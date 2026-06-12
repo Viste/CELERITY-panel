@@ -226,7 +226,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
         const {
             name, ip, domain, sni, port, portRange, statsPort,
             groups, ssh, paths, settings, rankingCoefficient,
-            type, xray, virtual, cascadeRole, country, comment,
+            type, xray, virtual, mieru, cascadeRole, country, comment,
             hopInterval, acme, masquerade, bandwidth,
             ignoreClientBandwidth, speedTest, disableUDP,
             udpIdleTimeout, sniff, quic, resolver, acl,
@@ -237,14 +237,14 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             return res.status(400).json({ error: 'name is required' });
         }
 
-        if (type && !['hysteria', 'xray', 'virtual'].includes(type)) {
-            return res.status(400).json({ error: 'type must be hysteria, xray, or virtual' });
+        if (type && !['hysteria', 'xray', 'virtual', 'mieru'].includes(type)) {
+            return res.status(400).json({ error: 'type must be hysteria, xray, virtual, or mieru' });
         }
 
         const nodeType = type || 'hysteria';
 
         if (nodeType !== 'virtual' && !ip) {
-            return res.status(400).json({ error: 'ip is required for hysteria and xray nodes' });
+            return res.status(400).json({ error: `ip is required for ${nodeType} nodes` });
         }
 
         // Validate virtual-specific fields up-front (pre('validate') hook is
@@ -313,6 +313,18 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             nodeData.xray = xray;
         }
 
+        if (nodeType === 'mieru' && mieru) {
+            // Schema defaults cover the rest (mtu/loggingLevel/multiplexing);
+            // accept only the few fields a caller is allowed to override.
+            nodeData.mieru = {
+                protocol: mieru.protocol === 'UDP' ? 'UDP' : 'TCP',
+                mtu: Number.isFinite(mieru.mtu) && mieru.mtu > 0 ? mieru.mtu : 1400,
+                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(mieru.loggingLevel) ? mieru.loggingLevel : 'INFO',
+                multiplexing: mieru.multiplexing || '',
+                muxUserHintMandatory: !!mieru.muxUserHintMandatory,
+            };
+        }
+
         if (nodeType === 'virtual') {
             const v = virtual || {};
             nodeData.virtual = {
@@ -361,7 +373,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         const allowedUpdates = [
             'name', 'domain', 'sni', 'port', 'portRange', 'statsPort',
             'groups', 'ssh', 'paths', 'settings', 'active', 'rankingCoefficient',
-            'type', 'xray', 'virtual', 'cascadeRole', 'country', 'comment',
+            'type', 'xray', 'virtual', 'mieru', 'cascadeRole', 'country', 'comment',
             'hopInterval', 'acme', 'masquerade', 'bandwidth',
             'ignoreClientBandwidth', 'speedTest', 'disableUDP',
             'udpIdleTimeout', 'sniff', 'quic', 'resolver', 'acl',
@@ -770,6 +782,8 @@ router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
         let result;
         if (node.type === 'xray') {
             result = await nodeSetup.setupXrayNode(node, { restartService });
+        } else if (node.type === 'mieru') {
+            result = await nodeSetup.setupMieruNode(node, { restartService });
         } else {
             result = await nodeSetup.setupNode(node, {
                 installHysteria,

@@ -925,6 +925,41 @@ WantedBy=multi-user.target
 `;
 }
 
+// ==================== MIERU (mita server) ====================
+
+/**
+ * Generate mita server configuration JSON for a mieru-type node.
+ * Each enabled HyUser becomes one entry in the `users` array — mita expects
+ * plaintext passwords here and hashes them itself on `apply config`.
+ *
+ * @param {Object} node - HyNode document with type === 'mieru'
+ * @param {Array} users - HyUser docs to enroll on this node
+ * @returns {Object} mita config object (serialise to JSON before writing)
+ */
+function generateMieruConfig(node, users) {
+    const mieru = node.mieru || {};
+    const port = node.port || 443;
+    const protocol = (mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
+
+    const config = {
+        portBindings: [{ port, protocol }],
+        users: (Array.isArray(users) ? users : [])
+            .filter(u => u && u.username && u.password)
+            .map(u => ({ name: u.username, password: u.password })),
+        mtu: Number.isFinite(mieru.mtu) && mieru.mtu > 0 ? mieru.mtu : 1400,
+        loggingLevel: mieru.loggingLevel || 'INFO',
+    };
+
+    if (mieru.multiplexing) {
+        config.mux = { level: mieru.multiplexing };
+        if (mieru.muxUserHintMandatory) {
+            config.mux.userHintMandatory = true;
+        }
+    }
+
+    return config;
+}
+
 // ==================== XRAY CASCADE (Reverse Proxy) ====================
 
 /**
@@ -1661,6 +1696,7 @@ module.exports = {
     generateXrayConfig,
     buildXrayStreamSettings,
     generateXraySystemdService,
+    generateMieruConfig,
     applyReversePortal,
     generateBridgeConfig,
     generateRelayConfig,

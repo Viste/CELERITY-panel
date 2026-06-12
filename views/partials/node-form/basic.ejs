@@ -120,6 +120,14 @@
                         <span class="proto-name"><%= t('nodes.virtualName') %></span>
                         <span class="proto-desc"><%= t('nodes.virtualDesc') %></span>
                     </label>
+                    <label class="proto-option <% if (node?.type === 'mieru') { %>active<% } %>" id="protoMieruLabel">
+                        <input type="radio" name="type" value="mieru" id="protoMieru"
+                               <%= node?.type === 'mieru' ? 'checked' : '' %>
+                               onchange="switchProto('mieru')">
+                        <span class="proto-icon"><i class="ti ti-shield-lock" style="font-size:24px;"></i></span>
+                        <span class="proto-name">Mieru</span>
+                        <span class="proto-desc">mita server · TCP/UDP · no TLS fingerprint</span>
+                    </label>
                 </div>
             </div>
 

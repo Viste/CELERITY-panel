@@ -755,7 +755,55 @@ class SyncService {
         if (node.type === 'xray') {
             return this.updateXrayNodeConfig(node);
         }
+        if (node.type === 'mieru') {
+            return this.updateMieruNodeConfig(node);
+        }
         return this._updateHysteriaNodeConfig(node);
+    }
+
+    /**
+     * Full config update for a mieru (mita) node.
+     *
+     * Pushes /etc/mita/server-config.json with the current enabled-user pool
+     * baked into mita's `users` array, then runs `mita apply config` and
+     * restarts the daemon. SSH-only — no agent path because mita has neither
+     * an HTTP control API nor a panel agent.
+     */
+    async updateMieruNodeConfig(node) {
+        logger.info(`[Mieru Sync] Updating config for node ${node.name} (${node.ip})`);
+        await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
+
+        if (!node.ssh?.password && !node.ssh?.privateKey) {
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: 'mieru sync requires SSH credentials' },
+            });
+            return false;
+        }
+
+        const users = await this._getUsersForNode(node);
+        const configObject = configGenerator.generateMieruConfig(node, users);
+
+        const ssh = new NodeSSH(node);
+        try {
+            await ssh.connect();
+            const success = await ssh.updateMieruConfig(configObject);
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: {
+                    status: success ? 'online' : 'error',
+                    lastSync: new Date(),
+                    lastError: success ? '' : 'mita apply config failed (see node journal)',
+                },
+            });
+            return success;
+        } catch (error) {
+            logger.error(`[Mieru Sync] ${node.name}: ${error.message}`);
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: error.message },
+            });
+            return false;
+        } finally {
+            try { await ssh.disconnect(); } catch { /* best-effort */ }
+        }
     }
 
     /**
@@ -928,6 +976,9 @@ class SyncService {
      */
     async collectTrafficStats(node) {
         if (node.type === 'virtual') return;
+        // mita exposes aggregate metrics only (no per-user traffic via API);
+        // we don't try to parse them yet — traffic shows 0 on mieru nodes.
+        if (node.type === 'mieru') return;
         if (node.type === 'xray') {
             return this.collectXrayTrafficStats(node);
         }
@@ -1012,6 +1063,8 @@ class SyncService {
      */
     async getOnlineUsers(node) {
         if (node.type === 'virtual') return 0;
+        // mita's `mita describe connections` is not user-keyed; treat as zero.
+        if (node.type === 'mieru') return 0;
         if (node.type === 'xray') {
             return this.getXrayOnlineUsers(node);
         }
@@ -1089,6 +1142,9 @@ class SyncService {
             try {
                 // Virtual nodes have no remote service to kick from.
                 if (node.type === 'virtual') continue;
+                // mita has no per-user kick endpoint; user removal happens on
+                // the next full config push (updateMieruNodeConfig).
+                if (node.type === 'mieru') continue;
                 if (!node.statsPort || !node.statsSecret || !node.ip) continue;
 
                 const url = `http://${node.ip}:${node.statsPort}/kick`;

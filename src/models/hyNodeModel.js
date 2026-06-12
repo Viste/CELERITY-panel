@@ -247,9 +247,32 @@ const virtualConfigSchema = new mongoose.Schema({
     },
 }, { _id: false });
 
+// Mieru node: standalone mita server config (https://github.com/enfein/mieru).
+// Users are taken from the global HyUser pool — each enabled user becomes one
+// entry in mita's `users` array (username + password). The fields below only
+// describe the listener and transport; per-user creds live on HyUser.
+const mieruConfigSchema = new mongoose.Schema({
+    // mita listens on a single port-binding. TCP is corp-firewall friendly,
+    // UDP is faster but more often blocked.
+    protocol: { type: String, enum: ['TCP', 'UDP'], default: 'TCP' },
+    // Padding budget for mita's inner frames — only effective when mux is on.
+    mtu: { type: Number, default: 1400 },
+    loggingLevel: { type: String, enum: ['DEBUG', 'INFO', 'WARN', 'ERROR'], default: 'INFO' },
+    // Server-side multiplexing pattern. Empty = client-driven. Setting it
+    // forces every session to use that pattern (raises latency-stealth).
+    multiplexing: {
+        type: String,
+        enum: ['', 'MULTIPLEXING_OFF', 'MULTIPLEXING_LOW', 'MULTIPLEXING_MIDDLE', 'MULTIPLEXING_HIGH', 'MULTIPLEXING_PADDING'],
+        default: '',
+    },
+    // When true, mux frames missing the username hint are rejected — saves CPU
+    // on probe traffic but blocks pre-3.x clients that don't emit the hint.
+    muxUserHintMandatory: { type: Boolean, default: false },
+}, { _id: false });
+
 const hyNodeSchema = new mongoose.Schema({
-    // 'hysteria' (default), 'xray' or 'virtual' (balancer aggregator).
-    type: { type: String, enum: ['hysteria', 'xray', 'virtual'], default: 'hysteria' },
+    // 'hysteria' (default), 'xray', 'virtual' (balancer aggregator), or 'mieru' (mita server).
+    type: { type: String, enum: ['hysteria', 'xray', 'virtual', 'mieru'], default: 'hysteria' },
 
     name: { type: String, required: true },
     flag: { type: String, default: '' },
@@ -287,6 +310,9 @@ const hyNodeSchema = new mongoose.Schema({
 
     // Virtual-specific configuration (only used when type === 'virtual')
     virtual: { type: virtualConfigSchema, default: () => ({}) },
+
+    // Mieru-specific configuration (only used when type === 'mieru')
+    mieru: { type: mieruConfigSchema, default: () => ({}) },
 
     groups: [{
         type: mongoose.Schema.Types.ObjectId,

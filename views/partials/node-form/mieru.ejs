@@ -1,0 +1,68 @@
+<%
+// Mieru node form partial — visible only when type === 'mieru'.
+// Mita server (https://github.com/enfein/mieru) is a username+password proxy
+// with no TLS surface, so the form only collects listener and mux options.
+const m = node?.mieru || {};
+const isMieru = node?.type === 'mieru';
+const protocol = m.protocol || 'TCP';
+const mtu = m.mtu || 1400;
+const loggingLevel = m.loggingLevel || 'INFO';
+const multiplexing = m.multiplexing || '';
+const muxUserHintMandatory = !!m.muxUserHintMandatory;
+%>
+
+<div class="form-section mieru-only" id="mieruSection" style="<%= isMieru ? '' : 'display:none' %>">
+    <h3>
+        <i class="ti ti-shield-lock"></i> Mieru (mita) settings
+        <a class="docs-hint-link" href="https://github.com/enfein/mieru/blob/main/docs/server-install.md" target="_blank" rel="noopener noreferrer" title="mieru server docs">ⓘ</a>
+    </h3>
+    <small class="section-hint">
+        Mita listens on a single port. Users (name + password) are seeded
+        from the global user pool — no separate user form needed here.
+    </small>
+
+    <div class="form-group">
+        <label for="mieruProtocol">Transport protocol</label>
+        <select id="mieruProtocol" name="mieru.protocol">
+            <option value="TCP" <%= protocol === 'TCP' ? 'selected' : '' %>>TCP — corp-firewall friendly</option>
+            <option value="UDP" <%= protocol === 'UDP' ? 'selected' : '' %>>UDP — faster but more often blocked</option>
+        </select>
+        <small>Mita binds the node's `port` field with this transport.</small>
+    </div>
+
+    <div class="form-group">
+        <label for="mieruMtu">MTU</label>
+        <input type="number" id="mieruMtu" name="mieru.mtu" value="<%= mtu %>" min="576" max="1500">
+        <small>1400 is a safe default for cellular / corp NAT. Lower if PPPoE chokes.</small>
+    </div>
+
+    <div class="form-group">
+        <label for="mieruLoggingLevel">Logging level</label>
+        <select id="mieruLoggingLevel" name="mieru.loggingLevel">
+            <% ['DEBUG','INFO','WARN','ERROR'].forEach(function(lvl){ %>
+                <option value="<%= lvl %>" <%= loggingLevel === lvl ? 'selected' : '' %>><%= lvl %></option>
+            <% }); %>
+        </select>
+    </div>
+
+    <div class="form-group">
+        <label for="mieruMultiplexing">Server mux pattern</label>
+        <select id="mieruMultiplexing" name="mieru.multiplexing">
+            <option value="" <%= multiplexing === '' ? 'selected' : '' %>>Client-driven (default)</option>
+            <option value="MULTIPLEXING_OFF" <%= multiplexing === 'MULTIPLEXING_OFF' ? 'selected' : '' %>>Off — no padding</option>
+            <option value="MULTIPLEXING_LOW" <%= multiplexing === 'MULTIPLEXING_LOW' ? 'selected' : '' %>>Low</option>
+            <option value="MULTIPLEXING_MIDDLE" <%= multiplexing === 'MULTIPLEXING_MIDDLE' ? 'selected' : '' %>>Middle</option>
+            <option value="MULTIPLEXING_HIGH" <%= multiplexing === 'MULTIPLEXING_HIGH' ? 'selected' : '' %>>High</option>
+            <option value="MULTIPLEXING_PADDING" <%= multiplexing === 'MULTIPLEXING_PADDING' ? 'selected' : '' %>>Padding</option>
+        </select>
+        <small>Higher = more shape-obfuscation, more CPU. Leave default unless DPI catches mita's pattern.</small>
+    </div>
+
+    <div class="form-group">
+        <label class="form-checkbox-label">
+            <input type="checkbox" name="mieru.muxUserHintMandatory" value="1" <%= muxUserHintMandatory ? 'checked' : '' %>>
+            Require username hint in mux frames
+        </label>
+        <small>Rejects probe traffic that omits the hint. Breaks pre-3.x clients — keep off unless probed heavily.</small>
+    </div>
+</div>

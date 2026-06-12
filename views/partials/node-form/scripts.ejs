@@ -528,15 +528,17 @@ function checkXrayPortConflict() {
 function switchProto(proto) {
     const xraySection = document.getElementById('xraySection');
     const virtualSection = document.getElementById('virtualSection');
+    const mieruSection = document.getElementById('mieruSection');
     const cascadeSection = document.getElementById('cascadeRoleSection');
     const labelHysteria = document.getElementById('protoHysteriaLabel');
     const labelXray = document.getElementById('protoXrayLabel');
     const labelVirtual = document.getElementById('protoVirtualLabel');
+    const labelMieru = document.getElementById('protoMieruLabel');
     const hysteriaOnlyEls = document.querySelectorAll('.hysteria-only');
     const ipFormGroup = document.getElementById('ipFormGroup');
     const ipInput = document.getElementById('ip');
 
-    [labelHysteria, labelXray, labelVirtual].forEach(l => l && l.classList.remove('active'));
+    [labelHysteria, labelXray, labelVirtual, labelMieru].forEach(l => l && l.classList.remove('active'));
 
     if (proto === 'virtual') {
         if (xraySection) xraySection.style.display = 'none';
@@ -574,6 +576,26 @@ function switchProto(proto) {
     });
     if (ipFormGroup) ipFormGroup.style.display = '';
     if (ipInput) ipInput.setAttribute('required', 'required');
+
+    if (proto === 'mieru') {
+        // Mieru only needs the listener block + global ssh / management.
+        // Hide hysteria/xray-specific sections same way virtual does.
+        if (xraySection) xraySection.style.display = 'none';
+        if (cascadeSection) cascadeSection.style.display = 'none';
+        if (mieruSection) mieruSection.style.display = '';
+        if (labelMieru) labelMieru.classList.add('active');
+        hysteriaOnlyEls.forEach(el => el.style.display = 'none');
+        // Domain/SNI are pointless on mita (no TLS); hide the domain block.
+        const domainGroup = document.getElementById('domainGroup');
+        if (domainGroup) domainGroup.style.display = 'none';
+        const sniGroup = document.getElementById('sniGroup');
+        if (sniGroup) sniGroup.style.display = 'none';
+        checkXrayPortConflict();
+        return;
+    }
+
+    // Restore mieru-hidden bits when switching away from mieru.
+    if (mieruSection) mieruSection.style.display = 'none';
 
     if (proto === 'xray') {
         xraySection.style.display = '';

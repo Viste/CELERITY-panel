@@ -958,9 +958,14 @@ router.get('/nodes/:id/logs', async (req, res) => {
         }
 
         logger.debug(`[Panel] Getting logs for node ${node.name} (type: ${node.type})`);
-        const result = node.type === 'xray'
-            ? await nodeSetup.getXrayNodeLogs(node, 100)
-            : await nodeSetup.getNodeLogs(node, 100);
+        let result;
+        if (node.type === 'xray') {
+            result = await nodeSetup.getXrayNodeLogs(node, 100);
+        } else if (node.type === 'mieru') {
+            result = await nodeSetup.getMieruNodeLogs(node, 100);
+        } else {
+            result = await nodeSetup.getNodeLogs(node, 100);
+        }
         res.json(result);
     } catch (error) {
         logger.error(`[Panel] Get logs error for node ${req.params.id}: ${error.message}`);

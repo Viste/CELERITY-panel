@@ -909,6 +909,12 @@ function generateURIList(user, nodes) {
             // will see only real nodes and fall back to manual selection.
             return;
         }
+        if (node.type === 'mieru') {
+            // mieru has no standardised URL scheme — clients using the plain
+            // URI list (Happ, Streisand, Shadowrocket import) can't consume it.
+            // Clash / sing-box subscribers get the node via the other generators.
+            return;
+        }
         if (node.type === 'xray') {
             generateVlessURIs(user, node).forEach(uri => uris.push(uri));
         } else {
@@ -1017,6 +1023,15 @@ function generateClashYAML(user, nodes, routing) {
                 proxyNames.push(name);
                 proxies.push(proxy);
             });
+        } else if (node.type === 'mieru') {
+            const name = `${node.flag || ''} ${node.name}`.trim();
+            const server = node.domain || node.ip;
+            if (!server || !user.username || !user.password) return;
+            const transport = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
+            proxyNames.push(name);
+            proxies.push(
+                `  - name: "${name}"\n    type: mieru\n    server: ${server}\n    port: ${node.port || 443}\n    transport: ${transport}\n    username: "${user.username}"\n    password: "${user.password}"`
+            );
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const name = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
@@ -1194,6 +1209,9 @@ function _buildSingboxVlessOutbounds(user, node) {
  */
 function _buildV2rayOutboundsForNode(user, node, tagOverride) {
     if (node.type === 'virtual') return [];
+    // mieru is not an Xray/V2Ray-core protocol — clients consuming the
+    // v2ray-json / xray-json shapes can't speak it, so we drop the node.
+    if (node.type === 'mieru') return [];
     const auth = `${user.userId}:${user.password}`;
     const built = [];
 
@@ -1545,6 +1563,20 @@ function generateSingboxJSON(user, nodes, routing) {
                 tags.push(tag);
                 proxyOutbounds.push(outbound);
             });
+        } else if (node.type === 'mieru') {
+            const tag = `${node.flag || ''} ${node.name}`.trim();
+            const server = node.domain || node.ip;
+            if (!server || !user.username || !user.password) return;
+            tags.push(tag);
+            proxyOutbounds.push({
+                type: 'mieru',
+                tag,
+                server,
+                server_port: node.port || 443,
+                transport: (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP',
+                username: user.username,
+                password: user.password,
+            });
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const tag = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
@@ -1769,6 +1801,9 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', 
         // page entirely. They still appear (always pinned to the top) inside
         // the actual subscription payloads served to clients via ?format=…
         if (node.type === 'virtual') return;
+        // mieru lacks a standardised URL scheme, so no QR / copy-paste card
+        // makes sense here. The node still appears in clash / sing-box payloads.
+        if (node.type === 'mieru') return;
         if (node.type === 'xray') {
             // Render one card per published inbound (main + extras).
             const inbounds = getXrayPublishedInbounds(node);
