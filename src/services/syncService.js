@@ -770,9 +770,6 @@ class SyncService {
      * an HTTP control API nor a panel agent.
      */
     async updateMieruNodeConfig(node) {
-        logger.info(`[Mieru Sync] Updating config for node ${node.name} (${node.ip})`);
-        await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
-
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             await HyNode.updateOne({ _id: node._id }, {
                 $set: { status: 'error', lastSync: new Date(), lastError: 'mieru sync requires SSH credentials' },
@@ -781,6 +778,18 @@ class SyncService {
         }
 
         const users = await this._getUsersForNode(node);
+
+        // Adopt mode: a mieru node with no panel-bound users keeps its existing
+        // /etc/mita/server-config.json untouched. Pushing an empty users[] would
+        // brick a live mita that was provisioned out-of-band (ansible).
+        // Only do a health probe so the panel can flip status online/offline.
+        if (users.length === 0) {
+            return this._checkMieruNodeHealth(node);
+        }
+
+        logger.info(`[Mieru Sync] Updating config for node ${node.name} (${node.ip})`);
+        await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
+
         const configObject = configGenerator.generateMieruConfig(node, users);
 
         const ssh = new NodeSSH(node);
@@ -800,6 +809,43 @@ class SyncService {
             await HyNode.updateOne({ _id: node._id }, {
                 $set: { status: 'error', lastSync: new Date(), lastError: error.message },
             });
+            return false;
+        } finally {
+            try { await ssh.disconnect(); } catch { /* best-effort */ }
+        }
+    }
+
+    /**
+     * Health probe for adopted mieru nodes — never mutates remote state.
+     * Marks status online/offline based on `systemctl is-active mita` only.
+     */
+    async _checkMieruNodeHealth(node) {
+        if (!node.ssh?.password && !node.ssh?.privateKey) return false;
+
+        const ssh = new NodeSSH(node);
+        try {
+            await ssh.connect();
+            const probe = await ssh.checkMieruStatus();
+            const isAlive = !!probe.serviceActive;
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: {
+                    status: isAlive ? 'online' : 'offline',
+                    lastSync: new Date(),
+                    lastError: isAlive ? '' : 'mita.service not active',
+                    healthFailures: 0,
+                },
+            });
+            await invalidateNodesCache();
+            return isAlive;
+        } catch (error) {
+            logger.warn(`[Mieru Health] ${node.name}: ${error.message}`);
+            const prev = await HyNode.findById(node._id).select('status healthFailures');
+            const failures = (prev?.healthFailures || 0) + 1;
+            const update = { healthFailures: failures, lastError: error.message };
+            if (failures >= HEALTH_FAILURE_THRESHOLD && prev?.status === 'online') {
+                update.status = 'offline';
+            }
+            await HyNode.updateOne({ _id: node._id }, { $set: update });
             return false;
         } finally {
             try { await ssh.disconnect(); } catch { /* best-effort */ }

@@ -160,6 +160,34 @@ function buildHysteriaMeta(node, options) {
     };
 }
 
+function buildMieruMeta(node, options) {
+    const labels = options.labels || {};
+    const protocol = (node?.mieru?.protocol === 'UDP') ? 'UDP' : 'TCP';
+    const badges = [
+        badge(
+            'transport',
+            'ti ti-route',
+            protocol,
+            label(labels, 'transportTitle', 'Transport'),
+            'transport',
+            `mieru / ${protocol}`
+        ),
+    ];
+    const mux = text(node?.mieru?.multiplexing);
+    if (mux && mux !== 'MULTIPLEXING_OFF') {
+        const short = mux.replace(/^MULTIPLEXING_/, '');
+        badges.push(badge(
+            'security',
+            'ti ti-layers-intersect',
+            `MUX:${short}`,
+            'Multiplexing',
+            'reality',
+            mux
+        ));
+    }
+    return { displayDomain: '', badges };
+}
+
 function buildVirtualMeta(options) {
     const labels = options.labels || {};
     return {
@@ -180,6 +208,7 @@ function buildNodeUiMeta(node, options = {}) {
     if (!node) return { displayDomain: '', badges: [] };
     if (node.type === 'virtual') return buildVirtualMeta(options);
     if (node.type === 'xray') return buildXrayMeta(node, options);
+    if (node.type === 'mieru') return buildMieruMeta(node, options);
     return buildHysteriaMeta(node, options);
 }
 

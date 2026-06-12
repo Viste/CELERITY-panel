@@ -89,9 +89,13 @@
                                     <span class="node-name-row">
                                         <% if (node.flag) { %><span class="node-flag"><%= node.flag %></span><% } %>
                                         <strong><%= node.name %></strong>
+                                        <% if (node.type === 'mieru') { %>
+                                        <i class="ti ti-shield-bolt" title="Mieru / mita" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
+                                        <% } else { %>
                                         <img src="/img/<%= node.type === 'xray' ? 'xray' : 'hysteria' %>.svg"
                                              alt="<%= node.type === 'xray' ? 'Xray' : 'Hysteria' %>"
                                              style="width:14px;height:14px;vertical-align:middle;opacity:0.7;">
+                                        <% } %>
                                     </span>
                                     <code class="node-ip"><%= node.ip %></code>
                                     <% if (node.comment) { %>
@@ -147,9 +151,13 @@
                                 <span class="node-name-row">
                                     <% if (node.flag) { %><span class="node-flag"><%= node.flag %></span><% } %>
                                     <strong><%= node.name %></strong>
+                                    <% if (node.type === 'mieru') { %>
+                                    <i class="ti ti-shield-bolt" title="Mieru / mita" style="font-size:13px;vertical-align:middle;opacity:0.7;"></i>
+                                    <% } else { %>
                                     <img src="/img/<%= node.type === 'xray' ? 'xray' : 'hysteria' %>.svg"
                                          alt="<%= node.type === 'xray' ? 'Xray' : 'Hysteria' %>"
                                          style="width:13px;height:13px;vertical-align:middle;opacity:0.7;">
+                                    <% } %>
                                 </span>
                                 <code><%= node.ip %></code>
                                 <% if (node.comment) { %>

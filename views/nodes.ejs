@@ -135,6 +135,8 @@ function nodeMetaFor(node) {
                                     <img src="/img/xray.svg" alt="Xray" title="Xray VLESS" style="width:16px;height:16px;vertical-align:middle;margin-left:6px;opacity:0.7;">
                                     <% } else if (node.type === 'virtual') { %>
                                     <i class="ti ti-route" title="Virtual / Balancer" style="font-size:16px;vertical-align:middle;margin-left:6px;opacity:0.7;"></i>
+                                    <% } else if (node.type === 'mieru') { %>
+                                    <i class="ti ti-shield-bolt" title="Mieru / mita" style="font-size:16px;vertical-align:middle;margin-left:6px;opacity:0.7;"></i>
                                     <% } else { %>
                                     <img src="/img/hysteria.svg" alt="Hysteria" title="Hysteria 2" style="width:16px;height:16px;vertical-align:middle;margin-left:6px;opacity:0.7;">
                                     <% } %>
@@ -293,6 +295,8 @@ function nodeMetaFor(node) {
                             <img src="/img/xray.svg" alt="Xray" title="Xray VLESS" style="width:14px;height:14px;vertical-align:middle;opacity:0.7;">
                             <% } else if (node.type === 'virtual') { %>
                             <i class="ti ti-route" title="Virtual / Balancer" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
+                            <% } else if (node.type === 'mieru') { %>
+                            <i class="ti ti-shield-bolt" title="Mieru / mita" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
                             <% } else { %>
                             <img src="/img/hysteria.svg" alt="Hysteria" title="Hysteria 2" style="width:14px;height:14px;vertical-align:middle;opacity:0.7;">
                             <% } %>
