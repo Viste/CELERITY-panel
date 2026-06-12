@@ -1827,9 +1827,18 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', 
         // page entirely. They still appear (always pinned to the top) inside
         // the actual subscription payloads served to clients via ?format=…
         if (node.type === 'virtual') return;
-        // mieru lacks a standardised URL scheme, so no QR / copy-paste card
-        // makes sense here. The node still appears in clash / sing-box payloads.
-        if (node.type === 'mieru') return;
+        if (node.type === 'mieru') {
+            const uri = _buildMieruSimpleURI(user, node);
+            if (uri) {
+                allConfigs.push({
+                    location: node.name,
+                    flag: node.flag || '🌐',
+                    name: 'Mieru',
+                    uri,
+                });
+            }
+            return;
+        }
         if (node.type === 'xray') {
             // Render one card per published inbound (main + extras).
             const inbounds = getXrayPublishedInbounds(node);
