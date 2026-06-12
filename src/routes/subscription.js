@@ -901,6 +901,29 @@ function buildClashDns(rules, dns) {
 
 // ==================== FORMAT GENERATORS ====================
 
+// Build a single mieru "simple sharing link" — the mierus:// scheme accepted
+// by Shadowrocket 2.2.81+ and the mieru CLI. Layout per enfein/mieru/pkg/appctl/url.go:
+//   mierus://USER:PASS@HOST?profile=NAME&mtu=N&multiplexing=LEVEL&port=N&protocol=TCP|UDP#REMARK
+function _buildMieruSimpleURI(user, node) {
+    if (!user.username || !user.password) return null;
+    const host = node.domain || node.ip;
+    if (!host) return null;
+    const port = node.port || 443;
+    const protocol = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
+    const profile = node.name || 'default';
+    const params = new URLSearchParams();
+    params.append('profile', profile);
+    const mtu = node.mieru && node.mieru.mtu;
+    if (Number.isFinite(mtu) && mtu > 0) params.append('mtu', String(mtu));
+    if (node.mieru && node.mieru.multiplexing) params.append('multiplexing', node.mieru.multiplexing);
+    params.append('port', String(port));
+    params.append('protocol', protocol);
+    const u = encodeURIComponent(user.username);
+    const p = encodeURIComponent(user.password);
+    const remark = encodeURIComponent(`${node.flag || ''} ${node.name}`.trim());
+    return `mierus://${u}:${p}@${host}?${params.toString()}#${remark}`;
+}
+
 function generateURIList(user, nodes) {
     const uris = [];
     nodes.forEach(node => {
@@ -910,9 +933,12 @@ function generateURIList(user, nodes) {
             return;
         }
         if (node.type === 'mieru') {
-            // mieru has no standardised URL scheme — clients using the plain
-            // URI list (Happ, Streisand, Shadowrocket import) can't consume it.
-            // Clash / sing-box subscribers get the node via the other generators.
+            // Shadowrocket 2.2.81+ and the mieru CLI accept the simple mierus://
+            // URI; older clients on the URI-list path (Happ, Streisand) will skip
+            // the unknown scheme. Clash / sing-box subscribers get the node via
+            // the dedicated generators below.
+            const uri = _buildMieruSimpleURI(user, node);
+            if (uri) uris.push(uri);
             return;
         }
         if (node.type === 'xray') {
