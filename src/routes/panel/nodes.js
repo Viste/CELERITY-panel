@@ -297,7 +297,7 @@ router.patch('/nodes/reorder', async (req, res) => {
 router.post('/nodes', async (req, res) => {
     try {
         const { name } = req.body;
-        const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
+        const nodeType = ['xray', 'virtual', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
 
         if (!name) {
@@ -395,6 +395,15 @@ router.post('/nodes', async (req, res) => {
             if (virtualError) {
                 return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(virtualError)}`);
             }
+        } else if (nodeType === 'mieru') {
+            const m = req.body.mieru || {};
+            nodeData.mieru = {
+                protocol: m.protocol === 'UDP' ? 'UDP' : 'TCP',
+                mtu: parseInt(m.mtu, 10) > 0 ? parseInt(m.mtu, 10) : 1400,
+                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(m.loggingLevel) ? m.loggingLevel : 'INFO',
+                multiplexing: m.multiplexing || '',
+                muxUserHintMandatory: !!m.muxUserHintMandatory,
+            };
         } else {
             const hyFields = parseHysteriaFormFields(req.body);
             const hyValidationError = validateHysteriaFormFields(hyFields);
@@ -601,7 +610,7 @@ router.post('/nodes/:id', async (req, res) => {
         }
 
         const { name } = req.body;
-        const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
+        const nodeType = ['xray', 'virtual', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
 
         if (!name) {
@@ -676,6 +685,15 @@ router.post('/nodes/:id', async (req, res) => {
             if (virtualError) {
                 return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(virtualError)}`);
             }
+        } else if (nodeType === 'mieru') {
+            const m = req.body.mieru || {};
+            updates.mieru = {
+                protocol: m.protocol === 'UDP' ? 'UDP' : 'TCP',
+                mtu: parseInt(m.mtu, 10) > 0 ? parseInt(m.mtu, 10) : 1400,
+                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(m.loggingLevel) ? m.loggingLevel : 'INFO',
+                multiplexing: m.multiplexing || '',
+                muxUserHintMandatory: !!m.muxUserHintMandatory,
+            };
         } else {
             const hyFields = parseHysteriaFormFields(req.body);
             const hyValidationError = validateHysteriaFormFields(hyFields);

@@ -1109,8 +1109,14 @@ class SyncService {
      */
     async getOnlineUsers(node) {
         if (node.type === 'virtual') return 0;
-        // mita's `mita describe connections` is not user-keyed; treat as zero.
-        if (node.type === 'mieru') return 0;
+        if (node.type === 'mieru') {
+            // mita's `mita describe connections` is not user-keyed, so we can't
+            // report online count — but we still need to flip status online/offline
+            // from the periodic health loop, otherwise the panel would show every
+            // mieru node permanently offline and fire false-positive alerts.
+            this._checkMieruNodeHealth(node).catch(() => {});
+            return 0;
+        }
         if (node.type === 'xray') {
             return this.getXrayOnlineUsers(node);
         }
