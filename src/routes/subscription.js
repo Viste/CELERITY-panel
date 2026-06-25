@@ -905,7 +905,8 @@ function buildClashDns(rules, dns) {
 // by Shadowrocket 2.2.81+ and the mieru CLI. Layout per enfein/mieru/pkg/appctl/url.go:
 //   mierus://USER:PASS@HOST?profile=NAME&mtu=N&multiplexing=LEVEL&port=N&protocol=TCP|UDP#REMARK
 function _buildMieruSimpleURI(user, node) {
-    if (!user.username || !user.password) return null;
+    const uname = user.username || user.userId;
+    if (!uname || !user.password) return null;
     const host = node.domain || node.ip;
     if (!host) return null;
     const port = node.port || 443;
@@ -918,7 +919,7 @@ function _buildMieruSimpleURI(user, node) {
     if (node.mieru && node.mieru.multiplexing) params.append('multiplexing', node.mieru.multiplexing);
     params.append('port', String(port));
     params.append('protocol', protocol);
-    const u = encodeURIComponent(user.username);
+    const u = encodeURIComponent(uname);
     const p = encodeURIComponent(user.password);
     const remark = encodeURIComponent(`${node.flag || ''} ${node.name}`.trim());
     return `mierus://${u}:${p}@${host}?${params.toString()}#${remark}`;
@@ -1052,11 +1053,12 @@ function generateClashYAML(user, nodes, routing) {
         } else if (node.type === 'mieru') {
             const name = `${node.flag || ''} ${node.name}`.trim();
             const server = node.domain || node.ip;
-            if (!server || !user.username || !user.password) return;
+            const uname = user.username || user.userId;
+            if (!server || !uname || !user.password) return;
             const transport = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
             proxyNames.push(name);
             proxies.push(
-                `  - name: "${name}"\n    type: mieru\n    server: ${server}\n    port: ${node.port || 443}\n    transport: ${transport}\n    username: "${user.username}"\n    password: "${user.password}"`
+                `  - name: "${name}"\n    type: mieru\n    server: ${server}\n    port: ${node.port || 443}\n    transport: ${transport}\n    username: "${uname}"\n    password: "${user.password}"`
             );
         } else {
             getNodeConfigs(node).forEach(cfg => {
@@ -1592,7 +1594,8 @@ function generateSingboxJSON(user, nodes, routing) {
         } else if (node.type === 'mieru') {
             const tag = `${node.flag || ''} ${node.name}`.trim();
             const server = node.domain || node.ip;
-            if (!server || !user.username || !user.password) return;
+            const uname = user.username || user.userId;
+            if (!server || !uname || !user.password) return;
             tags.push(tag);
             proxyOutbounds.push({
                 type: 'mieru',
@@ -1600,7 +1603,7 @@ function generateSingboxJSON(user, nodes, routing) {
                 server,
                 server_port: node.port || 443,
                 transport: (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP',
-                username: user.username,
+                username: uname,
                 password: user.password,
             });
         } else {
