@@ -30,8 +30,10 @@ const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
 
-// Mark node offline after this many consecutive health check failures (1 check/min)
-const HEALTH_FAILURE_THRESHOLD = 3;
+// Mark node offline after this many consecutive health check failures (1 check/min).
+// Env-overridable so we can absorb transit flaps (e.g. upstream DDoS-scrubber that
+// drops ~29/30 probes) without rolling a new image each time.
+const HEALTH_FAILURE_THRESHOLD = Math.max(1, parseInt(process.env.HEALTH_FAILURE_THRESHOLD, 10) || 10);
 
 // Fields whose change requires regenerating the runtime config on the node.
 // Anything not listed here (name, groups, flag, rankingCoefficient, ssh.*, ...)
