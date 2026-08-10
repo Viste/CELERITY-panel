@@ -51,6 +51,30 @@ const CONFIG_AFFECTING_FIELDS = new Set([
     'xray',
 ]);
 
+// Minimum elapsed time between two traffic samples for a speed calculation to be
+// trusted. Guards against bogus Mbps spikes from clock skew, overlapping manual
+// POST /nodes/:id/sync calls, or the very first poll after a node is added
+// (prevLastUpdate is null then, so callers skip the calculation entirely).
+const MIN_SPEED_INTERVAL_MS = 2000;
+
+/**
+ * Average load (Mbit/s) since the previous traffic sample, derived from the same
+ * byte counters already fetched during the periodic stats poll — no extra
+ * requests to the node. Returns null when the interval is unknown or too short
+ * to trust (first poll after restart/add, or overlapping manual syncs).
+ */
+function computeMbps(txBytes, rxBytes, prevLastUpdate, now) {
+    if (!prevLastUpdate) return null;
+    const intervalMs = now.getTime() - new Date(prevLastUpdate).getTime();
+    if (intervalMs < MIN_SPEED_INTERVAL_MS) return null;
+
+    const intervalSec = intervalMs / 1000;
+    return {
+        txMbps: Number(((txBytes * 8) / intervalSec / 1e6).toFixed(2)),
+        rxMbps: Number(((rxBytes * 8) / intervalSec / 1e6).toFixed(2)),
+    };
+}
+
 function hasConfigRelevantUpdates(updates) {
     // null/undefined means "unknown" — err on the side of pushing.
     if (!updates) return true;
@@ -540,6 +564,23 @@ class SyncService {
                     logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
                 }
 
+                // When access logging is enabled, the log directory must exist
+                // and be writable by the Xray service user (User=nobody in the
+                // systemd unit) BEFORE Xray restarts with the new config —
+                // otherwise Xray fails to start and the node goes down.
+                if (node.xray?.accessLogs?.enabled) {
+                    try {
+                        await ssh.exec(
+                            'mkdir -p /var/log/xray && '
+                            + 'chown nobody /var/log/xray 2>/dev/null || chown nobody:nogroup /var/log/xray 2>/dev/null || true; '
+                            + 'chmod 755 /var/log/xray; '
+                            + 'touch /var/log/xray/access.log && chown nobody /var/log/xray/access.log 2>/dev/null || true'
+                        );
+                    } catch (dirErr) {
+                        logger.warn(`[Xray Sync] Node ${node.name}: access-log dir prep failed: ${dirErr.message}`);
+                    }
+                }
+
                 // Xray config always goes to /usr/local/etc/xray/config.json
                 const xrayConfigPath = '/usr/local/etc/xray/config.json';
                 await ssh.uploadContent(configContent, xrayConfigPath);
@@ -676,6 +717,12 @@ class SyncService {
             if (nodeTx > 0 || nodeRx > 0) {
                 nodeUpdate.$inc = { 'traffic.tx': nodeTx, 'traffic.rx': nodeRx };
                 nodeUpdate.$set['traffic.lastUpdate'] = now;
+            }
+            const speed = computeMbps(nodeTx, nodeRx, node.traffic?.lastUpdate, now);
+            if (speed) {
+                nodeUpdate.$set['traffic.txMbps'] = speed.txMbps;
+                nodeUpdate.$set['traffic.rxMbps'] = speed.rxMbps;
+                nodeUpdate.$set['traffic.speedUpdatedAt'] = now;
             }
             await HyNode.updateOne({ _id: node._id }, nodeUpdate);
 
@@ -1088,6 +1135,13 @@ class SyncService {
             }
             
             // Update node traffic
+            const nodeSet = { 'traffic.lastUpdate': now };
+            const speed = computeMbps(nodeTx, nodeRx, node.traffic?.lastUpdate, now);
+            if (speed) {
+                nodeSet['traffic.txMbps'] = speed.txMbps;
+                nodeSet['traffic.rxMbps'] = speed.rxMbps;
+                nodeSet['traffic.speedUpdatedAt'] = now;
+            }
             await HyNode.updateOne(
                 { _id: node._id },
                 {
@@ -1095,7 +1149,7 @@ class SyncService {
                         'traffic.tx': nodeTx,
                         'traffic.rx': nodeRx,
                     },
-                    $set: { 'traffic.lastUpdate': now }
+                    $set: nodeSet,
                 }
             );
             

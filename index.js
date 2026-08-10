@@ -39,7 +39,7 @@ const authRoutes = require('./src/routes/auth');
 const panelRoutes = require('./src/routes/panel');
 const mcpRoutes = require('./src/routes/mcp');
 const marzbanCompat = require('./src/routes/marzbanCompat');
-const { subscriptionLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
+const { subscriptionLimiter, authLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
 const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
 const helmet = require('helmet');
@@ -68,6 +68,42 @@ app.use(cors({
     origin: config.BASE_URL,
     credentials: true,
 }));
+
+// Access-logs ingest is mounted BEFORE the JSON body parser: it reads the raw
+// gzipped NDJSON body itself. It authenticates via a per-node Bearer token
+// (not a session), so it lives outside the normal /api auth chain. A generous
+// rate limit guards against a misbehaving agent while allowing normal batch
+// cadence from many nodes.
+{
+    const rateLimitLib = require('express-rate-limit');
+    const accessLogsIngestLimiter = rateLimitLib({
+        windowMs: 60 * 1000,
+        max: 600, // ~10 batches/sec/IP; agents batch every few seconds
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: 'too many ingest requests' },
+    });
+    const accessLogsIngestRoutes = require('./src/routes/accessLogsIngest');
+    app.use('/api/access-logs', accessLogsIngestLimiter, accessLogsIngestRoutes);
+}
+
+// External diagnostic probes are mounted here for the same reason: the ingest
+// handler reads a raw gzipped body and authenticates with a probe-scoped Bearer
+// token rather than a session. Probes report on a light cadence (a batch every
+// ~15 minutes each), so the limit only has to stop a runaway client.
+{
+    const rateLimitLib = require('express-rate-limit');
+    const probeLimiter = rateLimitLib({
+        windowMs: 60 * 1000,
+        max: 120,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: 'too many probe requests' },
+    });
+    const probeRoutes = require('./src/routes/probe');
+    app.use('/api/probe', probeLimiter, probeRoutes);
+}
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -99,6 +135,22 @@ app.use(i18nMiddleware);
 const { version: appVersion } = require('./package.json');
 app.use((req, res, next) => {
     res.locals.appVersion = appVersion;
+    next();
+});
+
+// Expose optional-feature flags to views (they drive the sidebar nav entries).
+// Only computed for panel HTML routes to avoid work on API/static traffic.
+const { getFeatureFlags } = require('./src/utils/featureFlags');
+app.use(async (req, res, next) => {
+    if (!req.path.startsWith('/panel')) return next();
+    try {
+        const flags = await getFeatureFlags();
+        res.locals.accessLogsEnabled = flags.accessLogs;
+        res.locals.probesEnabled = flags.probes;
+    } catch (_) {
+        res.locals.accessLogsEnabled = false;
+        res.locals.probesEnabled = false;
+    }
     next();
 });
 
@@ -148,7 +200,7 @@ app.get('/health', async (req, res) => {
 
 // ==================== API ROUTES ====================
 
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 
 const Admin = require('./src/models/adminModel');
 const totpService = require('./src/services/totpService');
@@ -512,6 +564,32 @@ async function startServer() {
             logger.info(`[Migration] Generated xrayUuid for ${usersWithoutUuid.length} existing users`);
         }
 
+        // Migration: ensure all users have a non-public subscription token.
+        const usersWithoutSubscriptionToken = await HyUser.find({
+            $or: [
+                { subscriptionToken: { $exists: false } },
+                { subscriptionToken: null },
+                { subscriptionToken: '' },
+            ],
+        }).select('_id userId');
+        if (usersWithoutSubscriptionToken.length > 0) {
+            const crypto = require('crypto');
+            const bulkOps = usersWithoutSubscriptionToken.map(u => {
+                const token = crypto.createHash('sha256')
+                    .update(u.userId + crypto.randomBytes(8).toString('hex'))
+                    .digest('hex')
+                    .substring(0, 16);
+                return {
+                    updateOne: {
+                        filter: { _id: u._id },
+                        update: { $set: { subscriptionToken: token } },
+                    },
+                };
+            });
+            await HyUser.bulkWrite(bulkOps, { ordered: false });
+            logger.info(`[Migration] Generated subscriptionToken for ${usersWithoutSubscriptionToken.length} existing users`);
+        }
+
         // Migration: backfill xray.tlsSource for legacy Xray nodes that were
         // created before the TLS-source picker existed. Any TLS node without
         // an explicit source defaults to 'panel' — matches the new default
@@ -646,7 +724,49 @@ async function startServer() {
         
             // Cron jobs
         setupCronJobs();
-        
+
+        // Access-logs spool processor. Always started: it is idle when the spool
+        // is empty (feature off / ClickHouse not configured) and picks up batches
+        // immediately once collection is enabled, without needing a restart.
+        try {
+            require('./src/services/accessLogs/processService').start();
+        } catch (e) {
+            logger.warn(`[AccessLogs] processor start skipped: ${e.message}`);
+        }
+
+        // Ensure the ClickHouse schema exists on boot when credentials are set,
+        // so the pipeline can insert immediately. Idempotent (IF NOT EXISTS) and
+        // best-effort: a missing/unreachable ClickHouse just logs and retries on
+        // the next settings save.
+        setTimeout(async () => {
+            try {
+                const clickhouse = require('./src/services/accessLogs/clickhouseService');
+                if (await clickhouse.isConfigured()) {
+                    await clickhouse.ensureSchema();
+                }
+            } catch (e) {
+                logger.warn(`[AccessLogs] ClickHouse schema ensure at boot skipped: ${e.message}`);
+            }
+        }, 15 * 1000);
+
+        // Crash recovery: if the panel died mid-reconcile the access-logs state
+        // stays stuck in a transitional value. Re-run reconciliation once on
+        // boot (delayed so nodes/DB settle first); it is a no-op fast path when
+        // every node already matches the desired config.
+        setTimeout(async () => {
+            try {
+                const Settings = require('./src/models/settingsModel');
+                const s = await Settings.get();
+                const state = s?.accessLogs?.state;
+                if (state === 'enabling' || state === 'disabling' || state === 'error') {
+                    logger.info(`[AccessLogs] state '${state}' at boot — resuming reconciliation`);
+                    await require('./src/services/accessLogs/provisionService').reconcileAll();
+                }
+            } catch (e) {
+                logger.warn(`[AccessLogs] boot reconcile skipped: ${e.message}`);
+            }
+        }, 30 * 1000);
+
     } catch (err) {
         logger.error(`[Server] Startup failed: ${err.message}`);
         process.exit(1);
@@ -877,6 +997,11 @@ function setupCronJobs() {
         } catch (error) {
             logger.error(`[Cron] Cascade health check failed: ${error.message}`);
         }
+        try {
+            await require('./src/services/diskMonitorService').check();
+        } catch (error) {
+            logger.error(`[Cron] Disk monitor failed: ${error.message}`);
+        }
     });
 
     // Panel cert rotation watcher — every 5 minutes.
@@ -910,6 +1035,16 @@ function setupCronJobs() {
             logger.error(`[Cron] Daily snapshot failed: ${error.message}`);
         }
     });
+
+    // Access-logs IP-sharing alert — every hour. Self-gated (no-op unless access
+    // logs + webhook + ipAlert are enabled); heavy aggregation runs on ClickHouse.
+    cron.schedule('0 * * * *', async () => {
+        try {
+            await require('./src/services/accessLogs/ipAlertService').check();
+        } catch (error) {
+            logger.error(`[Cron] IP alert check failed: ${error.message}`);
+        }
+    });
     
     // Save monthly snapshot and cleanup at 00:05
     cron.schedule('5 0 * * *', async () => {
@@ -933,6 +1068,41 @@ function setupCronJobs() {
         }
     });
     
+    // Access-logs retention is enforced natively by the ClickHouse TTL on the
+    // access_events table (set via settings), so the panel runs no retention job.
+
+    // Probe rollups at 5 minutes past the hour: fold the finished hour of raw
+    // windows into the hourly read index so long dashboard ranges never
+    // aggregate raw documents.
+    cron.schedule('5 * * * *', async () => {
+        try {
+            const rollupService = require('./src/services/probes/rollupService');
+            await rollupService.rollupPreviousHour();
+        } catch (error) {
+            logger.error(`[Cron] Probe rollup failed: ${error.message}`);
+        }
+    });
+
+    // Probe liveness check every 5 minutes (alerts on silent probes).
+    cron.schedule('*/5 * * * *', async () => {
+        try {
+            const rollupService = require('./src/services/probes/rollupService');
+            await rollupService.checkLiveness();
+        } catch (error) {
+            logger.error(`[Cron] Probe liveness check failed: ${error.message}`);
+        }
+    });
+
+    // Probe retention daily at 00:20.
+    cron.schedule('20 0 * * *', async () => {
+        try {
+            const rollupService = require('./src/services/probes/rollupService');
+            await rollupService.cleanup();
+        } catch (error) {
+            logger.error(`[Cron] Probe cleanup failed: ${error.message}`);
+        }
+    });
+
     // Clean inactive HWID device rows (daily 03:30)
     cron.schedule('30 3 * * *', async () => {
         try {

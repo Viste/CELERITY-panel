@@ -17,6 +17,7 @@ const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 const { getNodesByGroups, getSettings, parseDurationSeconds, normalizeHopInterval } = require('../utils/helpers');
+const { formatTraffic } = require('../utils/formatTraffic');
 const { getDateLocale, normalizeLanguage } = require('../middleware/i18n');
 const uaStats = require('../services/uaStatsService');
 const { extractHwidHeaders } = require('../utils/hwidHeaders');
@@ -59,13 +60,7 @@ function isBrowser(req) {
 }
 
 async function getUserByToken(token) {
-    // Single query instead of two (optimization)
-    const user = await HyUser.findOne({
-        $or: [
-            { subscriptionToken: token },
-            { userId: token }
-        ]
-    })
+    const user = await HyUser.findOne({ subscriptionToken: token })
         .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray cascadeRole groups virtual')
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
@@ -91,6 +86,31 @@ function getSubscriptionTitle(user) {
  */
 function encodeTitle(text) {
     return `base64:${Buffer.from(text).toString('base64')}`;
+}
+
+/**
+ * Build a Content-Disposition value for a subscription filename (RFC 6266).
+ *
+ * Node rejects any header value containing bytes outside ISO-8859-1, so a
+ * username written in Cyrillic (probe users are named after the probe) would
+ * throw and turn the whole subscription into a 500. The ASCII form keeps old
+ * clients working, `filename*` carries the original name for the rest.
+ */
+/**
+ * Keep a header value only when it is safe to send as-is. Stripping characters
+ * from a URL would produce a broken link, so a value with anything outside
+ * printable ASCII is dropped and the header is omitted.
+ */
+function asciiHeaderValue(value) {
+    const raw = String(value || '').trim();
+    return /^[\x20-\x7e]*$/.test(raw) ? raw : '';
+}
+
+function buildContentDisposition(name) {
+    const raw = String(name || '').trim() || 'subscription';
+    const ascii = raw.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_').trim() || 'subscription';
+    const encoded = encodeURIComponent(raw).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 /**
@@ -137,7 +157,12 @@ async function getActiveNodes(user) {
     }
     
     const lb = settings.loadBalancing || {};
-    
+
+    // Diagnostic probes must see the fleet as it is, not as it should be shown
+    // to customers: hiding an offline node from a probe would switch external
+    // monitoring off exactly when the node needs checking.
+    const isProbe = user.isProbe === true;
+
     // Exclude exit (bridge) and relay nodes — users connect to entry (portal) or standalone nodes only.
     // Traffic is routed through the cascade automatically.
     {
@@ -149,7 +174,7 @@ async function getActiveNodes(user) {
     }
 
     // Filter overloaded nodes (if enabled). Virtual nodes have no capacity.
-    if (lb.hideOverloaded) {
+    if (lb.hideOverloaded && !isProbe) {
         const beforeFilter = nodes.length;
         nodes = nodes.filter(n => {
             if (n.type === 'virtual') return true;
@@ -163,7 +188,7 @@ async function getActiveNodes(user) {
 
     // Filter offline/error nodes flagged by the health checker.
     // Virtual nodes are never pinged (default status='offline') so they bypass.
-    if (lb.hideOffline !== false) {
+    if (lb.hideOffline !== false && !isProbe) {
         const beforeFilter = nodes.length;
         nodes = nodes.filter(n => n.type === 'virtual' || (n.status !== 'offline' && n.status !== 'error'));
         if (nodes.length < beforeFilter) {
@@ -244,10 +269,14 @@ function resolveVirtualSources(nodes, user) {
         // Final guard: source must remain visible to this user via group overlap.
         // Real nodes already passed group filter above, but manual lists may include
         // nodes the user shouldn't see if administrator changed groups since.
-        resolved = resolved.filter(real => {
-            const ids = (real.groups || []).map(g => String(g._id || g));
-            return ids.some(id => userGroupIds.has(id));
-        });
+        // Probes are bound to nodes explicitly and belong to no group, so the
+        // overlap check would drop every balancer from their subscription.
+        if (user.isProbe !== true) {
+            resolved = resolved.filter(real => {
+                const ids = (real.groups || []).map(g => String(g._id || g));
+                return ids.some(id => userGroupIds.has(id));
+            });
+        }
 
         if (resolved.length === 0) {
             logger.debug(`[Sub] Virtual node "${node.name}" dropped: no resolved sources`);
@@ -260,8 +289,10 @@ function resolveVirtualSources(nodes, user) {
 
 function validateUser(user) {
     if (!user) return { valid: false, error: 'Not found' };
-    if (!user.enabled) return { valid: false, error: 'Inactive' };
+    // Expiry is checked before enabled: the scheduler auto-disables expired
+    // users, so an expired account would otherwise report "Inactive".
     if (user.expireAt && new Date(user.expireAt) < new Date()) return { valid: false, error: 'Expired' };
+    if (!user.enabled) return { valid: false, error: 'Inactive' };
     if (user.trafficLimit > 0) {
         const used = (user.traffic?.tx || 0) + (user.traffic?.rx || 0);
         if (used >= user.trafficLimit) return { valid: false, error: 'Traffic exceeded' };
@@ -370,6 +401,10 @@ function getXrayPublishedInbounds(node) {
     const main = {
         port: node.port || 443,
         nameSuffix: '',
+        // Stable identity of this inbound. Unused by client config builders,
+        // consumed by the diagnostic probe manifest to key its results.
+        extraId: null,
+        inboundTag: xray.inboundTag || 'vless-in',
         transport: xray.transport,
         security: xray.security,
         flow: xray.flow,
@@ -400,6 +435,8 @@ function getXrayPublishedInbounds(node) {
             // When uniqueName is set the label fully replaces the node name
             // in the published server name (issue #74).
             uniqueName: !!i.uniqueName,
+            extraId: i.id,
+            inboundTag: i.inboundTag,
             transport: i.transport,
             security: i.security,
             flow: i.flow,
@@ -1762,6 +1799,8 @@ const SUBSCRIPTION_PAGE_TEXTS = {
         copied: 'Скопировано',
         done: 'Готово',
         gb: 'ГБ',
+        tb: 'ТБ',
+        mb: 'МБ',
         used: 'Использовано',
         locations: 'Локаций',
         validUntil: 'Действует до',
@@ -1779,6 +1818,8 @@ const SUBSCRIPTION_PAGE_TEXTS = {
         copied: 'Copied',
         done: 'Done',
         gb: 'GB',
+        tb: 'TB',
+        mb: 'MB',
         used: 'Used',
         locations: 'Locations',
         validUntil: 'Valid until',
@@ -1796,6 +1837,8 @@ const SUBSCRIPTION_PAGE_TEXTS = {
         copied: '已复制',
         done: '完成',
         gb: 'GB',
+        tb: 'TB',
+        mb: 'MB',
         used: '已用',
         locations: '地区',
         validUntil: '有效期至',
@@ -1876,8 +1919,13 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', 
         }
     });
     
-    const trafficUsed = ((user.traffic?.tx || 0) + (user.traffic?.rx || 0)) / (1024 * 1024 * 1024);
-    const trafficLimit = user.trafficLimit ? user.trafficLimit / (1024 * 1024 * 1024) : 0;
+    const trafficUsedBytes = (user.traffic?.tx || 0) + (user.traffic?.rx || 0);
+    const trafficLimitBytes = user.trafficLimit || 0;
+    const trafficUnits = { GB: text.gb, TB: text.tb, MB: text.mb };
+    const trafficUsedLabel = formatTraffic(trafficUsedBytes, { decimals: 1, units: trafficUnits });
+    const trafficLimitLabel = trafficLimitBytes > 0
+        ? formatTraffic(trafficLimitBytes, { decimals: 0, units: trafficUnits })
+        : '';
     const expireDate = user.expireAt ? new Date(user.expireAt).toLocaleDateString(text.dateLocale) : text.unlimited;
     
     // Group by location preserving node sort order (Map keeps insertion order for all key types)
@@ -2402,8 +2450,8 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', 
 
         ${softBlock ? '' : `<div class="stats">
             <div class="stat">
-                <div class="stat-value">${trafficUsed.toFixed(1)} ${text.gb}</div>
-                <div class="stat-label">${text.used}${trafficLimit > 0 ? ` / ${trafficLimit.toFixed(0)} ${text.gb}` : ''}</div>
+                <div class="stat-value">${trafficUsedLabel}</div>
+                <div class="stat-label">${text.used}${trafficLimitLabel ? ` / ${trafficLimitLabel}` : ''}</div>
             </div>
             <div class="stat">
                 <div class="stat-value">${locationsCount}</div>
@@ -3035,7 +3083,7 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
     
     const headers = {
         'Content-Type': `${contentType}; charset=utf-8`,
-        'Content-Disposition': `attachment; filename="${data.username}"`,
+        'Content-Disposition': buildContentDisposition(data.username),
         'Profile-Title': encodeTitle(data.profileTitle),
         'Profile-Update-Interval': String(settings?.subscription?.updateInterval || 12),
         'Subscription-Userinfo': [
@@ -3047,9 +3095,14 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
     };
 
     const sub = settings?.subscription;
-    if (sub?.supportUrl)     headers['support-url']          = sub.supportUrl;
-    if (sub?.webPageUrl)     headers['profile-web-page-url'] = sub.webPageUrl;
-    if (sub?.happProviderId) headers['providerid']            = sub.happProviderId;
+    // Admin-supplied values land in raw headers, where a single non-ASCII byte
+    // makes Node throw and takes the whole subscription down with it.
+    const supportUrl = asciiHeaderValue(sub?.supportUrl);
+    const webPageUrl = asciiHeaderValue(sub?.webPageUrl);
+    const providerId = asciiHeaderValue(sub?.happProviderId);
+    if (supportUrl) headers['support-url']          = supportUrl;
+    if (webPageUrl) headers['profile-web-page-url'] = webPageUrl;
+    if (providerId) headers['providerid']            = providerId;
 
     let content = data.content;
 
@@ -3132,3 +3185,9 @@ module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
 module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
+// Exposed for the diagnostic probe manifest. The probe matches subscription
+// outbounds to nodes by tag, so the panel must predict those tags with the
+// very same code that generates the subscription.
+module.exports.getNodeConfigs = getNodeConfigs;
+module.exports.getXrayPublishedInbounds = getXrayPublishedInbounds;
+module.exports.xrayInboundName = _xrayInboundName;

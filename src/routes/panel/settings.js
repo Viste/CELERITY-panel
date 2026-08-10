@@ -5,6 +5,7 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
+const rateLimit = require('express-rate-limit');
 
 const HyUser = require('../../models/hyUserModel');
 const HyNode = require('../../models/hyNodeModel');
@@ -19,6 +20,7 @@ const cache = require('../../services/cacheService');
 const hwidDeviceService = require('../../services/hwidDeviceService');
 const homepageService = require('../../services/homepageService');
 const syncService = require('../../services/syncService');
+const updateService = require('../../services/updateService');
 const { invalidateSettingsCache } = require('../../utils/helpers');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
@@ -94,6 +96,21 @@ router.get('/settings', async (req, res) => {
             maxBytes: homepageService.MAX_CUSTOM_BYTES,
         };
 
+        // Eligible nodes for access-log collection: client-facing Xray nodes
+        // (standalone or portal). Used by the access-logs settings tab.
+        let accessLogNodes = [];
+        try {
+            const HyNode = require('../../models/hyNodeModel');
+            accessLogNodes = await HyNode.find({
+                type: 'xray',
+                cascadeRole: { $in: ['standalone', 'portal'] },
+            })
+                .select('name cascadeRole agentVersion xray.accessLogs.status xray.accessLogs.lastError xray.accessLogs.lastBatchAt')
+                .lean();
+        } catch (e) {
+            logger.warn(`[Panel] accessLogNodes: ${e.message}`);
+        }
+
         render(res, 'settings', {
             title: res.locals.locales.settings.title,
             page: 'settings',
@@ -107,6 +124,7 @@ router.get('/settings', async (req, res) => {
             homepageInfo,
             migrationGroups,
             marzbanCfg,
+            accessLogNodes,
             message: req.query.message || null,
             error: req.query.error || null,
         });
@@ -157,7 +175,12 @@ router.post('/settings', async (req, res) => {
         setIfPresent('sshPool.connectTimeout', v => parseInt(v) || 15);
         setIfPresent('sshPool.keepAliveInterval', v => parseInt(v) || 30);
         setIfPresent('sshPool.maxRetries', v => parseInt(v) || 2);
-        setBool('nodeAuth.insecure');
+
+        // Node Auth card is a standalone form; an absent checkbox means
+        // "unchecked", so force-apply the boolean when that card is submitted.
+        if (req.body['_nodeAuthSettings'] !== undefined) {
+            updates['nodeAuth.insecure'] = req.body['nodeAuth.insecure'] === 'on';
+        }
 
         // Hysteria IP device limit (its own card on the Subscription tab).
         if (req.body['_hyLimitSettings'] !== undefined) {
@@ -175,6 +198,19 @@ router.post('/settings', async (req, res) => {
             updates['webhook.events'] = rawEvents
                 ? (Array.isArray(rawEvents) ? rawEvents : [rawEvents])
                 : [];
+            const warnPct = parseFloat(req.body['webhook.diskWarnPct']);
+            updates['webhook.diskWarnPct'] = Number.isFinite(warnPct) && warnPct > 0 && warnPct < 100 ? warnPct : 15;
+            const critGb = parseFloat(req.body['webhook.diskCritGb']);
+            updates['webhook.diskCritGb'] = Number.isFinite(critGb) && critGb > 0 ? critGb : 1;
+
+            // Access-logs IP-sharing alert. Clamp to sane bounds; fall back to
+            // defaults on invalid input so a bad value never disables the guard.
+            updates['webhook.ipAlertEnabled'] = req.body['webhook.ipAlertEnabled'] === 'on';
+            const ipThreshold = parseInt(req.body['webhook.ipAlertThreshold'], 10);
+            updates['webhook.ipAlertThreshold'] = Number.isFinite(ipThreshold) && ipThreshold >= 1 && ipThreshold <= 10000 ? ipThreshold : 5;
+            const ipWindow = parseInt(req.body['webhook.ipAlertWindowMinutes'], 10);
+            updates['webhook.ipAlertWindowMinutes'] = Number.isFinite(ipWindow) && ipWindow >= 1 && ipWindow <= 43200 ? ipWindow : 60;
+            updates['webhook.ipAlertIncludeIps'] = req.body['webhook.ipAlertIncludeIps'] === 'on';
         }
 
         // Subscription settings.
@@ -288,6 +324,7 @@ router.post('/settings', async (req, res) => {
 
         // Homepage mode (decoy/custom). File upload has its own endpoint.
         let homepageModeChanged = null;
+        let probeTrafficLimit = null;
         if (req.body['_homepageSettings'] !== undefined) {
             const VALID_MODES = ['nginx', 'custom'];
             const mode = String(req.body['homepage.mode'] || 'nginx');
@@ -337,10 +374,112 @@ router.post('/settings', async (req, res) => {
             }
             updates['backup.s3.keepLast'] = parseInt(req.body['backup.s3.keepLast']) || 30;
         }
-        
+
+        // Access-logs settings (opt-in Xray access-log collection & analytics).
+        // Its own form carries the _accessLogsSettings marker, so an absent
+        // checkbox means "off". Actual node provisioning is kicked off after the
+        // settings are persisted (below), never inline with the request.
+        let accessLogsToggled = false;
+        if (req.body['_accessLogsSettings'] !== undefined) {
+            const wantEnabled = req.body['accessLogs.enabled'] === 'on';
+            updates['accessLogs.enabled'] = wantEnabled;
+            const retention = parseInt(req.body['accessLogs.retentionDays'], 10);
+            updates['accessLogs.retentionDays'] = Number.isFinite(retention)
+                ? Math.min(3650, Math.max(1, retention)) : 30;
+
+            // External ClickHouse connection. The password is only overwritten
+            // when a non-empty value is submitted, so leaving the field blank
+            // keeps the stored credential (never wiped by an empty form field).
+            updates['accessLogs.clickhouse.host'] = String(req.body['accessLogs.clickhouse.host'] || '').trim().slice(0, 255);
+            const chPort = parseInt(req.body['accessLogs.clickhouse.port'], 10);
+            updates['accessLogs.clickhouse.port'] = Number.isFinite(chPort)
+                ? Math.min(65535, Math.max(1, chPort)) : 8123;
+            updates['accessLogs.clickhouse.database'] = String(req.body['accessLogs.clickhouse.database'] || 'default').trim().slice(0, 128);
+            updates['accessLogs.clickhouse.username'] = String(req.body['accessLogs.clickhouse.username'] || 'default').trim().slice(0, 128);
+            updates['accessLogs.clickhouse.secure'] = req.body['accessLogs.clickhouse.secure'] === 'on';
+            const chPassword = req.body['accessLogs.clickhouse.password'];
+            if (chPassword !== undefined && chPassword !== '') {
+                updates['accessLogs.clickhouse.passwordEncrypted'] = cryptoService.encrypt(String(chPassword));
+            }
+            const scope = req.body['accessLogs.nodeScope'] === 'selected' ? 'selected' : 'all';
+            updates['accessLogs.nodeScope'] = scope;
+            const rawNodeIds = req.body['accessLogs.nodeIds'];
+            updates['accessLogs.nodeIds'] = rawNodeIds
+                ? (Array.isArray(rawNodeIds) ? rawNodeIds : [rawNodeIds]).filter(Boolean)
+                : [];
+            updates['accessLogs.maskClientIp'] = req.body['accessLogs.maskClientIp'] === 'on';
+            // Ingest URL must be an absolute http(s) URL; anything else is
+            // silently dropped to the default (derived from BASE_URL).
+            const rawIngestUrl = String(req.body['accessLogs.ingestUrl'] || '').trim().slice(0, 500);
+            let ingestUrl = '';
+            if (rawIngestUrl) {
+                try {
+                    const u = new URL(rawIngestUrl);
+                    if (u.protocol === 'https:' || u.protocol === 'http:') ingestUrl = rawIngestUrl;
+                } catch (_) { /* invalid URL -> fall back to derived */ }
+            }
+            updates['accessLogs.ingestUrl'] = ingestUrl;
+            updates['accessLogs.state'] = wantEnabled ? 'enabling' : 'disabling';
+            if (wantEnabled) updates['accessLogs.lastEnabledAt'] = new Date();
+            accessLogsToggled = true;
+        }
+
+        // Probe settings (opt-in external diagnostics). Its own form carries the
+        // _probesSettings marker, so an absent checkbox means "off". Sizes are
+        // entered in GB/MB and stored as bytes.
+        if (req.body['_probesSettings'] !== undefined) {
+            const intInRange = (raw, fallback, min, max) => {
+                const n = parseInt(raw, 10);
+                return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+            };
+
+            updates['probes.enabled'] = req.body['probes.enabled'] === 'on';
+            updates['probes.transportIntervalSec'] = intInRange(req.body['probes.transportIntervalSec'], 300, 60, 86400);
+            updates['probes.targetsIntervalSec'] = intInRange(req.body['probes.targetsIntervalSec'], 3600, 300, 86400);
+            updates['probes.reportIntervalSec'] = intInRange(req.body['probes.reportIntervalSec'], 900, 60, 86400);
+            updates['probes.retentionDays'] = intInRange(req.body['probes.retentionDays'], 30, 1, 365);
+            updates['probes.probeTrafficLimitBytes'] =
+                intInRange(req.body['probes.probeTrafficLimitGB'], 5, 0, 10000) * 1024 * 1024 * 1024;
+
+            updates['probes.speedTest.enabled'] = req.body['probes.speedTest.enabled'] === 'on';
+            updates['probes.speedTest.intervalSec'] =
+                intInRange(req.body['probes.speedTest.intervalMin'], 180, 5, 1440) * 60;
+            updates['probes.speedTest.maxBytes'] =
+                intInRange(req.body['probes.speedTest.maxMB'], 20, 1, 1024) * 1024 * 1024;
+            updates['probes.speedTest.maxSeconds'] = intInRange(req.body['probes.speedTest.maxSeconds'], 5, 1, 60);
+            updates['probes.speedTest.dailyBudgetBytes'] =
+                intInRange(req.body['probes.speedTest.dailyBudgetGB'], 1, 0, 1000) * 1024 * 1024 * 1024;
+
+            // Checklist entries are edited as "id|url" lines. Invalid lines are
+            // dropped rather than rejected, so one typo cannot block the save.
+            const rawTargets = String(req.body['probes.targetsRaw'] || '');
+            const seenTargetIds = new Set();
+            updates['probes.targets'] = rawTargets
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .map((line) => {
+                    const [id, url, label] = line.split('|').map((part) => (part || '').trim());
+                    return { id: id.slice(0, 32), url: (url || '').slice(0, 500), label: (label || '').slice(0, 64) };
+                })
+                .filter((target) => {
+                    if (!target.id || !/^https?:\/\//i.test(target.url)) return false;
+                    if (seenTargetIds.has(target.id)) return false;
+                    seenTargetIds.add(target.id);
+                    return true;
+                })
+                .slice(0, 25)
+                .map((target) => ({ ...target, enabled: true }));
+
+            probeTrafficLimit = updates['probes.probeTrafficLimitBytes'];
+        }
+
         await Settings.update(updates);
         
         await invalidateSettingsCache();
+        // Sidebar entries for optional features are cached per process; drop it
+        // so a toggled feature appears in the menu on the next page load.
+        require('../../utils/featureFlags').invalidateFeatureFlags();
         if (req.body['_backupSettings'] || req.body['backup.enabled'] !== undefined) {
             require('../../services/backupService').resetS3Client();
         }
@@ -354,12 +493,53 @@ router.post('/settings', async (req, res) => {
         if (systemTabSubmit) {
             await cache.invalidateAllSubscriptions();
         }
+
+        if (req.body['_probesSettings'] !== undefined) {
+            // Toggling the feature must take effect on the next probe request,
+            // not after the ingest route's cache expires.
+            try {
+                require('../probe').invalidateFeatureCache();
+            } catch (_) { /* route not mounted in this process */ }
+        }
+
+        // The probe traffic cap only protects the operator if it also applies
+        // to probes that already exist.
+        if (probeTrafficLimit !== null) {
+            try {
+                await require('../../services/probes/enrollService')
+                    .applyProbeTrafficLimit(probeTrafficLimit);
+            } catch (err) {
+                logger.warn(`[Panel] Could not apply probe traffic limit: ${err.message}`);
+            }
+        }
         
         const sshPool = require('../../services/sshPoolService');
         await sshPool.reloadSettings();
 
         if (homepageModeChanged) {
             await homepageService.setMode(homepageModeChanged);
+        }
+
+        // Kick off access-log reconciliation in the background so the request
+        // stays fast (Xray restarts on nodes must not block the HTTP response).
+        // Also ensure the ClickHouse schema exists and its retention TTL matches
+        // the saved setting; both are idempotent and off the request path.
+        if (accessLogsToggled) {
+            setImmediate(async () => {
+                const clickhouse = require('../../services/accessLogs/clickhouseService');
+                try {
+                    clickhouse.reset();
+                    if (await clickhouse.isConfigured()) {
+                        await clickhouse.ensureSchema();
+                        await clickhouse.applyRetention(updates['accessLogs.retentionDays']);
+                    }
+                } catch (err) {
+                    logger.error('[AccessLogs] ClickHouse setup after settings save failed:', err.message);
+                }
+                require('../../services/accessLogs/provisionService')
+                    .reconcileAll()
+                    .catch(err => logger.error('[AccessLogs] Reconcile after settings save failed:', err.message));
+            });
         }
 
         logger.info(`[Panel] Settings updated`);
@@ -745,6 +925,40 @@ router.post('/settings/test-s3', async (req, res) => {
     }
 });
 
+// POST /settings/test-clickhouse - Verify ClickHouse credentials before saving.
+router.post('/settings/test-clickhouse', async (req, res) => {
+    try {
+        const clickhouse = require('../../services/accessLogs/clickhouseService');
+        const host = String(req.body.host || '').trim();
+        if (!host) {
+            return res.status(400).json({ error: res.locals.t?.('accessLogs.chHostRequired') || 'Host is required' });
+        }
+        // If the password field was left blank, fall back to the stored one so a
+        // test on an existing config does not require re-typing the secret.
+        let passwordEncrypted = '';
+        if (!req.body.password) {
+            const settings = await Settings.get();
+            passwordEncrypted = settings?.accessLogs?.clickhouse?.passwordEncrypted || '';
+        }
+        const result = await clickhouse.testConnection({
+            host,
+            port: req.body.port,
+            database: req.body.database,
+            username: req.body.username,
+            password: req.body.password || '',
+            passwordEncrypted,
+            secure: req.body.secure === 'on' || req.body.secure === true || req.body.secure === 'true',
+        });
+        if (result.ok) {
+            res.json({ success: true, version: result.version });
+        } else {
+            res.status(400).json({ error: result.error });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // GET /settings/backups - List local backups
 router.get('/settings/backups', async (req, res) => {
     try {
@@ -876,11 +1090,17 @@ router.post('/settings/restore-backup', async (req, res) => {
         
         logger.info(`[Restore] Starting restore from ${source}: ${identifier}`);
         
-        await backupService.restoreBackup(settings, source, identifier);
-        
+        const result = await backupService.restoreBackup(settings, source, identifier);
+
         logger.info(`[Restore] Completed successfully`);
-        
-        res.json({ success: true, message: 'Database restored successfully' });
+
+        res.json({
+            success: true,
+            message: 'Database restored successfully',
+            warning: result?.encryptionKey?.status === 'mismatch'
+                ? (res.locals.t?.('settings.restoreKeyMismatch') || 'Backup was created with a different ENCRYPTION_KEY')
+                : null,
+        });
     } catch (error) {
         logger.error(`[Restore] Error: ${error.message}`);
         res.status(500).json({ error: error.message });
@@ -985,6 +1205,113 @@ router.post('/settings/test-webhook', async (req, res) => {
         }
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== PANEL UPDATE ====================
+
+// Forced GitHub re-check is a network egress operation; keep it modest.
+const checkUpdatesLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({ error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.' }),
+});
+
+// Applying an update is the most privileged action in the panel; strict bucket.
+const applyUpdateLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 3,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({ error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.' }),
+});
+
+// GET /settings/update-status - Versions (cached) + updater sidecar status +
+// panel-side flow state (pre-update backup / trigger progress).
+router.get('/settings/update-status', async (req, res) => {
+    try {
+        const [versionInfo, updater] = await Promise.all([
+            updateService.getVersionInfo({ force: false }),
+            updateService.getUpdaterStatus({ force: false }),
+        ]);
+        res.json({ ...versionInfo, updater, flow: updateService.getUpdateFlow() });
+    } catch (error) {
+        logger.error('[Panel] update-status error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /settings/check-updates - Force refresh the GitHub release cache.
+// Only the release feed is re-fetched; the updater sidecar status comes from
+// the micro-cache (a version check must not cost an extra sidecar round-trip).
+router.post('/settings/check-updates', checkUpdatesLimiter, async (req, res) => {
+    try {
+        const versionInfo = await updateService.getVersionInfo({ force: true });
+        const updater = await updateService.getUpdaterStatus({ force: false });
+        res.json({ ...versionInfo, updater });
+    } catch (error) {
+        logger.error('[Panel] check-updates error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /settings/apply-update - Re-auth, back up, then trigger the updater.
+// Body: { version, currentPassword, totpToken?, backup?: boolean }
+router.post('/settings/apply-update', applyUpdateLimiter, async (req, res) => {
+    try {
+        if (!updateService.isUpdaterConfigured()) {
+            return res.status(409).json({ error: res.locals.t?.('settings.updateUpdaterUnavailable') || 'Updater is not available for this deployment' });
+        }
+
+        const version = String(req.body.version || '').trim();
+        const currentPassword = String(req.body.currentPassword || '');
+        const totpToken = String(req.body.totpToken || '');
+        // Default to creating a backup unless the client explicitly opts out.
+        const wantBackup = req.body.backup !== false && req.body.backup !== 'false';
+
+        if (!version) {
+            return res.status(400).json({ error: res.locals.t?.('settings.updateVersionRequired') || 'Version is required' });
+        }
+
+        // Re-authenticate the admin (password, plus TOTP when enabled).
+        const admin = await Admin.verifyPassword(req.session.adminUsername, currentPassword);
+        if (!admin) {
+            return res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentPassword') || 'Invalid current password' });
+        }
+        if (admin.twoFactor?.enabled) {
+            // Empty covers both a missing secret and one that cannot be decrypted
+            // with the current ENCRYPTION_KEY — neither can ever verify a code.
+            const secret = totpService.decryptSecret(admin.twoFactor.secretEncrypted);
+            if (!secret) {
+                return res.status(500).json({ error: res.locals.t?.('auth.totpConfigError') || 'TOTP configuration error' });
+            }
+            const validToken = await totpService.verifyToken({ secret, token: totpToken });
+            if (!validToken) {
+                return res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentTotp') || 'Invalid TOTP code' });
+            }
+        }
+
+        // Whitelist: only versions returned by the GitHub release feed may pass.
+        const known = await updateService.isKnownRelease(version);
+        if (!known) {
+            return res.status(400).json({ error: res.locals.t?.('settings.updateUnknownVersion') || 'Unknown version' });
+        }
+
+        // Kick off the flow (optional backup + updater trigger) in the
+        // background and answer immediately: a mongodump can run for minutes,
+        // far beyond sane HTTP/proxy timeouts. Progress is polled via
+        // update-status. A backup failure aborts the flow before the updater
+        // is ever contacted.
+        const flow = updateService.startUpdateFlow(version, { backup: wantBackup });
+
+        logger.warn(`[Panel] Update to ${version} triggered by admin: ${req.session.adminUsername} (IP: ${req.ip})`);
+
+        res.status(202).json({ accepted: true, version, flow });
+    } catch (error) {
+        logger.error('[Panel] apply-update error:', error.message);
+        res.status(error.statusCode || 500).json({ error: error.message });
     }
 });
 

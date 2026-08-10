@@ -36,10 +36,24 @@ const EVENTS = {
     USER_DEVICE_ADDED: 'user.device_added',
     /** Emitted once per panel process per user when HWID limit blocks subscription. */
     USER_DEVICE_LIMIT_REACHED: 'user.device_limit_reached',
+    /** User connected from more unique IPs than the configured threshold (access logs). */
+    USER_IP_LIMIT_EXCEEDED: 'user.ip_limit_exceeded',
     NODE_ONLINE: 'node.online',
     NODE_OFFLINE: 'node.offline',
     NODE_ERROR: 'node.error',
     SYNC_COMPLETED: 'sync.completed',
+    /** Panel host free disk space dropped below the warning threshold. */
+    HOST_DISK_LOW: 'host.disk_low',
+    /** Panel host free disk space dropped below the critical threshold. */
+    HOST_DISK_CRITICAL: 'host.disk_critical',
+    /** Panel host free disk space recovered above the warning threshold. */
+    HOST_DISK_RECOVERED: 'host.disk_recovered',
+    /** External diagnostic probe stopped reporting. */
+    PROBE_OFFLINE: 'probe.offline',
+    /** A probe could not reach a node inbound; payload carries the failure code. */
+    PROBE_NODE_UNREACHABLE: 'probe.node_unreachable',
+    /** A checklist resource became unreachable through a node (geo-block, blacklist). */
+    PROBE_TARGET_UNREACHABLE: 'probe.target_unreachable',
 };
 
 /** Dedup device-limit webhooks (in-memory; resets on restart). */
@@ -154,10 +168,17 @@ const _SAMPLE_BUILDERS = {
     'user.expired': () => ({ userId: 'sample-user', expireAt: new Date().toISOString() }),
     'user.device_added': () => ({ userId: 'sample-user', hwid: 'sample-hwid', userAgent: 'Sample/1.0' }),
     'user.device_limit_reached': () => ({ userId: 'sample-user', maxDevices: 2 }),
+    'user.ip_limit_exceeded': () => ({ userId: 'sample-user', ips: 8, threshold: 5, windowMinutes: 60, ipList: ['1.2.3.4', '5.6.7.8'] }),
     'node.online': () => ({ nodeId: 'sample-node', name: 'Sample Node' }),
     'node.offline': () => ({ nodeId: 'sample-node', name: 'Sample Node', lastError: 'connection refused' }),
     'node.error': () => ({ nodeId: 'sample-node', name: 'Sample Node', error: 'sample error' }),
     'sync.completed': () => ({ ok: 1, failed: 0, totalUsers: 1 }),
+    'host.disk_low': () => ({ path: '/', freeBytes: 2147483648, totalBytes: 53687091200, usedPct: 96, level: 'low' }),
+    'host.disk_critical': () => ({ path: '/', freeBytes: 1073741824, totalBytes: 53687091200, usedPct: 98, level: 'critical' }),
+    'host.disk_recovered': () => ({ path: '/', freeBytes: 10737418240, totalBytes: 53687091200, usedPct: 80, level: 'ok' }),
+    'probe.offline': () => ({ probeId: 'sample-probe', probeName: 'Moscow', country: 'RU', asn: 'AS12345', lastSeenAt: new Date().toISOString() }),
+    'probe.node_unreachable': () => ({ probeId: 'sample-probe', probeName: 'Moscow', country: 'RU', asn: 'AS12345', nodeId: 'sample-node', nodeName: 'Sample Node', inboundId: 'main', code: 'handshake_failed', message: 'tls handshake timeout' }),
+    'probe.target_unreachable': () => ({ probeId: 'sample-probe', probeName: 'Moscow', country: 'RU', asn: 'AS12345', nodeId: 'sample-node', nodeName: 'Sample Node', targetId: 'openai', httpStatus: 403, message: 'blocked' }),
 };
 
 function _sampleDataFor(event) {

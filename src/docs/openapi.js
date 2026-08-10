@@ -301,6 +301,7 @@ function addCommonExamples(target) {
                 enabled: true,
                 groups: ['64a1b2c3d4e5f6a7b8c9d0e1'],
                 trafficLimit: 10737418240,
+                maxDevices: 1,
                 expireAt: '2026-12-31T23:59:59.000Z',
             },
         },
@@ -501,6 +502,7 @@ function addCommonExamples(target) {
                 onlineUsers: 12,
                 lastError: '',
                 lastSync: '2026-05-18T17:00:00.000Z',
+                load: { txMbps: 12.4, rxMbps: 87.1, updatedAt: '2026-05-18T17:00:00.000Z' },
             },
         },
         McpToolsResponse: {
@@ -928,6 +930,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     enabled:      { type: 'boolean', default: false },
                     groups:       { type: 'array', items: { type: 'string' }, example: [] },
                     trafficLimit: { type: 'integer', example: 0, description: 'Bytes, 0 = unlimited' },
+                    maxDevices:   { type: 'integer', example: 0, description: '0 = from min of groups, -1 = unlimited' },
                     expireAt:     { type: 'string', format: 'date-time', nullable: true },
                 },
             },
@@ -987,8 +990,11 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     traffic: {
                         type: 'object',
                         properties: {
-                            tx: { type: 'integer' },
-                            rx: { type: 'integer' },
+                            tx: { type: 'integer', description: 'Total uploaded bytes (all-time)' },
+                            rx: { type: 'integer', description: 'Total downloaded bytes (all-time)' },
+                            txMbps: { type: 'number', example: 12.4, description: 'Average upload load in Mbit/s since the previous stats poll (~5 min window, not instantaneous)' },
+                            rxMbps: { type: 'number', example: 87.1, description: 'Average download load in Mbit/s since the previous stats poll (~5 min window, not instantaneous)' },
+                            speedUpdatedAt: { type: 'string', format: 'date-time', nullable: true, description: 'When txMbps/rxMbps were last computed' },
                         },
                     },
                     // Hysteria 2 advanced configuration
@@ -1368,6 +1374,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
         { name: 'Nodes',  description: 'Node management — scope: `nodes:read` / `nodes:write`' },
         { name: 'Cascade', description: 'Cascade tunnel management — scope: `nodes:read` / `nodes:write`' },
         { name: 'MCP',    description: 'Model Context Protocol endpoint — scope: `mcp:enabled`' },
+        { name: 'Probes', description: 'External diagnostic probes — authenticated with a probe token, not an API key' },
         { name: 'Sync',   description: 'Synchronization and user kicking — scope: `sync:write`' },
         { name: 'Public', description: 'Public endpoints — no authentication required' },
     ],
@@ -2134,7 +2141,11 @@ See the request body examples panel for both flavours.`,
             get: {
                 tags: ['Nodes'],
                 summary: 'Get stored node status',
-                description: 'Returns the status currently stored in the panel database.',
+                description: `Returns the status currently stored in the panel database, including \`load\` —
+average Mbit/s since the previous stats-collection poll (cron runs every 5 minutes).
+This is a byproduct of the traffic accounting the panel already does for quotas/billing,
+not a live SSH probe, so it's cheap to poll frequently and safe to call from external
+integrations. Resolution is bound to the collection interval (~5 min), not per-second.`,
                 responses: {
                     200: {
                         description: 'Node status',
@@ -2148,6 +2159,15 @@ See the request body examples panel for both flavours.`,
                                         onlineUsers: { type: 'integer' },
                                         lastError:   { type: 'string' },
                                         lastSync:    { type: 'string', format: 'date-time', nullable: true },
+                                        load: {
+                                            type: 'object',
+                                            description: 'Average load since the previous ~5 min stats poll (not instantaneous).',
+                                            properties: {
+                                                txMbps:    { type: 'number', example: 12.4 },
+                                                rxMbps:    { type: 'number', example: 87.1 },
+                                                updatedAt: { type: 'string', format: 'date-time', nullable: true },
+                                            },
+                                        },
                                     },
                                 },
                             },
@@ -2655,6 +2675,120 @@ See the request body examples panel for both flavours.`,
                     400: { description: 'positions must be an array', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, examples: { invalid: { value: { error: 'positions must be an array' } } } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
+                },
+            },
+        },
+
+        // ── Probes ─────────────────────────────────────────────────────────────
+
+        '/probe/enroll': {
+            post: {
+                tags: ['Probes'],
+                summary: 'Exchange an enrollment token for a probe token',
+                description: 'Called once by a freshly installed probe. The enrollment token is single-use and short-lived; the permanent token it returns authenticates every later request. Rejected with 403 while the probes feature is disabled.',
+                security: [],
+                requestBody: {
+                    required: true,
+                    content: {
+                        'application/json': {
+                            schema: {
+                                type: 'object',
+                                properties: {
+                                    enrollToken: { type: 'string', description: 'May also be sent as a Bearer token' },
+                                    version: { type: 'string' },
+                                    singboxVersion: { type: 'string' },
+                                    os: { type: 'string' },
+                                    arch: { type: 'string' },
+                                },
+                            },
+                        },
+                    },
+                },
+                responses: {
+                    201: {
+                        description: 'Enrolled',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        token: { type: 'string' },
+                                        probeId: { type: 'string' },
+                                        name: { type: 'string' },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    401: { description: 'Missing, invalid or expired enrollment token' },
+                    403: { description: 'Probes are disabled' },
+                    429: { $ref: '#/components/responses/RateLimited' },
+                },
+            },
+        },
+
+        '/probe/profile': {
+            get: {
+                tags: ['Probes'],
+                summary: 'Get the checking plan for this probe',
+                description: 'Returns the nodes and inbounds to check with the sing-box outbound tag each one will carry in the subscription, plus the resource checklist, cadence, speed-test budget and the subscription URL. Requires the probe Bearer token.',
+                security: [{ BearerToken: [] }],
+                responses: {
+                    200: {
+                        description: 'Manifest',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        probeId: { type: 'string' },
+                                        name: { type: 'string' },
+                                        subscriptionUrl: { type: 'string' },
+                                        ingestUrl: { type: 'string' },
+                                        intervals: {
+                                            type: 'object',
+                                            properties: {
+                                                transportSec: { type: 'integer' },
+                                                targetsSec: { type: 'integer' },
+                                                reportSec: { type: 'integer' },
+                                            },
+                                        },
+                                        speedTest: { type: 'object' },
+                                        targets: { type: 'array', items: { type: 'object' } },
+                                        nodes: { type: 'array', items: { type: 'object' } },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    401: { $ref: '#/components/responses/Unauthorized' },
+                    403: { description: 'Probes are disabled' },
+                },
+            },
+        },
+
+        '/probe/ingest': {
+            post: {
+                tags: ['Probes'],
+                summary: 'Submit probe measurements',
+                description: 'Accepts gzipped NDJSON rollup windows (kinds: transport, target, event, meta). `X-Batch-Id` must be the SHA-256 of the body; identical redelivered batches are acknowledged without reprocessing, which makes at-least-once shipping safe.',
+                security: [{ BearerToken: [] }],
+                requestBody: {
+                    required: true,
+                    content: {
+                        'application/x-ndjson': {
+                            schema: { type: 'string', format: 'binary' },
+                        },
+                    },
+                },
+                responses: {
+                    202: { description: 'Accepted' },
+                    200: { description: 'Duplicate batch, already processed' },
+                    400: { description: 'Empty body or batch id mismatch' },
+                    401: { $ref: '#/components/responses/Unauthorized' },
+                    403: { description: 'Probes are disabled' },
+                    413: { description: 'Payload too large' },
+                    429: { $ref: '#/components/responses/RateLimited' },
                 },
             },
         },

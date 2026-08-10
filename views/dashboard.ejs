@@ -31,21 +31,9 @@
             <span class="stat-icon"><i class="ti ti-chart-bar"></i></span>
             <span class="stat-trend"><%= t('dashboard.total') %></span>
         </div>
-        <% 
-        const totalGB = (stats.traffic?.total || 0) / (1024 * 1024 * 1024);
-        const txGB = (stats.traffic?.tx || 0) / (1024 * 1024 * 1024);
-        const rxGB = (stats.traffic?.rx || 0) / (1024 * 1024 * 1024);
-        
-        const formatTraffic = (gb) => {
-            if (gb >= 1000) {
-                return (gb / 1024).toFixed(2) + ' TB';
-            }
-            return gb.toFixed(1) + ' GB';
-        };
-        %>
-        <div class="stat-value"><%= formatTraffic(totalGB) %></div>
-        <div class="stat-label" title="<%= t('common.upload') || 'Upload' %> <%= formatTraffic(txGB) %> / <%= t('common.download') || 'Download' %> <%= formatTraffic(rxGB) %>">
-            <i class="ti ti-arrow-up" style="color:var(--success)"></i> <%= formatTraffic(txGB) %> / <i class="ti ti-arrow-down" style="color:var(--info)"></i> <%= formatTraffic(rxGB) %>
+        <div class="stat-value"><%= formatTraffic(stats.traffic?.total || 0) %></div>
+        <div class="stat-label" title="<%= t('common.upload') || 'Upload' %> <%= formatTraffic(stats.traffic?.tx || 0) %> / <%= t('common.download') || 'Download' %> <%= formatTraffic(stats.traffic?.rx || 0) %>">
+            <i class="ti ti-arrow-up" style="color:var(--success)"></i> <%= formatTraffic(stats.traffic?.tx || 0) %> / <i class="ti ti-arrow-down" style="color:var(--info)"></i> <%= formatTraffic(stats.traffic?.rx || 0) %>
         </div>
     </div>
 </div>
@@ -289,6 +277,13 @@
                         <span class="sys-value" id="ramValue">—</span>
                     </div>
                     <div class="sys-item">
+                        <span class="sys-label"><%= t('stats.serverDisk') || 'Disk' %></span>
+                        <div class="progress-bar-wrap">
+                            <div class="progress-bar" id="diskBar" style="width: 0%"></div>
+                        </div>
+                        <span class="sys-value" id="diskValue">—</span>
+                    </div>
+                    <div class="sys-item">
                         <span class="sys-label">RPS</span>
                         <span class="sys-value" id="rpsValue">—</span>
                     </div>
@@ -380,7 +375,7 @@
     font-size: 0.8rem;
     color: var(--text-muted);
 }
-.node-load .cpu, .node-load .mem {
+.node-load .cpu, .node-load .mem, .node-load .disk {
     display: block;
 }
 .node-speed {
@@ -676,7 +671,19 @@ async function loadSystemStats() {
             ramBar.style.width = ramPercent + '%';
             ramBar.className = 'progress-bar' + (ramPercent > 80 ? ' high' : ramPercent > 60 ? ' medium' : '');
             document.getElementById('ramValue').textContent = ramPercent + '%';
-            
+
+            // Disk (panel host filesystem)
+            const diskBar = document.getElementById('diskBar');
+            if (diskBar && data.disk && data.disk.total > 0) {
+                const diskPercent = data.disk.percent || 0;
+                diskBar.style.width = diskPercent + '%';
+                diskBar.className = 'progress-bar' + (diskPercent > 90 ? ' high' : diskPercent > 75 ? ' medium' : '');
+                const freeGB = (data.disk.free / 1073741824).toFixed(1);
+                document.getElementById('diskValue').textContent = `${diskPercent}% (${freeGB} GB free)`;
+            } else if (diskBar) {
+                document.getElementById('diskValue').textContent = 'n/a';
+            }
+
             // RPS (Requests Per Second)
             const rps = data.requests?.rps || 0;
             const rpm = data.requests?.rpm || 0;
@@ -710,19 +717,24 @@ async function loadNodesStats(onlyIds) {
         if (data.success) {
             const cpuPercent = data.cpu.percent != null ? data.cpu.percent : Math.min(Math.round((data.cpu.load1 / data.cpu.cores) * 100), 100);
             const memPercent = data.mem.percent;
-            
+            const diskPercent = data.disk && data.disk.total > 0 ? data.disk.percent : null;
+
             let cpuColor = 'var(--text-primary)';
             if (cpuPercent >= 80) cpuColor = '#ef4444';
             else if (cpuPercent >= 60) cpuColor = '#f59e0b';
-            
+
+            const diskDesktop = diskPercent != null ? `<span class="disk">Disk: ${diskPercent}%</span>` : '';
+            const diskMobile = diskPercent != null ? ` / ${diskPercent}%` : '';
+
             if (desktopEl) {
                 desktopEl.innerHTML = `
                     <span class="cpu" style="color: ${cpuColor}">CPU: ${cpuPercent}%</span>
                     <span class="mem">RAM: ${memPercent}%</span>
+                    ${diskDesktop}
                 `;
             }
             if (mobileEl) {
-                mobileEl.innerHTML = `<span style="color: ${cpuColor}">${cpuPercent}%</span> / ${memPercent}%`;
+                mobileEl.innerHTML = `<span style="color: ${cpuColor}">${cpuPercent}%</span> / ${memPercent}%${diskMobile}`;
             }
         } else {
             if (desktopEl) desktopEl.innerHTML = '<span class="load-placeholder">N/A</span>';

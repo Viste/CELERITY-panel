@@ -73,6 +73,15 @@ const settingsSchema = new mongoose.Schema({
         secret: { type: String, default: '' },
         // empty = all events; non-empty = only listed events
         events: { type: [String], default: [] },
+        // Disk-space alert thresholds for the panel host (issue #103)
+        diskWarnPct: { type: Number, default: 15 }, // warn when free space % < this
+        diskCritGb: { type: Number, default: 1 },   // critical when free space < this many GiB
+        // Access-logs IP-sharing alert (fires user.ip_limit_exceeded).
+        // Requires access logs enabled; checked hourly by ipAlertService.
+        ipAlertEnabled: { type: Boolean, default: false },
+        ipAlertThreshold: { type: Number, default: 5 },        // unique IPs per user
+        ipAlertWindowMinutes: { type: Number, default: 60 },   // sliding analysis window
+        ipAlertIncludeIps: { type: Boolean, default: false },  // include IP list in payload (privacy)
     },
 
     subscription: {
@@ -130,6 +139,95 @@ const settingsSchema = new mongoose.Schema({
         completed:   { type: Boolean, default: false },
         profile:     { type: String, enum: ['', 'self-host', 'remote'], default: '' },
         completedAt: { type: Date, default: null },
+    },
+
+    // Opt-in Xray access-logs collection & analytics. Disabled by default so
+    // the pipeline stays completely inert (no node provisioning, no ingest)
+    // until an admin explicitly turns it on.
+    accessLogs: {
+        // Admin-requested state. Runtime reconciliation flips `state` as the
+        // per-node provisioning progresses.
+        enabled: { type: Boolean, default: false },
+        state: {
+            type: String,
+            enum: ['disabled', 'enabling', 'active', 'disabling', 'error'],
+            default: 'disabled',
+        },
+        // Retention window (days). Mapped to a native ClickHouse TTL on the
+        // access_events table; still admin-configurable.
+        retentionDays: { type: Number, default: 30 },
+        // External ClickHouse connection. The password is AES-encrypted at rest
+        // (cryptoService); everything analytical runs on this server, not the
+        // panel. Empty host = feature not backed by storage.
+        clickhouse: {
+            host: { type: String, default: '' },
+            port: { type: Number, default: 8123 },
+            database: { type: String, default: 'default' },
+            username: { type: String, default: 'default' },
+            passwordEncrypted: { type: String, default: '' },
+            secure: { type: Boolean, default: false },
+        },
+        // Which nodes ship access logs: all eligible xray nodes, or a subset.
+        nodeScope: { type: String, enum: ['all', 'selected'], default: 'all' },
+        nodeIds: { type: [String], default: [] },
+        // Privacy: mask client IPs before storage. When on, exact source-IP
+        // search is not possible (documented in the UI).
+        maskClientIp: { type: Boolean, default: false },
+        // Full ingest endpoint pushed to agents; empty = derive from BASE_URL.
+        ingestUrl: { type: String, default: '' },
+        lastEnabledAt: { type: Date, default: null },
+        // Aggregate ingest counters for the settings dashboard.
+        stats: {
+            ingestedBatches: { type: Number, default: 0 },
+            rejectedBatches: { type: Number, default: 0 },
+            duplicateBatches: { type: Number, default: 0 },
+            lastIngestAt: { type: Date, default: null },
+        },
+    },
+
+    // External diagnostic probes. Opt-in like access logs: while `enabled` is
+    // false no enrollment or ingest is accepted, so the feature stays inert.
+    // Cadence defaults follow the light profile: cheap transport checks every
+    // 5 minutes, resource checklist hourly, reports shipped every 15 minutes.
+    probes: {
+        enabled: { type: Boolean, default: false },
+        transportIntervalSec: { type: Number, default: 300 },
+        targetsIntervalSec: { type: Number, default: 3600 },
+        reportIntervalSec: { type: Number, default: 900 },
+        // Bounded throughput measurement. Off by default: it burns real node
+        // traffic the operator pays for. `intervalSec` is how often a single
+        // node is measured; the probe walks its fleet round-robin within that
+        // period, and the daily byte budget stays as the hard backstop.
+        speedTest: {
+            enabled: { type: Boolean, default: false },
+            intervalSec: { type: Number, default: 3 * 3600 },
+            maxBytes: { type: Number, default: 20 * 1024 * 1024 },
+            maxSeconds: { type: Number, default: 5 },
+            dailyBudgetBytes: { type: Number, default: 1024 * 1024 * 1024 },
+        },
+        // Resource checklist evaluated through every node. A failure here is a
+        // separate measurement, not a node outage.
+        targets: {
+            type: [{
+                _id: false,
+                id: { type: String },
+                url: { type: String },
+                label: { type: String, default: '' },
+                enabled: { type: Boolean, default: true },
+            }],
+            default: [],
+        },
+        retentionDays: { type: Number, default: 30 },
+        // Traffic cap applied to every hidden probe user (bytes).
+        probeTrafficLimitBytes: { type: Number, default: 5 * 1024 * 1024 * 1024 },
+        // Full ingest base URL handed to probes; empty = derive from BASE_URL.
+        ingestUrl: { type: String, default: '' },
+        stats: {
+            ingestedBatches: { type: Number, default: 0 },
+            rejectedBatches: { type: Number, default: 0 },
+            duplicateBatches: { type: Number, default: 0 },
+            lastIngestAt: { type: Date, default: null },
+        },
     },
 
     homepage: {

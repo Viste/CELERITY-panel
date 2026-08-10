@@ -46,9 +46,9 @@
                 <div class="detail-grid">
                     <div class="detail-item">
                         <label><%= t('users.traffic') %></label>
-                        <% const used = ((user.traffic?.tx || 0) + (user.traffic?.rx || 0)) / (1024*1024*1024); %>
-                        <% const limit = user.trafficLimit ? user.trafficLimit / (1024*1024*1024) : 0; %>
-                        <span class="value"><%= used.toFixed(2) %> / <%= limit > 0 ? limit.toFixed(0) + ' GB' : '∞' %></span>
+                        <% const usedBytes = (user.traffic?.tx || 0) + (user.traffic?.rx || 0); %>
+                        <% const limitBytes = user.trafficLimit || 0; %>
+                        <span class="value"><%= formatTraffic(usedBytes, { decimals: 2 }) %> / <%= limitBytes > 0 ? formatTraffic(limitBytes, { decimals: 0 }) : '∞' %></span>
                     </div>
                     <div class="detail-item">
                         <label><%= t('users.devices') %></label>
@@ -70,8 +70,8 @@
                     <div class="detail-item">
                         <label><%= t('users.txRx') %></label>
                         <span class="value">
-                            <i class="ti ti-arrow-up" style="color:var(--success)"></i> <%= ((user.traffic?.tx || 0) / (1024*1024*1024)).toFixed(2) %> / 
-                            <i class="ti ti-arrow-down" style="color:var(--info)"></i> <%= ((user.traffic?.rx || 0) / (1024*1024*1024)).toFixed(2) %> GB
+                            <i class="ti ti-arrow-up" style="color:var(--success)"></i> <%= formatTraffic(user.traffic?.tx || 0, { decimals: 2 }) %> / 
+                            <i class="ti ti-arrow-down" style="color:var(--info)"></i> <%= formatTraffic(user.traffic?.rx || 0, { decimals: 2 }) %>
                         </span>
                     </div>
                     <div class="detail-item">
@@ -174,10 +174,14 @@
                         <i class="ti ti-clipboard"></i> <%= t('users.copySubscription') %>
                     </button>
                     
-                    <a href="<%= baseUrl %>/api/files/<%= user.subscriptionToken || user.userId %>" 
+                    <a href="<%= baseUrl %>/api/files/<%= user.subscriptionToken %>" 
                        target="_blank" class="btn btn-block">
                         <i class="ti ti-external-link"></i> <%= t('users.openSubscription') %>
                     </a>
+                    
+                    <button class="btn btn-block" onclick="resetTraffic()">
+                        <i class="ti ti-refresh"></i> <%= t('users.resetTraffic') %>
+                    </button>
                     
                     <hr>
                     
@@ -196,7 +200,7 @@
                 <div id="qrcode" style="text-align:center;margin-bottom:12px;"></div>
                 <p class="hint mb-1"><%= t('users.universalLink') %></p>
                 <input type="text" readonly class="input-readonly" 
-                       value="<%= baseUrl %>/api/files/<%= user.subscriptionToken || user.userId %>" id="subLink">
+                       value="<%= baseUrl %>/api/files/<%= user.subscriptionToken %>" id="subLink">
                 <button class="btn btn-sm btn-block mt-1" onclick="copySubscription()"><%= t('common.copy') %></button>
             </div>
         </div>
@@ -213,6 +217,7 @@ const i18n = {
     linkCopied: <%- JSON.stringify(t("users.linkCopied")) %>,
     confirmUnlinkHwid: <%- JSON.stringify(t("users.confirmUnlinkHwid")) %>,
     confirmUnlinkAllHwid: <%- JSON.stringify(t("users.confirmUnlinkAllHwid")) %>,
+    confirmResetTraffic: <%- JSON.stringify(t("users.confirmResetTraffic")) %>,
 };
 
 async function unlinkHwid(hwid) {
@@ -243,6 +248,19 @@ async function unlinkAllHwid() {
 
 async function toggleUser(enabled) {
     const res = await fetch(`/api/users/${userId}/${enabled ? 'enable' : 'disable'}`, {
+        method: 'POST',
+        credentials: 'include'
+    });
+    if (res.ok) location.reload();
+    else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || i18n.error);
+    }
+}
+
+async function resetTraffic() {
+    if (!confirm(i18n.confirmResetTraffic)) return;
+    const res = await fetch(`/api/users/${userId}/reset-traffic`, {
         method: 'POST',
         credentials: 'include'
     });

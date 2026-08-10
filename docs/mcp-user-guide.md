@@ -18,6 +18,7 @@ Through MCP, AI can:
 | 🖥 **Server Configuration** | Configure servers and nodes |
 | 💻 **SSH Commands** | Execute commands on servers remotely |
 | 📊 **Monitoring** | Retrieve statistics and logs |
+| 🔎 **Access Logs** | Run read-only SQL against ClickHouse `access_events` |
 | 🔧 **Diagnostics** | Diagnose and troubleshoot issues |
 
 ---
@@ -130,7 +131,7 @@ curl -X POST https://your-panel.com/api/mcp \
 | `nodes` | 🖥 List of servers | `nodes:read` |
 | `groups` | 📁 Server groups | `stats:read` |
 | `stats` | 📊 Traffic statistics | `stats:read` |
-| `logs` | 📜 System logs | `stats:read` |
+| `logs` | 📜 System logs (panel winston buffer, not ClickHouse) | `stats:read` |
 
 **Parameters:**
 
@@ -152,6 +153,72 @@ curl -X POST https://your-panel.com/api/mcp \
     "resource": "users",
     "filter": { "enabled": true },
     "limit": 50
+  }
+}
+```
+
+</details>
+
+---
+
+### 🔎 query_access_logs — ClickHouse Access Logs
+
+> `stats:read` scope required. Requires Access Logs + ClickHouse configured in panel settings.
+
+Runs a **read-only** SQL query against the ClickHouse `access_events` table (Xray connection events). This is **not** the same as `query` / `resource=logs` (system logs).
+
+Allowed statement types: `SELECT`, `WITH`, `EXPLAIN`, `DESCRIBE`, `SHOW`. Mutations are rejected; results are capped (default 1000 rows, 30s timeout).
+
+**Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `sql` | ✅ Yes | Single read-only ClickHouse SQL statement |
+
+<details>
+<summary>📖 Example: Recent accepted connections for a user</summary>
+
+```json
+{
+  "name": "query_access_logs",
+  "arguments": {
+    "sql": "SELECT event_time, node_id, source_ip, dest_host, dest_ip, dest_port, action FROM access_events WHERE email = 'user123' AND event_time >= now() - INTERVAL 1 DAY ORDER BY event_time DESC LIMIT 100"
+  }
+}
+```
+
+</details>
+
+---
+
+### 📡 query_probes — External Probe Results
+
+> `probes:read` scope required. Requires probes enabled in panel settings.
+
+Returns what external probes observed while dialling your nodes through a real sing-box core, which shows what a client behind a given ISP sees. See the [probes guide](probes.md).
+
+**Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `view` | ❌ No | `probes` (vantage points, default), `nodes` (latest verdict per inbound), `targets` (checklist resources) |
+| `nodeId` | ❌ No | Restrict `nodes` / `targets` views to one node |
+| `probeId` | ❌ No | Restrict results to one probe |
+| `hours` | ❌ No | Look-back window, 1–720 (default 1). Over 24 h reads hourly rollups |
+| `limit` | ❌ No | 1–500 (default 100) |
+
+Verdicts: `net_unreachable`, `handshake_failed`, `auth_rejected`, `tunnel_no_data`, `degraded`, `core_down` (the probe's own core failed, so the fault is on the probe host).
+
+<details>
+<summary>📖 Example: Why users complain about one node</summary>
+
+```json
+{
+  "name": "query_probes",
+  "arguments": {
+    "view": "nodes",
+    "nodeId": "sample-node",
+    "hours": 6
   }
 }
 ```
@@ -361,7 +428,8 @@ AI will use the `setup_new_node` prompt:
 | `users:write` | ✏️ Create, modify, delete users | Write |
 | `nodes:read` | 👁 Read servers and statistics | Read |
 | `nodes:write` | ✏️ Manage servers, SSH commands | Write |
-| `stats:read` | 👁 Read statistics and logs | Read |
+| `stats:read` | 👁 Read statistics, system logs, and ClickHouse access logs | Read |
+| `probes:read` | 👁 Read external probe results | Read |
 | `sync:write` | ✏️ Sync, backups, system operations | Write |
 
 ---

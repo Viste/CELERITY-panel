@@ -28,15 +28,6 @@
             <span class="stat-icon"><i class="ti ti-chart-bar"></i></span>
             <span class="stat-trend"><%= t('stats.last24h') %></span>
         </div>
-        <% 
-        const traffic24hGB = (summary.traffic24h.total) / (1024 * 1024 * 1024);
-        const formatTraffic = (bytes) => {
-            const gb = bytes / (1024 * 1024 * 1024);
-            if (gb >= 1000) return (gb / 1024).toFixed(2) + ' TB';
-            if (gb >= 1) return gb.toFixed(1) + ' GB';
-            return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
-        };
-        %>
         <div class="stat-value"><%= formatTraffic(summary.traffic24h.total) %></div>
         <div class="stat-label"><i class="ti ti-arrow-up" style="color:var(--success)"></i> <%= formatTraffic(summary.traffic24h.tx) %> / <i class="ti ti-arrow-down" style="color:var(--info)"></i> <%= formatTraffic(summary.traffic24h.rx) %></div>
     </div>
@@ -163,6 +154,17 @@
         </div>
         <div class="card-body chart-body">
             <canvas id="hostMemChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Disk usage Chart -->
+    <div class="card chart-card">
+        <div class="card-header">
+            <h2><i class="ti ti-server-2"></i> <%= t('stats.serverDisk') %></h2>
+            <div class="chart-legend" id="hostDiskLegend"></div>
+        </div>
+        <div class="card-body chart-body">
+            <canvas id="hostDiskChart"></canvas>
         </div>
     </div>
 </div>
@@ -431,6 +433,8 @@ const i18n = {
     serverMemory: <%- JSON.stringify(t('stats.serverMemory')) %>,
     serverRss: <%- JSON.stringify(t('stats.serverRss')) %>,
     serverRpm: <%- JSON.stringify(t('stats.serverRpm')) %>,
+    serverDisk: <%- JSON.stringify(t('stats.serverDisk')) %>,
+    serverDiskFree: <%- JSON.stringify(t('stats.serverDiskFree')) %>,
 };
 
 // Last fetched nodes data -- stored so metric toggle doesn't require a refetch
@@ -445,6 +449,7 @@ let clientsChart = null;
 let hostCpuChart = null;
 let hostMemChart = null;
 let hostRpmChart = null;
+let hostDiskChart = null;
 
 // Current period
 let currentPeriod = '1h';
@@ -460,6 +465,8 @@ const colors = {
     memHost:  { bg: 'rgba(139, 92, 246, 0.15)', border: '#8b5cf6' },
     memRss:   { bg: 'rgba(20, 184, 166, 0.0)',  border: '#14b8a6' },
     rpm:      { bg: 'rgba(34, 197, 94, 0.2)',   border: '#22c55e' },
+    disk:     { bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
+    diskFree: { bg: 'rgba(6, 182, 212, 0.0)',   border: '#06b6d4' },
     nodeColors: [
         '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6',
         '#ec4899', '#14b8a6', '#f97316', '#06b6d4', '#84cc16'
@@ -649,6 +656,40 @@ function initCharts() {
             }],
         },
         options: getChartOptions('online'),
+    });
+
+    // Host Disk
+    const hostDiskCtx = document.getElementById('hostDiskChart').getContext('2d');
+    hostDiskChart = new Chart(hostDiskCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: i18n.serverDisk,
+                    data: [],
+                    borderColor: colors.disk.border,
+                    backgroundColor: colors.disk.bg,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    yAxisID: 'y',
+                },
+                {
+                    label: i18n.serverDiskFree,
+                    data: [],
+                    borderColor: colors.diskFree.border,
+                    backgroundColor: colors.diskFree.bg,
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    yAxisID: 'y1',
+                },
+            ],
+        },
+        options: getHostChartOptions('mem'),
     });
 
     // VPN Clients Donut Chart
@@ -876,6 +917,25 @@ function updateHostCharts(data) {
             ${i18n.serverRpm}: ${lastRpm}
         </span>
         <span class="legend-item" style="color: var(--text-muted)">Max: ${maxRpm}</span>
+    `;
+
+    // Disk usage + free
+    hostDiskChart.data.labels = labels;
+    hostDiskChart.data.datasets[0].data = ds.diskPct || [];
+    hostDiskChart.data.datasets[1].data = ds.diskFree || [];
+    hostDiskChart.update('none');
+
+    const lastDiskPct  = (ds.diskPct  || []).slice(-1)[0] ?? 0;
+    const lastDiskFree = (ds.diskFree || []).slice(-1)[0] ?? 0;
+    document.getElementById('hostDiskLegend').innerHTML = `
+        <span class="legend-item">
+            <span class="legend-dot" style="background: ${colors.disk.border}"></span>
+            ${i18n.serverDisk}: ${lastDiskPct}%
+        </span>
+        <span class="legend-item">
+            <span class="legend-dot" style="background: ${colors.diskFree.border}"></span>
+            ${i18n.serverDiskFree}: ${formatBytes(lastDiskFree)}
+        </span>
     `;
 }
 

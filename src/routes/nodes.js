@@ -1,5 +1,5 @@
 /**
- * API для управления нодами Hysteria + Xray
+ * API for managing Hysteria + Xray nodes
  */
 
 const express = require('express');
@@ -142,7 +142,7 @@ async function setNodeActive(req, res, active) {
 }
 
 /**
- * GET /nodes - Список всех нод
+ * GET /nodes - List all nodes
  */
 router.get('/', requireScope('nodes:read'), async (req, res) => {
     try {
@@ -182,7 +182,7 @@ router.get('/check-ip', requireScope('nodes:read'), async (req, res) => {
 });
 
 /**
- * GET /nodes/:id - Получить ноду
+ * GET /nodes/:id - Get a node
  */
 router.get('/:id', requireScope('nodes:read'), async (req, res) => {
     try {
@@ -192,10 +192,11 @@ router.get('/:id', requireScope('nodes:read'), async (req, res) => {
             return res.status(404).json({ error: 'Node not found' });
         }
         
-        // Считаем пользователей на этой ноде
+        // Count users on this node
         const userCount = await HyUser.countDocuments({
             nodes: node._id,
-            enabled: true
+            enabled: true,
+            isProbe: { $ne: true }
         });
         
         res.json({
@@ -209,17 +210,17 @@ router.get('/:id', requireScope('nodes:read'), async (req, res) => {
 });
 
 /**
- * POST /nodes/:id/enable - Включить ноду в подписках
+ * POST /nodes/:id/enable - Enable node in subscriptions
  */
 router.post('/:id/enable', requireScope('nodes:write'), (req, res) => setNodeActive(req, res, true));
 
 /**
- * POST /nodes/:id/disable - Отключить ноду из подписок без остановки сервиса
+ * POST /nodes/:id/disable - Disable node from subscriptions without stopping the service
  */
 router.post('/:id/disable', requireScope('nodes:write'), (req, res) => setNodeActive(req, res, false));
 
 /**
- * POST /nodes - Создать ноду
+ * POST /nodes - Create a node
  */
 router.post('/', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -366,7 +367,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 });
 
 /**
- * PUT /nodes/:id - Обновить ноду
+ * PUT /nodes/:id - Update a node
  */
 router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -430,10 +431,14 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             return res.status(404).json({ error: 'Node not found' });
         }
 
-        // Sync SSH credentials to sibling node on the same IP (if SSH was updated)
-        if (updates.ssh) {
+        // Sync SSH credentials to the sibling node on the same host (if SSH was
+        // updated). Matched on the pre-update IP and skipped when the node moved
+        // to another one: the credentials belong to the old host, and nodes
+        // already sitting on the new IP have their own.
+        const ipUnchanged = String(existing.ip || '') === String(node.ip || '');
+        if (updates.ssh && existing.ip && ipUnchanged) {
             await HyNode.updateMany(
-                { ip: node.ip, _id: { $ne: node._id } },
+                { ip: existing.ip, _id: { $ne: node._id } },
                 { $set: { ssh: node.ssh } }
             );
         }
@@ -441,7 +446,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // Auto-push config to the node if any config-affecting field changed.
         require('../services/syncService').schedulePush(node._id, updates);
 
-        // Инвалидируем кэш
+        // Invalidate cache
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Updated node ${node.name}`);
@@ -454,7 +459,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
 });
 
 /**
- * DELETE /nodes/:id - Удалить ноду
+ * DELETE /nodes/:id - Delete a node
  */
 router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -464,13 +469,13 @@ router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
             return res.status(404).json({ error: 'Node not found' });
         }
         
-        // Удаляем ноду из списка пользователей
+        // Remove the node from users' node lists
         await HyUser.updateMany(
             { nodes: node._id },
             { $pull: { nodes: node._id } }
         );
         
-        // Инвалидируем кэш
+        // Invalidate cache
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Deleted node ${node.name}`);
@@ -483,11 +488,11 @@ router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
 });
 
 /**
- * GET /nodes/:id/status - Получить статус ноды
+ * GET /nodes/:id/status - Get node status
  */
 router.get('/:id/status', requireScope('nodes:read'), async (req, res) => {
     try {
-        const node = await HyNode.findById(req.params.id).select('name status lastError onlineUsers lastSync');
+        const node = await HyNode.findById(req.params.id).select('name status lastError onlineUsers lastSync traffic');
         
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
@@ -499,6 +504,15 @@ router.get('/:id/status', requireScope('nodes:read'), async (req, res) => {
             lastError: node.lastError,
             onlineUsers: node.onlineUsers,
             lastSync: node.lastSync,
+            // Average load since the previous stats-collection poll (cron */5 * * * *,
+            // see syncService.collectXrayTrafficStats/_collectHysteriaTrafficStats).
+            // Not instantaneous — cheap byproduct of traffic accounting that's
+            // already happening, not a live SSH probe.
+            load: {
+                txMbps: node.traffic?.txMbps || 0,
+                rxMbps: node.traffic?.rxMbps || 0,
+                updatedAt: node.traffic?.speedUpdatedAt || null,
+            },
         });
     } catch (error) {
         logger.error(`[Nodes API] Get status error: ${error.message}`);
@@ -507,7 +521,7 @@ router.get('/:id/status', requireScope('nodes:read'), async (req, res) => {
 });
 
 /**
- * POST /nodes/:id/reset-status - Сброс статуса ноды на online
+ * POST /nodes/:id/reset-status - Reset node status to online
  */
 router.post('/:id/reset-status', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -582,7 +596,7 @@ router.post('/:id/sync', requireScope('nodes:write'), async (req, res) => {
 });
 
 /**
- * GET /nodes/:id/users - Пользователи на ноде
+ * GET /nodes/:id/users - Users on the node
  */
 router.get('/:id/users', requireScope('nodes:read'), async (req, res) => {
     try {
@@ -594,7 +608,8 @@ router.get('/:id/users', requireScope('nodes:read'), async (req, res) => {
         
         const users = await HyUser.find({
             nodes: node._id,
-            enabled: true
+            enabled: true,
+            isProbe: { $ne: true }
         }).select('userId username traffic');
         
         res.json(users);
@@ -605,7 +620,7 @@ router.get('/:id/users', requireScope('nodes:read'), async (req, res) => {
 });
 
 /**
- * POST /nodes/:id/groups - Добавить ноду в группы
+ * POST /nodes/:id/groups - Add node to groups
  */
 router.post('/:id/groups', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -625,7 +640,7 @@ router.post('/:id/groups', requireScope('nodes:write'), async (req, res) => {
             return res.status(404).json({ error: 'Node not found' });
         }
         
-        // Инвалидируем кэш
+        // Invalidate cache
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Added groups for node ${node.name}`);
@@ -636,7 +651,7 @@ router.post('/:id/groups', requireScope('nodes:write'), async (req, res) => {
 });
 
 /**
- * DELETE /nodes/:id/groups/:groupId - Удалить ноду из группы
+ * DELETE /nodes/:id/groups/:groupId - Remove node from a group
  */
 router.delete('/:id/groups/:groupId', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -650,7 +665,7 @@ router.delete('/:id/groups/:groupId', requireScope('nodes:write'), async (req, r
             return res.status(404).json({ error: 'Node not found' });
         }
         
-        // Инвалидируем кэш
+        // Invalidate cache
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Removed group ${req.params.groupId} from node ${node.name}`);
@@ -661,7 +676,7 @@ router.delete('/:id/groups/:groupId', requireScope('nodes:write'), async (req, r
 });
 
 /**
- * GET /nodes/:id/config - Получить текущий конфиг ноды
+ * GET /nodes/:id/config - Get the node's current config
  */
 router.get('/:id/config', requireScope('nodes:read'), async (req, res) => {
     try {
@@ -671,7 +686,7 @@ router.get('/:id/config', requireScope('nodes:read'), async (req, res) => {
             return res.status(404).json({ error: 'Node not found' });
         }
         
-        // Генерируем конфиг с HTTP авторизацией
+        // Generate config with HTTP authorization
         const configGenerator = require('../services/configGenerator');
         const config = require('../../config');
         
@@ -688,7 +703,7 @@ router.get('/:id/config', requireScope('nodes:read'), async (req, res) => {
 });
 
 /**
- * POST /nodes/:id/setup-port-hopping - Настройка port hopping на ноде
+ * POST /nodes/:id/setup-port-hopping - Configure port hopping on the node
  */
 router.post('/:id/setup-port-hopping', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -712,7 +727,7 @@ router.post('/:id/setup-port-hopping', requireScope('nodes:write'), async (req, 
 });
 
 /**
- * POST /nodes/:id/update-config - Обновить конфиг на ноде через SSH
+ * POST /nodes/:id/update-config - Update config on the node via SSH
  */
 router.post('/:id/update-config', requireScope('nodes:write'), async (req, res) => {
     try {

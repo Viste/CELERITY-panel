@@ -68,6 +68,40 @@
                             </button>
                         </div>
                     </form>
+
+                    <script>
+                    (function () {
+                        const messages = {
+                            newPasswordTooShort: <%- JSON.stringify(typeof t !== "undefined" ? t("settings.newPasswordTooShort") : "New password must be at least 6 characters") %>,
+                            passwordsMismatch: <%- JSON.stringify(typeof t !== "undefined" ? t("setup.passwordsMismatch") : "Passwords don't match!") %>
+                        };
+
+                        const newPassword = document.querySelector('input[name="newPassword"]');
+                        const confirmPassword = document.querySelector('input[name="confirmPassword"]');
+                        if (!newPassword || !confirmPassword) return;
+
+                        function validateField(input) {
+                            const min = parseInt(input.getAttribute('minlength') || '0', 10);
+                            if (input.value.length > 0 && min > 0 && input.value.length < min) {
+                                input.setCustomValidity(messages.newPasswordTooShort);
+                                return;
+                            }
+                            if (input === confirmPassword && input.value.length > 0 && newPassword.value !== input.value) {
+                                input.setCustomValidity(messages.passwordsMismatch);
+                                return;
+                            }
+                            input.setCustomValidity('');
+                        }
+
+                        [newPassword, confirmPassword].forEach(function (input) {
+                            if (!input) return;
+                            input.addEventListener('input', function () {
+                                validateField(input);
+                                if (input === newPassword) validateField(confirmPassword);
+                            });
+                        });
+                    })();
+                    </script>
                 </div>
             </div>
         </div>
@@ -79,6 +113,7 @@
                 </div>
                 <div class="card-body">
                     <form method="POST" action="/panel/settings">
+                        <input type="hidden" name="_nodeAuthSettings" value="1">
                         <label class="checkbox-label">
                             <input type="checkbox" name="nodeAuth.insecure"
                                    <%= settings?.nodeAuth?.insecure !== false ? 'checked' : '' %>>
@@ -475,6 +510,52 @@
                             <% }) %>
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label><%= t('webhooks.diskThresholds') || 'Disk space alert thresholds' %></label>
+                        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+                            <div style="flex:1; min-width:180px;">
+                                <small class="hint"><%= t('webhooks.diskWarnPct') || 'Warning: free space below (%)' %></small>
+                                <input type="number" name="webhook.diskWarnPct" min="1" max="99" step="1"
+                                       value="<%= settings?.webhook?.diskWarnPct ?? 15 %>">
+                            </div>
+                            <div style="flex:1; min-width:180px;">
+                                <small class="hint"><%= t('webhooks.diskCritGb') || 'Critical: free space below (GB)' %></small>
+                                <input type="number" name="webhook.diskCritGb" min="0.1" step="0.1"
+                                       value="<%= settings?.webhook?.diskCritGb ?? 1 %>">
+                            </div>
+                        </div>
+                        <small class="hint"><%= t('webhooks.diskThresholdsHint') || 'Sends host.disk_low / host.disk_critical / host.disk_recovered events.' %></small>
+                    </div>
+
+                    <% if (settings?.accessLogs?.enabled) { %>
+                    <!-- Access-logs IP-sharing alert (only when access logs are active) -->
+                    <div class="form-group">
+                        <label><%= t('webhooks.ipAlert') || 'IP-sharing alert (access logs)' %></label>
+                        <label class="checkbox-label" style="margin:0.35rem 0;">
+                            <input type="checkbox" name="webhook.ipAlertEnabled" id="webhookIpAlertEnabled"
+                                   <%= settings?.webhook?.ipAlertEnabled ? 'checked' : '' %>>
+                            <span><%= t('webhooks.ipAlertEnabled') || 'Alert when a user exceeds the IP limit' %></span>
+                        </label>
+                        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+                            <div style="flex:1; min-width:180px;">
+                                <small class="hint"><%= t('webhooks.ipAlertThreshold') || 'Unique IPs per user (threshold)' %></small>
+                                <input type="number" name="webhook.ipAlertThreshold" min="1" max="10000" step="1"
+                                       value="<%= settings?.webhook?.ipAlertThreshold ?? 5 %>">
+                            </div>
+                            <div style="flex:1; min-width:180px;">
+                                <small class="hint"><%= t('webhooks.ipAlertWindow') || 'Analysis window (minutes)' %></small>
+                                <input type="number" name="webhook.ipAlertWindowMinutes" min="1" max="43200" step="1"
+                                       value="<%= settings?.webhook?.ipAlertWindowMinutes ?? 60 %>">
+                            </div>
+                        </div>
+                        <label class="checkbox-label" style="margin-top:0.5rem;">
+                            <input type="checkbox" name="webhook.ipAlertIncludeIps"
+                                   <%= settings?.webhook?.ipAlertIncludeIps ? 'checked' : '' %>>
+                            <span><%= t('webhooks.ipAlertIncludeIps') || 'Include the IP list in the payload (privacy-sensitive)' %></span>
+                        </label>
+                        <small class="hint"><%= t('webhooks.ipAlertHint') || 'Checked hourly. Sends user.ip_limit_exceeded. With IP masking on, counts are per /24 subnet, so granularity is coarser.' %></small>
+                    </div>
+                    <% } %>
                 </div>
 
                 <div class="settings-save-bar">

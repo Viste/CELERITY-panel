@@ -97,14 +97,15 @@ router.get('/', async (req, res) => {
             const realNodeFilter = { type: { $ne: 'virtual' } };
             const [trafficAgg, usersTotal, usersEnabled, nodesTotal, nodesOnline] = await Promise.all([
                 HyUser.aggregate([
+                    { $match: { isProbe: { $ne: true } } },
                     { $group: { 
                         _id: null, 
                         tx: { $sum: '$traffic.tx' }, 
                         rx: { $sum: '$traffic.rx' } 
                     }}
                 ]),
-                HyUser.countDocuments(),
-                HyUser.countDocuments({ enabled: true }),
+                HyUser.countDocuments({ isProbe: { $ne: true } }),
+                HyUser.countDocuments({ enabled: true, isProbe: { $ne: true } }),
                 HyNode.countDocuments(realNodeFilter),
                 HyNode.countDocuments({ ...realNodeFilter, status: 'online' }),
             ]);
@@ -159,6 +160,47 @@ router.get('/', async (req, res) => {
 
 // ==================== NODES ====================
 
+/**
+ * Per-node view of the most recent probe verdicts, for the compact badge in the
+ * list. One aggregation covers the whole page, so the badge costs a single
+ * query no matter how many nodes are shown.
+ */
+async function buildProbeSummary() {
+    const ProbeResult = require('../../models/probeResultModel');
+    const since = new Date(Date.now() - 30 * 60 * 1000);
+
+    const rows = await ProbeResult.aggregate([
+        { $match: { bucket: 'raw', ts: { $gte: since } } },
+        { $sort: { ts: -1 } },
+        {
+            $group: {
+                _id: { nodeId: '$nodeId', probeId: '$probeId', inboundId: '$inboundId' },
+                ok: { $first: '$ok' },
+                attempts: { $first: '$attempts' },
+                lastCode: { $first: '$lastCode' },
+            },
+        },
+        {
+            $group: {
+                _id: '$_id.nodeId',
+                checks: { $sum: 1 },
+                failing: { $sum: { $cond: [{ $eq: ['$ok', 0] }, 1, 0] } },
+                codes: { $addToSet: '$lastCode' },
+            },
+        },
+    ]);
+
+    const summary = {};
+    for (const row of rows) {
+        summary[String(row._id)] = {
+            checks: row.checks,
+            failing: row.failing,
+            code: (row.codes || []).find((c) => c) || '',
+        };
+    }
+    return summary;
+}
+
 // GET /panel/nodes - Node list
 router.get('/nodes', async (req, res) => {
     try {
@@ -174,6 +216,8 @@ router.get('/nodes', async (req, res) => {
         const ipProtocolCount = {};
         nodes.forEach(n => { ipProtocolCount[n.ip] = (ipProtocolCount[n.ip] || 0) + 1; });
 
+        const probeSummary = settings?.probes?.enabled ? await buildProbeSummary() : {};
+
         render(res, 'nodes', {
             title: res.locals.locales.nodes.title,
             page: 'nodes',
@@ -181,6 +225,7 @@ router.get('/nodes', async (req, res) => {
             groups,
             linksCount,
             ipProtocolCount,
+            probeSummary,
             loadBalancingEnabled: !!(settings?.loadBalancing?.enabled),
             panelDomain: config.PANEL_DOMAIN || '',
             buildNodeUiMeta,
@@ -609,6 +654,11 @@ router.post('/nodes/:id', async (req, res) => {
             return res.redirect('/panel/nodes');
         }
 
+        // Captured before the update: SSH credentials are shared per host, so the
+        // sibling sync below must target the IP this node actually lived on, not
+        // the one it is being moved to.
+        const previousIp = existingNode.ip;
+
         const { name } = req.body;
         const nodeType = ['xray', 'virtual', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
@@ -651,9 +701,18 @@ router.post('/nodes/:id', async (req, res) => {
                 ? req.body.comment.trim().slice(0, 500)
                 : '',
             initScript: req.body.initScript || '',
-            'ssh.port': parseInt(req.body['ssh.port']) || 22,
-            'ssh.username': req.body['ssh.username'] || 'root',
         };
+
+        // SSH transport fields are only touched when the request actually carries
+        // them. Writing them unconditionally would reset a custom port/user to
+        // 22/root for any caller that posts a partial body, and would also make
+        // the sibling sync below fire on every single save.
+        if (req.body['ssh.port'] !== undefined) {
+            updates['ssh.port'] = parseInt(req.body['ssh.port'], 10) || 22;
+        }
+        if (req.body['ssh.username'] !== undefined) {
+            updates['ssh.username'] = req.body['ssh.username'] || 'root';
+        }
 
         if (req.body.statsSecret) {
             updates.statsSecret = req.body.statsSecret;
@@ -724,16 +783,20 @@ router.post('/nodes/:id', async (req, res) => {
 
         syncService.schedulePush(nodeId, updates);
 
-        // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)
+        // Sync SSH credentials to the sibling node on the same host (if SSH was
+        // part of this update). Skipped when the node was moved to another IP:
+        // the credentials belong to the old host, and nodes already sitting on
+        // the new IP have their own.
         const sshChanged = updates['ssh.password'] !== undefined
             || updates['ssh.privateKey'] !== undefined
             || updates['ssh.port'] !== undefined
             || updates['ssh.username'] !== undefined;
-        if (sshChanged) {
+        const ipUnchanged = String(existingNode.ip || '') === String(previousIp || '');
+        if (sshChanged && previousIp && ipUnchanged) {
             const updatedNode = await HyNode.findById(nodeId).select('ip ssh').lean();
             if (updatedNode) {
                 await HyNode.updateMany(
-                    { ip: updatedNode.ip, _id: { $ne: updatedNode._id } },
+                    { ip: previousIp, _id: { $ne: updatedNode._id } },
                     { $set: { ssh: updatedNode.ssh } }
                 );
             }
@@ -1077,42 +1140,6 @@ router.post('/nodes/:id/outbounds', async (req, res) => {
     } catch (error) {
         logger.error('[Panel] Outbounds save error:', error.message);
         res.redirect(`/panel/nodes/${req.params.id}/outbounds?error=` + encodeURIComponent(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`));
-    }
-});
-
-// GET /panel/broadcast-terminal - Broadcast terminal page
-router.get('/broadcast-terminal', async (req, res) => {
-    try {
-        const nodes = await HyNode.find({
-            $or: [
-                { 'ssh.password': { $exists: true, $ne: '' } },
-                { 'ssh.privateKey': { $exists: true, $ne: '' } },
-            ],
-        })
-            .select('_id name ip type status flag ssh.port ssh.username groups')
-            .populate('groups', 'name')
-            .lean();
-        // Deduplicate by IP (one physical server may have two protocol nodes)
-        const seenIps = new Set();
-        const sshNodes = [];
-        for (const n of nodes) {
-            if (seenIps.has(n.ip)) continue;
-            seenIps.add(n.ip);
-            sshNodes.push({
-                _id: n._id,
-                name: n.name,
-                ip: n.ip,
-                type: n.type,
-                status: n.status,
-                flag: n.flag,
-                sshPort: n.ssh?.port || 22,
-                sshUsername: n.ssh?.username || 'root',
-                groups: n.groups,
-            });
-        }
-        res.render('broadcast-terminal', { nodes: sshNodes });
-    } catch (error) {
-        res.status(500).send('Error: ' + error.message);
     }
 });
 

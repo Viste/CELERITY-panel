@@ -22,6 +22,8 @@ const cascadeTools = require('../mcp/tools/cascade');
 const systemTools = require('../mcp/tools/system');
 const statsTools = require('../mcp/tools/stats');
 const logsTools = require('../mcp/tools/logs');
+const accessLogsTools = require('../mcp/tools/accessLogs');
+const probesTools = require('../mcp/tools/probes');
 
 // ─── Schema generation ─────────────────────────────────────────────────────
 // Advertised tool `inputSchema`s are derived from the zod schemas that the
@@ -153,6 +155,20 @@ const TOOLS = {
             properties: {},
         },
     },
+
+    query_access_logs: {
+        description: accessLogsTools.TOOL_DESCRIPTION,
+        requiredScope: 'stats:read',
+        inputSchema: zodToInputSchema(accessLogsTools.schemas.queryAccessLogs),
+    },
+
+    query_probes: {
+        description: probesTools.TOOL_DESCRIPTION,
+        // Probe data exposes vantage points and their egress addresses, so it
+        // has its own scope instead of riding on general statistics access.
+        requiredScope: 'probes:read',
+        inputSchema: zodToInputSchema(probesTools.schemas.queryProbes),
+    },
 };
 
 // ─── Scope helpers ───────────────────────────────────────────────────────────
@@ -280,6 +296,12 @@ async function callTool(name, args, apiKey, emit) {
 
         case 'health_check':
             return await systemTools.healthCheck();
+
+        case 'query_access_logs':
+            return await accessLogsTools.queryAccessLogs(args);
+
+        case 'query_probes':
+            return await probesTools.queryProbes(args);
 
         default:
             throw Object.assign(new Error(`Tool not implemented: ${name}`), { code: 501 });

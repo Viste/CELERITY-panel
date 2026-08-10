@@ -43,9 +43,22 @@ mongo_data/
 
 # CC Agent binaries (large files, deploy separately)
 public/downloads/
+cc-agent/cc-agent
 cc-agent/cc-agent-linux-amd64
 cc-agent/cc-agent-linux-arm64
 
+# Celerity Probe binaries (built in CI, attached to releases)
+probe/celerity-probe
+probe/celerity-probe.exe
+probe/celerity-probe-*
+
+# Access-logs ingest spool
+data/access-logs/
+
+# Updater sidecar state (last update run log)
+data/updater/
+
 Rules.md
 TODO.md
-TEST-CHECKLIST.md 
+TEST-CHECKLIST.md
+docs/abuse-signatures.ru.md 
