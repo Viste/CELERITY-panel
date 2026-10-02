@@ -1,5 +1,5 @@
 <%
-// Mieru node form partial — visible only when type === 'mieru'.
+// Mieru node pane (mi-settings) — shown only when type === 'mieru'.
 // Mita server (https://github.com/enfein/mieru) is a username+password proxy
 // with no TLS surface, so the form only collects listener and mux options.
 const m = node?.mieru || {};
@@ -11,15 +11,23 @@ const multiplexing = m.multiplexing || '';
 const muxUserHintMandatory = !!m.muxUserHintMandatory;
 %>
 
-<div class="form-section mieru-only" id="mieruSection" style="<%= isMieru ? '' : 'display:none' %>">
-    <h3>
-        <i class="ti ti-shield-lock"></i> Mieru (mita) settings
-        <a class="docs-hint-link" href="https://github.com/enfein/mieru/blob/main/docs/server-install.md" target="_blank" rel="noopener noreferrer" title="mieru server docs">ⓘ</a>
-    </h3>
-    <small class="section-hint">
-        Mita listens on a single port. Users (name + password) are seeded
-        from the global user pool — no separate user form needed here.
-    </small>
+<div class="nf-pane" data-pane="mi-settings" data-types="mieru" id="mieruSection">
+    <div class="nf-pane__head">
+        <h3>
+            Mieru (mita)
+            <a class="docs-hint-link" href="https://github.com/enfein/mieru/blob/main/docs/server-install.md" target="_blank" rel="noopener noreferrer" title="mieru server docs">ⓘ</a>
+        </h3>
+        <p>
+            Mita listens on a single port. Users (name + password) are seeded
+            from the global user pool — no separate user form needed here.
+        </p>
+    </div>
+
+    <div class="form-row">
+        <div id="portSlotMieru">
+            <% if (isMieru) { %><%- include('field-port') %><% } %>
+        </div>
+    </div>
 
     <div class="form-group">
         <label for="mieruProtocol">Transport protocol</label>

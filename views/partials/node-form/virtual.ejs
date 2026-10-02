@@ -1,69 +1,80 @@
 <%
-// Virtual node form partial — visible only when type === 'virtual'.
-// Renders source-selector + balancer strategy + Xray observatory config.
+// Virtual node panes: vt-sources (which nodes are merged and how traffic is
+// spread) and vt-probe (observatory + client-side latency test).
 const v = node?.virtual || {};
-const isVirtual = node?.type === 'virtual';
 const selectMode = v.selectMode || 'manual';
 const strategy = v.strategy || 'leastLoad';
 const obs = v.observatory || {};
 const sourceIds = (v.sources || []).map(s => String(s._id || s));
 const sourceGroupId = v.sourceGroup ? String(v.sourceGroup._id || v.sourceGroup) : '';
 const fallbackToFirst = v.fallbackToFirst !== false;
+const tolerance = Number.isFinite(v.tolerance) ? v.tolerance : 50;
+const idleTimeout = v.idleTimeout || '';
+const interruptExistConnections = v.interruptExistConnections !== false;
 const cands = candidateNodes || [];
 %>
 
-<div class="form-section virtual-only" id="virtualSection" style="<%= isVirtual ? '' : 'display:none' %>">
-    <h3>
-        <i class="ti ti-route"></i> <%= t('nodes.virtualSection') %>
-        <a class="docs-hint-link" href="https://xtls.github.io/en/config/routing.html" target="_blank" rel="noopener noreferrer" title="Xray docs">ⓘ</a>
-    </h3>
-    <small class="section-hint"><%= t('nodes.virtualSectionHint') %></small>
+<div class="nf-pane" data-pane="vt-sources" data-types="virtual" id="virtualSection">
+    <div class="nf-pane__head">
+        <h3>
+            <%= t('nodes.paneSources') %>
+            <a class="docs-hint-link" href="https://xtls.github.io/en/config/routing.html" target="_blank" rel="noopener noreferrer" title="Xray docs">ⓘ</a>
+        </h3>
+        <p><%= t('nodes.paneSourcesHint') %></p>
+    </div>
 
-    <%# ===== Source selection ===== %>
-    <div class="form-group">
-        <label><%= t('nodes.virtualSelectMode') %></label>
-        <div class="proto-switcher" style="margin-top:6px;">
-            <label class="proto-option <%= selectMode === 'manual' ? 'active' : '' %>" id="virtualSelectModeManualLabel">
+    <div class="nf-standalone-field">
+        <div class="nf-label-row">
+            <div class="nf-standalone-label"><%= t('nodes.virtualSelectMode') %></div>
+            <%- include('field-help', { textKey: 'nodes.virtualSectionHint', t }) %>
+        </div>
+        <div class="nf-seg" id="virtualSelectModeSeg">
+            <label>
                 <input type="radio" name="virtual.selectMode" value="manual"
                        <%= selectMode === 'manual' ? 'checked' : '' %>
                        onchange="virtualOnSelectModeChange('manual')">
-                <span class="proto-icon"><i class="ti ti-list-check" style="font-size:22px;"></i></span>
-                <span class="proto-name"><%= t('nodes.virtualSelectModeManual') %></span>
-                <span class="proto-desc"><%= t('nodes.virtualSelectModeManualHint') %></span>
+                <span><i class="ti ti-list-check"></i> <%= t('nodes.virtualSelectModeManual') %></span>
             </label>
-            <label class="proto-option <%= selectMode === 'group' ? 'active' : '' %>" id="virtualSelectModeGroupLabel">
+            <label>
                 <input type="radio" name="virtual.selectMode" value="group"
                        <%= selectMode === 'group' ? 'checked' : '' %>
                        onchange="virtualOnSelectModeChange('group')">
-                <span class="proto-icon"><i class="ti ti-users-group" style="font-size:22px;"></i></span>
-                <span class="proto-name"><%= t('nodes.virtualSelectModeGroup') %></span>
-                <span class="proto-desc"><%= t('nodes.virtualSelectModeGroupHint') %></span>
+                <span><i class="ti ti-users-group"></i> <%= t('nodes.virtualSelectModeGroup') %></span>
             </label>
         </div>
     </div>
 
     <div class="form-group" id="virtualManualGroup" style="<%= selectMode === 'manual' ? '' : 'display:none' %>">
-        <label><%= t('nodes.virtualSources') %></label>
-        <small><%= t('nodes.virtualSourcesHint') %></small>
-        <div class="groups-select" style="margin-top:6px;max-height:240px;overflow-y:auto;">
-            <% if (cands.length === 0) { %>
-                <div class="alert alert-info" style="font-size:13px;"><%= t('nodes.virtualNoCandidates') %></div>
-            <% } %>
+        <div class="nf-label-row">
+            <label><%= t('nodes.virtualSources') %></label>
+            <%- include('field-help', { textKey: 'nodes.virtualSourcesHint', t }) %>
+        </div>
+        <% if (cands.length === 0) { %>
+            <div class="nf-info" style="margin-top:8px;">
+                <i class="ti ti-info-circle"></i>
+                <div><strong><%= t('nodes.virtualNoCandidates') %></strong></div>
+            </div>
+        <% } %>
+        <div class="nf-picks" style="margin-top:8px;max-height:280px;overflow-y:auto;">
             <% cands.forEach(c => {
                 const checked = sourceIds.includes(String(c._id));
-                const label = `${c.flag || ''} ${c.name} · ${c.type}${c.active === false ? ' · disabled' : ''}`.trim();
             %>
-                <label class="checkbox-tag">
+                <label class="nf-pick">
                     <input type="checkbox" name="virtual.sources[]" value="<%= c._id %>" <%= checked ? 'checked' : '' %>>
-                    <span><%= label %></span>
+                    <span class="nf-pick__text">
+                        <span class="nf-pick__name"><%= `${c.flag || ''} ${c.name}`.trim() %></span>
+                        <span class="nf-pick__meta"><%= c.type %><%= c.active === false ? ` · ${t('common.inactive')}` : '' %></span>
+                    </span>
                 </label>
             <% }); %>
         </div>
     </div>
 
-    <div class="form-group" id="virtualGroupGroup" style="<%= selectMode === 'group' ? '' : 'display:none' %>">
-        <label for="virtualSourceGroup"><%= t('nodes.virtualSourceGroup') %></label>
-        <small><%= t('nodes.virtualSourceGroupHint') %></small>
+    <div class="form-group" id="virtualGroupGroup" style="<%= selectMode === 'group' ? '' : 'display:none' %>;max-width:360px;">
+        <div class="nf-label-row">
+            <label for="virtualSourceGroup"><%= t('nodes.virtualSourceGroup') %></label>
+            <%- include('field-help', { textKey: 'nodes.virtualSourceGroupHint', t }) %>
+        </div>
         <select id="virtualSourceGroup" name="virtual.sourceGroup">
             <option value=""><%= t('nodes.virtualSourceGroupPlaceholder') %></option>
             <% (groups || []).forEach(g => { %>
@@ -72,24 +83,26 @@ const cands = candidateNodes || [];
         </select>
     </div>
 
-    <%# ===== Strategy ===== %>
-    <div class="form-group">
-        <label><%= t('nodes.virtualStrategy') %></label>
-        <small><%= t('nodes.virtualStrategyHint') %></small>
-        <div class="cascade-role-picker" style="margin-top:8px;">
+    <div class="nf-group">
+        <div class="nf-label-row">
+            <div class="nf-group__title"><%= t('nodes.virtualStrategy') %></div>
+            <%- include('field-help', { textKey: 'nodes.virtualStrategyHint', t }) %>
+        </div>
+        <div class="nf-choices" id="virtualStrategyChoices">
             <% [
-                { id: 'random',     icon: 'ti-arrows-shuffle',   key: 'Random' },
-                { id: 'roundRobin', icon: 'ti-rotate',           key: 'RoundRobin' },
-                { id: 'leastPing',  icon: 'ti-bolt',             key: 'LeastPing' },
-                { id: 'leastLoad',  icon: 'ti-chart-line',       key: 'LeastLoad' },
+                { id: 'random',     icon: 'ti-arrows-shuffle', key: 'Random' },
+                { id: 'roundRobin', icon: 'ti-rotate',         key: 'RoundRobin' },
+                { id: 'leastPing',  icon: 'ti-bolt',           key: 'LeastPing' },
+                { id: 'leastLoad',  icon: 'ti-chart-line',     key: 'LeastLoad' },
             ].forEach(item => { %>
-                <label class="role-card <%= strategy === item.id ? 'active' : '' %>"
-                       data-strategy="<%= item.id %>"
-                       onclick="virtualSelectStrategy('<%= item.id %>', this)">
-                    <span class="role-card-icon role-standalone"><i class="ti <%= item.icon %>"></i></span>
-                    <span class="role-card-body">
-                        <span class="role-card-name"><%= t(`nodes.virtualStrategy${item.key}`) %></span>
-                        <span class="role-card-desc"><%= t(`nodes.virtualStrategy${item.key}Desc`) %></span>
+                <label class="nf-choice">
+                    <%# The value lives in the hidden virtual.strategy input below, so
+                        these radios are UI-only and carry no name. %>
+                    <input type="radio" data-strategy="<%= item.id %>" <%= strategy === item.id ? 'checked' : '' %>
+                           onchange="virtualSelectStrategy('<%= item.id %>')">
+                    <span class="nf-choice__text">
+                        <span class="nf-choice__name"><i class="ti <%= item.icon %>"></i> <%= t(`nodes.virtualStrategy${item.key}`) %></span>
+                        <span class="nf-choice__hint"><%= t(`nodes.virtualStrategy${item.key}Desc`) %></span>
                     </span>
                 </label>
             <% }); %>
@@ -97,75 +110,126 @@ const cands = candidateNodes || [];
         <input type="hidden" name="virtual.strategy" id="virtualStrategy" value="<%= strategy %>">
     </div>
 
-    <%# ===== Observatory ===== %>
-    <div class="form-section" id="virtualObservatorySection" style="<%= ['leastPing','leastLoad'].includes(strategy) ? '' : 'display:none' %>;background:transparent;border:1px solid var(--border);border-radius:10px;padding:14px;margin-top:10px;">
-        <h3 style="font-size:14px;margin-top:0;"><i class="ti ti-radar"></i> <%= t('nodes.virtualObservatory') %></h3>
-        <small class="section-hint"><%= t('nodes.virtualObservatoryHint') %></small>
+    <div class="form-group">
+        <div class="nf-label-row">
+            <label class="nf-tag">
+                <input type="checkbox" name="virtual.fallbackToFirst" <%= fallbackToFirst ? 'checked' : '' %>>
+                <span><%= t('nodes.virtualFallbackToFirst') %></span>
+            </label>
+            <%- include('field-help', { textKey: 'nodes.virtualFallbackToFirstHint', t }) %>
+        </div>
+    </div>
+</div>
+
+<div class="nf-pane" data-pane="vt-probe" data-types="virtual">
+    <div class="nf-pane__head">
+        <h3><%= t('nodes.paneProbe') %></h3>
+        <p><%= t('nodes.paneProbeHint') %></p>
+    </div>
+
+    <%# Observatory only matters for the two latency-aware strategies. %>
+    <div class="nf-group" id="virtualObservatorySection" style="<%= ['leastPing','leastLoad'].includes(strategy) ? '' : 'display:none' %>">
+        <div class="nf-group__title"><i class="ti ti-radar"></i> <%= t('nodes.virtualObservatory') %></div>
+        <small class="nf-section__hint"><%= t('nodes.virtualObservatoryHint') %></small>
 
         <div class="form-row">
             <div class="form-group">
-                <label for="virtualObsDestination"><%= t('nodes.virtualObsDestination') %></label>
+                <div class="nf-label-row">
+                    <label for="virtualObsDestination"><%= t('nodes.virtualObsDestination') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualObsDestinationHint', t }) %>
+                </div>
                 <input type="text" id="virtualObsDestination" name="virtual.observatory.destination"
                        value="<%= obs.destination || 'http://www.gstatic.com/generate_204' %>"
                        placeholder="http://www.gstatic.com/generate_204">
-                <small><%= t('nodes.virtualObsDestinationHint') %></small>
             </div>
             <div class="form-group">
-                <label for="virtualObsConnectivity"><%= t('nodes.virtualObsConnectivity') %></label>
+                <div class="nf-label-row">
+                    <label for="virtualObsConnectivity"><%= t('nodes.virtualObsConnectivity') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualObsConnectivityHint', t }) %>
+                </div>
                 <input type="text" id="virtualObsConnectivity" name="virtual.observatory.connectivity"
                        value="<%= obs.connectivity || '' %>"
                        placeholder="<%= t('nodes.virtualObsConnectivityPlaceholder') %>">
-                <small><%= t('nodes.virtualObsConnectivityHint') %></small>
             </div>
         </div>
 
         <div class="form-row-3">
             <div class="form-group">
-                <label for="virtualObsInterval"><%= t('nodes.virtualObsInterval') %></label>
+                <div class="nf-label-row">
+                    <label for="virtualObsInterval"><%= t('nodes.virtualObsInterval') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualObsIntervalHint', t }) %>
+                </div>
                 <input type="text" id="virtualObsInterval" name="virtual.observatory.interval"
                        value="<%= obs.interval || '1m' %>" placeholder="1m">
-                <small><%= t('nodes.virtualObsIntervalHint') %></small>
             </div>
             <div class="form-group">
-                <label for="virtualObsTimeout"><%= t('nodes.virtualObsTimeout') %></label>
+                <div class="nf-label-row">
+                    <label for="virtualObsTimeout"><%= t('nodes.virtualObsTimeout') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualObsTimeoutHint', t }) %>
+                </div>
                 <input type="text" id="virtualObsTimeout" name="virtual.observatory.timeout"
                        value="<%= obs.timeout || '5s' %>" placeholder="5s">
-                <small><%= t('nodes.virtualObsTimeoutHint') %></small>
             </div>
             <div class="form-group" id="virtualObsSamplingGroup" style="<%= strategy === 'leastLoad' ? '' : 'display:none' %>">
-                <label for="virtualObsSampling"><%= t('nodes.virtualObsSampling') %></label>
+                <div class="nf-label-row">
+                    <label for="virtualObsSampling"><%= t('nodes.virtualObsSampling') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualObsSamplingHint', t }) %>
+                </div>
                 <input type="number" id="virtualObsSampling" name="virtual.observatory.sampling"
                        value="<%= obs.sampling || 3 %>" min="1" max="100">
-                <small><%= t('nodes.virtualObsSamplingHint') %></small>
             </div>
         </div>
     </div>
 
-    <%# ===== Fallback toggle ===== %>
-    <div class="form-group" style="margin-top:8px;">
-        <label class="checkbox-tag" style="display:inline-flex;align-items:center;gap:8px;">
-            <input type="checkbox" name="virtual.fallbackToFirst" <%= fallbackToFirst ? 'checked' : '' %>>
-            <span><%= t('nodes.virtualFallbackToFirst') %></span>
-        </label>
-        <small style="display:block;margin-top:4px;"><%= t('nodes.virtualFallbackToFirstHint') %></small>
+    <div class="nf-group">
+        <div class="nf-group__title">
+            <i class="ti ti-activity"></i> <%= t('nodes.virtualUrltest') %>
+            <a class="docs-hint-link" href="https://sing-box.sagernet.org/configuration/outbound/urltest/" target="_blank" rel="noopener noreferrer" title="sing-box docs">ⓘ</a>
+        </div>
+        <small class="nf-section__hint"><%= t('nodes.virtualUrltestHint') %></small>
+
+        <div class="form-row">
+            <div class="form-group">
+                <div class="nf-label-row">
+                    <label for="virtualTolerance"><%= t('nodes.virtualTolerance') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualToleranceHint', t }) %>
+                </div>
+                <input type="number" id="virtualTolerance" name="virtual.tolerance"
+                       value="<%= tolerance %>" min="0" max="5000">
+            </div>
+            <div class="form-group">
+                <div class="nf-label-row">
+                    <label for="virtualIdleTimeout"><%= t('nodes.virtualIdleTimeout') %></label>
+                    <%- include('field-help', { textKey: 'nodes.virtualIdleTimeoutHint', t }) %>
+                </div>
+                <input type="text" id="virtualIdleTimeout" name="virtual.idleTimeout"
+                       value="<%= idleTimeout %>" placeholder="30m">
+            </div>
+        </div>
+
+        <div class="form-group">
+            <div class="nf-label-row">
+                <label class="nf-tag">
+                    <input type="checkbox" name="virtual.interruptExistConnections" <%= interruptExistConnections ? 'checked' : '' %>>
+                    <span><%= t('nodes.virtualInterruptExisting') %></span>
+                </label>
+                <%- include('field-help', { textKey: 'nodes.virtualInterruptExistingHint', t }) %>
+            </div>
+            <small style="display:block;margin-top:6px;"><%= t('nodes.virtualInterruptExistingHint') %></small>
+        </div>
     </div>
 </div>
 
 <script>
 function virtualOnSelectModeChange(mode) {
-    document.querySelectorAll('#virtualSelectModeManualLabel, #virtualSelectModeGroupLabel').forEach(l => l.classList.remove('active'));
-    const active = mode === 'manual' ? 'virtualSelectModeManualLabel' : 'virtualSelectModeGroupLabel';
-    document.getElementById(active)?.classList.add('active');
     document.getElementById('virtualManualGroup').style.display = mode === 'manual' ? '' : 'none';
     document.getElementById('virtualGroupGroup').style.display = mode === 'group' ? '' : 'none';
 }
-function virtualSelectStrategy(id, card) {
-    card.parentElement.querySelectorAll('.role-card').forEach(c => c.classList.remove('active'));
-    card.classList.add('active');
+function virtualSelectStrategy(id) {
     document.getElementById('virtualStrategy').value = id;
-    const obsSection = document.getElementById('virtualObservatorySection');
-    obsSection.style.display = (id === 'leastPing' || id === 'leastLoad') ? '' : 'none';
-    const samplingGroup = document.getElementById('virtualObsSamplingGroup');
-    if (samplingGroup) samplingGroup.style.display = id === 'leastLoad' ? '' : 'none';
+    document.getElementById('virtualObservatorySection').style.display =
+        (id === 'leastPing' || id === 'leastLoad') ? '' : 'none';
+    const sampling = document.getElementById('virtualObsSamplingGroup');
+    if (sampling) sampling.style.display = id === 'leastLoad' ? '' : 'none';
 }
 </script>

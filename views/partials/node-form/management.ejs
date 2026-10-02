@@ -42,6 +42,46 @@
         </div>
         <div id="nodeInfoError" class="mt-2" style="display:none;"></div>
 
+        <div class="xrv-panel" id="xrayVersionCard"
+             data-current-version="<%= node.xrayVersion || '' %>"
+             data-totp-enabled="<%= xrayUpdateTotpEnabled ? '1' : '0' %>">
+            <div class="xrv-summary">
+                <div>
+                    <span class="node-info-label"><%= t('nodes.xrayCurrentVersion') %></span>
+                    <strong id="xrayVersionCurrent"><%= node.xrayVersion ? `v${node.xrayVersion.replace(/^v/i, '')}` : '—' %></strong>
+                </div>
+                <div>
+                    <span class="node-info-label"><%= t('nodes.xrayLatestVersion') %></span>
+                    <strong id="xrayVersionLatest">—</strong>
+                </div>
+                <div>
+                    <span class="node-info-label"><%= t('nodes.xrayVersionCheckedAt') %></span>
+                    <span id="xrayVersionCheckedAt">—</span>
+                </div>
+            </div>
+            <div id="xrayVersionMessage" class="mt-2" style="display:none;"></div>
+            <div class="form-group xrv-select-wrap">
+                <label for="xrayVersionSelect"><%= t('nodes.xrayVersionSelect') %></label>
+                <select id="xrayVersionSelect" class="form-control" disabled></select>
+            </div>
+            <details id="xrayVersionChangelogWrap" class="xrv-changelog" style="display:none;">
+                <summary><%= t('nodes.xrayVersionChangelog') %></summary>
+                <pre id="xrayVersionChangelog"></pre>
+            </details>
+            <div id="xrayVersionWarning" class="alert alert-warning mt-2" style="display:none;"></div>
+            <div class="xrv-actions">
+                <button type="button" class="btn btn-primary" id="xrayVersionApplyBtn"
+                        onclick="openXrayVersionModal()" disabled>
+                    <i class="ti ti-download"></i>
+                    <span id="xrayVersionApplyLabel"><%= t('nodes.xrayVersionInstall') %></span>
+                </button>
+                <button type="button" class="btn btn-secondary" id="xrayVersionCheckBtn"
+                        onclick="checkXrayVersions()">
+                    <i class="ti ti-refresh"></i> <%= t('settings.updateCheckNow') %>
+                </button>
+            </div>
+        </div>
+
         <%
             // Warn admins when extra inbounds are configured but the running
             // cc-agent is older than 1.2.0 (the version that understands the
@@ -85,6 +125,50 @@
             </div>
         </div>
         <% } %>
+    </div>
+</div>
+
+<div class="glass-modal" id="xrayVersionModal" style="display:none;">
+    <div class="glass-modal-content" style="max-width:440px;">
+        <h3 style="margin-top:0;"><%= t('nodes.xrayVersionConfirmTitle') %></h3>
+        <p class="hint" id="xrayVersionModalSummary"></p>
+        <div class="form-group">
+            <label for="xrayVersionPassword"><%= t('settings.updatePassword') %></label>
+            <input type="password" id="xrayVersionPassword" class="form-control" autocomplete="current-password">
+        </div>
+        <div class="form-group" id="xrayVersionTotpGroup" style="<%= xrayUpdateTotpEnabled ? '' : 'display:none;' %>">
+            <label for="xrayVersionTotp"><%= t('settings.updateTotp') %></label>
+            <input type="text" id="xrayVersionTotp" class="form-control"
+                   inputmode="numeric" autocomplete="one-time-code" maxlength="10">
+        </div>
+        <div class="xrv-actions xrv-actions-end">
+            <button type="button" class="btn btn-secondary" onclick="closeXrayVersionModal()"><%= t('common.cancel') %></button>
+            <button type="button" class="btn btn-primary" id="xrayVersionConfirmBtn"
+                    onclick="submitXrayVersionChange()"><%= t('nodes.xrayVersionInstall') %></button>
+        </div>
+    </div>
+</div>
+
+<div id="xrayVersionOverlay" class="xrv-overlay" style="display:none;">
+    <div class="xrv-progress-card">
+        <div class="xrv-progress-head">
+            <i class="ti ti-loader-2"></i>
+            <div>
+                <h2 id="xrayVersionProgressTitle"><%= t('nodes.xrayVersionProgressTitle') %></h2>
+                <p id="xrayVersionProgressSub"></p>
+            </div>
+        </div>
+        <div class="xrv-progress-steps" id="xrayVersionProgressSteps">
+            <div data-step="preflight"><i class="ti ti-circle"></i><span><%= t('nodes.xrayVersionStepPreflight') %></span></div>
+            <div data-step="download"><i class="ti ti-circle"></i><span><%= t('nodes.xrayVersionStepDownload') %></span></div>
+            <div data-step="sync"><i class="ti ti-circle"></i><span><%= t('nodes.xrayVersionStepSync') %></span></div>
+            <div data-step="verify"><i class="ti ti-circle"></i><span><%= t('nodes.xrayVersionStepVerify') %></span></div>
+        </div>
+        <pre id="xrayVersionProgressLog" class="xrv-progress-log"></pre>
+        <div class="xrv-actions xrv-actions-end">
+            <button type="button" class="btn btn-secondary" id="xrayVersionProgressClose"
+                    onclick="closeXrayVersionProgress()" style="display:none;"><%= t('common.close') %></button>
+        </div>
     </div>
 </div>
 <% } %>
@@ -165,7 +249,7 @@
 <% } %>
 
 <%# ========== Management (edit only — hidden for virtual: nothing to setup/restart/terminal-into) ========== %>
-<% if (node?._id && node.type !== 'virtual') { %>
+<% if (node?._id && node.type !== 'virtual' && node.type !== 'cdn') { %>
 <div class="card mt-3">
     <div class="card-header">
         <h2><%= t('nodes.management') %></h2>
@@ -182,19 +266,39 @@
                 <span class="action-icon"><i class="ti ti-settings"></i></span>
                 <span><%= t('nodes.autoSetup') %></span>
             </button>
+            <button class="action-btn" onclick="restartNodeService(this)" id="btnRestart"
+                    title="<%= t('nodes.restartHint') %>"
+                    <%= !(node.ssh?.password || node.ssh?.privateKey || (node.type === 'xray' && node.xray?.agentToken)) ? 'disabled' : '' %>>
+                <span class="action-icon"><i class="ti ti-refresh"></i></span>
+                <span><%= t('nodes.restart') %></span>
+            </button>
+            <a href="/panel/nodes/add?cloneConfig=<%= node._id %>" class="action-btn" style="text-decoration:none;text-align:center;" title="<%= t('nodes.cloneNodeHint') %>">
+                <span class="action-icon"><i class="ti ti-copy"></i></span>
+                <span><%= t('nodes.cloneNode') %></span>
+            </a>
+            <% if (typeof canAddPairedProtocol !== 'undefined' && canAddPairedProtocol) { %>
+            <a href="/panel/nodes/add?cloneFrom=<%= node._id %>" class="action-btn" style="text-decoration:none;text-align:center;" title="<%= t('nodes.addPairedProtocol') %>">
+                <span class="action-icon"><i class="ti ti-plug-connected"></i></span>
+                <span><%= t('nodes.addPairedProtocol') %></span>
+            </a>
+            <% } %>
             <% if (outboundsAclLocked) { %>
             <span class="action-btn is-disabled" style="text-decoration:none;text-align:center;" title="<%= t('nodes.outboundsAclLockedDisabled') %>" aria-disabled="true">
-                <span class="action-icon"><i class="ti ti-arrow-up-right"></i></span>
-                <span>Outbounds</span>
-                <% if (node.outbounds && node.outbounds.length > 0) { %>
+                <span class="action-icon"><i class="ti ti-filter"></i></span>
+                <span><%= t('nodes.outboundsAclButton') %></span>
+                <% if (node.aclRules && node.aclRules.length > 0) { %>
+                <span class="badge" style="font-size:10px;background:var(--accent);color:#fff;border-radius:10px;padding:1px 6px;margin-left:4px;"><%= node.aclRules.length %></span>
+                <% } else if (node.outbounds && node.outbounds.length > 0) { %>
                 <span class="badge" style="font-size:10px;background:var(--accent);color:#fff;border-radius:10px;padding:1px 6px;margin-left:4px;"><%= node.outbounds.length %></span>
                 <% } %>
             </span>
             <% } else { %>
-            <a href="/panel/nodes/<%= node._id %>/outbounds" class="action-btn" style="text-decoration:none;text-align:center;">
-                <span class="action-icon"><i class="ti ti-arrow-up-right"></i></span>
-                <span>Outbounds</span>
-                <% if (node.outbounds && node.outbounds.length > 0) { %>
+            <a href="/panel/nodes/<%= node._id %>/outbounds" class="action-btn" style="text-decoration:none;text-align:center;" title="<%= t('nodes.outboundsAclButtonHint') %>">
+                <span class="action-icon"><i class="ti ti-filter"></i></span>
+                <span><%= t('nodes.outboundsAclButton') %></span>
+                <% if (node.aclRules && node.aclRules.length > 0) { %>
+                <span class="badge" style="font-size:10px;background:var(--accent);color:#fff;border-radius:10px;padding:1px 6px;margin-left:4px;"><%= node.aclRules.length %></span>
+                <% } else if (node.outbounds && node.outbounds.length > 0) { %>
                 <span class="badge" style="font-size:10px;background:var(--accent);color:#fff;border-radius:10px;padding:1px 6px;margin-left:4px;"><%= node.outbounds.length %></span>
                 <% } %>
             </a>
@@ -245,6 +349,23 @@
                 <button class="btn btn-sm" onclick="clearLogs()"><%= t('common.clear') %></button>
             </div>
             <pre class="logs-output" id="logsOutput"></pre>
+        </div>
+    </div>
+</div>
+<% } %>
+
+<%# Virtual nodes have no server to manage, but their routing config is worth cloning %>
+<% if (node?._id && (node.type === 'virtual' || node.type === 'cdn')) { %>
+<div class="card mt-3">
+    <div class="card-header">
+        <h2><%= t('nodes.management') %></h2>
+    </div>
+    <div class="card-body">
+        <div class="actions-grid">
+            <a href="/panel/nodes/add?cloneConfig=<%= node._id %>" class="action-btn" style="text-decoration:none;text-align:center;" title="<%= t('nodes.cloneNodeHint') %>">
+                <span class="action-icon"><i class="ti ti-copy"></i></span>
+                <span><%= t('nodes.cloneNode') %></span>
+            </a>
         </div>
     </div>
 </div>

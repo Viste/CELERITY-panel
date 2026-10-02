@@ -1,0 +1,116 @@
+<%# Pane: xr-front — Caddy on the public port, decoy site on / and the
+    selected inbounds proxied by path. %>
+<%
+    const front = node?.xray?.front || {};
+    // A non-number here would reach String.replace() as a replacer callback.
+    const siteHtmlBytes = Number(front.siteHtmlBytes) || 0;
+    const frontIds = Array.isArray(front.inboundIds) ? front.inboundIds.map(String) : [];
+    const frontStatus = front.status || 'disabled';
+    const frontStatusBadge = frontStatus === 'active'
+        ? 'success'
+        : (frontStatus === 'error' ? 'danger' : (frontStatus === 'pending' ? 'warning' : 'secondary'));
+%>
+<div class="nf-pane" data-pane="xr-front" data-types="xray" id="frontSection"
+     data-inbound-ids="<%= JSON.stringify(frontIds) %>"
+     data-node-id="<%= node?._id || '' %>">
+    <div class="nf-pane__head">
+        <h3>
+            <%= t('nodes.frontTitle') %>
+            <% if (node?._id) { %>
+                <span class="badge badge-<%= frontStatusBadge %>" id="frontStatusBadge"><%= t(`nodes.frontStatus_${frontStatus}`) %></span>
+            <% } %>
+        </h3>
+        <p><%= t('nodes.frontHint') %></p>
+    </div>
+
+    <input type="hidden" name="xray.front.present" value="1">
+
+    <div class="nf-standalone-field">
+        <div class="nf-label-row">
+            <label class="checkbox-label">
+                <input type="checkbox" id="frontEnabled" name="xray.front.enabled"
+                       <%= front.enabled ? 'checked' : '' %> onchange="onFrontToggle()">
+                <span class="checkbox-text"><%= t('common.enabled') %></span>
+            </label>
+            <%- include('field-help', { textKey: 'nodes.frontHint', scope: 'panel', t }) %>
+        </div>
+    </div>
+
+    <div id="frontBody" style="<%= front.enabled ? '' : 'display:none;' %>">
+        <div class="nf-info is-warning" role="alert">
+            <i class="ti ti-info-circle"></i>
+            <div>
+                <strong><%= t('nodes.frontDisclaimerTitle') %></strong>
+                <small><%= t('nodes.frontDisclaimerMessage') %></small>
+            </div>
+        </div>
+
+        <div class="form-group" style="margin-top:16px;">
+            <div class="nf-label-row">
+                <label for="frontPublicPort"><%= t('nodes.frontPublicPort') %></label>
+                <%- include('field-help', { textKey: 'nodes.frontPublicPortHint', scope: 'both', t }) %>
+            </div>
+            <input type="number" id="frontPublicPort" name="xray.front.publicPort"
+                   value="<%= front.publicPort || 443 %>" min="1" max="65535" placeholder="443"
+                   style="max-width:200px;">
+        </div>
+
+        <div class="form-group">
+            <div class="nf-label-row">
+                <label><%= t('nodes.frontInbounds') %></label>
+                <%- include('field-help', { textKey: 'nodes.frontInboundsHint', scope: 'both', t }) %>
+            </div>
+            <div class="nf-picks" id="frontInbounds"></div>
+        </div>
+
+        <div class="form-group">
+            <div class="nf-label-row">
+                <label><%= t('nodes.frontSite') %></label>
+                <%- include('field-help', { textKey: 'nodes.frontSiteHint', scope: 'server', t }) %>
+            </div>
+            <div class="nf-actions" style="margin-top:0;">
+                <div class="nf-seg">
+                    <label>
+                        <input type="radio" name="xray.front.siteMode" value="nginx"
+                               <%= front.siteMode !== 'custom' ? 'checked' : '' %>>
+                        <span><%= t('nodes.frontSiteNginx') %></span>
+                    </label>
+                    <label>
+                        <input type="radio" name="xray.front.siteMode" value="custom"
+                               <%= front.siteMode === 'custom' ? 'checked' : '' %>>
+                        <span><%= t('nodes.frontSiteCustom') %></span>
+                    </label>
+                </div>
+                <%# Available before the node exists too: the file is held in the
+                    browser and uploaded right after the node is created. %>
+                <input type="file" id="frontSiteFile" accept=".html,.htm,text/html" hidden
+                       onchange="uploadFrontSite(this)">
+                <button type="button" class="btn btn-sm btn-secondary"
+                        onclick="document.getElementById('frontSiteFile').click()">
+                    <i class="ti ti-upload"></i> <%= t('nodes.frontSiteUpload') %>
+                </button>
+                <span class="hint" id="frontSiteState">
+                    <%= siteHtmlBytes ? String(t('nodes.frontSiteStored')).replace('{bytes}', String(siteHtmlBytes)) : '' %>
+                </span>
+                <% if (siteHtmlBytes) { %>
+                    <button type="button" class="btn btn-sm" onclick="resetFrontSite()">
+                        <i class="ti ti-trash"></i>
+                    </button>
+                <% } %>
+            </div>
+        </div>
+
+        <% if (node?._id) { %>
+        <div class="nf-actions">
+            <button type="button" class="btn btn-primary" id="frontApplyBtn" onclick="applyFront()">
+                <i class="ti ti-rocket"></i> <%= t('nodes.frontApply') %>
+            </button>
+            <span class="hint" id="frontApplyHint"><%= t('nodes.frontApplyHint') %></span>
+        </div>
+        <% if (front.lastError) { %>
+            <div class="alert alert-danger mt-2" id="frontLastError"><%= front.lastError %></div>
+        <% } %>
+        <pre class="nf-log" id="frontLog" style="display:none;"></pre>
+        <% } %>
+    </div>
+</div>

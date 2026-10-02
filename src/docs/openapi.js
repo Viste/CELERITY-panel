@@ -96,17 +96,126 @@ Virtual nodes carry no IP/SSH/agent and never run health checks themselves.`,
                 },
             },
         },
+        CdnConfig: {
+            type: 'object',
+            required: ['originNode'],
+            description: 'Publishes one Xray WebSocket, gRPC, or XHTTP inbound through a generic CDN. At least one of `domain` or `edges` is required.',
+            properties: {
+                originNode: { type: 'string', description: 'ObjectId of the origin Xray node.' },
+                originInboundId: { type: 'string', description: 'Extra inbound stable id. Empty selects the main inbound.' },
+                domain: { type: 'string', example: 'cdn.example.com', description: 'Optional public CDN domain.' },
+                edges: {
+                    type: 'array',
+                    maxItems: 32,
+                    items: {
+                        type: 'object',
+                        required: ['id', 'address'],
+                        properties: {
+                            id: { type: 'string' },
+                            label: { type: 'string' },
+                            address: { type: 'string', description: 'Pinned edge IP or hostname.' },
+                            enabled: { type: 'boolean', default: true },
+                        },
+                    },
+                },
+                port: { type: 'integer', minimum: 1, maximum: 65535, default: 443 },
+                security: { type: 'string', enum: ['tls'], default: 'tls' },
+                sni: { type: 'string', description: 'Required TLS server name. Defaults to domain.' },
+                host: { type: 'string' },
+                path: {
+                    type: 'string',
+                    description: 'Client path. Required for an XHTTP origin and must extend its prefix by at least one segment; for a WebSocket origin it must equal the origin path exactly.',
+                },
+                alpn: { type: 'array', items: { type: 'string', enum: ['h3', 'h2', 'http/1.1', 'http/1.0'] } },
+                fingerprint: { type: 'string', default: 'chrome' },
+                fingerprintPool: {
+                    type: 'array',
+                    uniqueItems: true,
+                    items: { type: 'string' },
+                    description: 'Optional TLS fingerprint pool distributed across CDN edges without repeats until exhausted. Overrides fingerprint.',
+                },
+                xhttpMode: { type: 'string', enum: ['', 'auto', 'packet-up', 'stream-up', 'stream-one'] },
+            },
+        },
+        XrayFrontConfig: {
+            type: 'object',
+            description: 'Runs Caddy on the node public port: a decoy site on `/` and the selected inbounds reverse-proxied by path to loopback. Only WebSocket, gRPC, and XHTTP inbounds qualify, and the panel moves them to 127.0.0.1 with `security=none` on its own. The front advertises h2 and http/1.1, and each published inbound is given the ALPN its transport requires. Requires `domain`, a `tlsSource` of acme or manual, SSH credentials, and a node on its own VPS. The panel certificate is not supported because the public front must present a certificate for the node domain.',
+            properties: {
+                enabled: { type: 'boolean', default: false },
+                publicPort: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 65535,
+                    default: 443,
+                    description: 'Port Caddy listens on. Takes it over from the fronted inbounds.',
+                },
+                inboundIds: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Inbounds to serve through the front. `main` selects the main inbound, other values are extra inbound ids. Each needs a distinct path, and none may use `/`.',
+                },
+                siteMode: {
+                    type: 'string',
+                    enum: ['nginx', 'custom'],
+                    default: 'nginx',
+                    description: 'Decoy page on `/`. A custom page is uploaded through the panel.',
+                },
+                status: {
+                    type: 'string',
+                    enum: ['disabled', 'pending', 'active', 'error'],
+                    readOnly: true,
+                },
+                lastError: { type: 'string', readOnly: true },
+                caddyVersion: { type: 'string', readOnly: true },
+            },
+        },
+        XrayConfig: {
+            type: 'object',
+            additionalProperties: true,
+            description: 'Xray-specific settings. Client-facing inbounds bind publicly unless listen is overridden.',
+            properties: {
+                listen: {
+                    type: 'string',
+                    format: 'ip',
+                    default: '0.0.0.0',
+                    example: '127.0.0.1',
+                    description: 'IPv4/IPv6 bind address for the main inbound.',
+                },
+                extraInbounds: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        additionalProperties: true,
+                        properties: {
+                            listen: {
+                                type: 'string',
+                                format: 'ip',
+                                default: '0.0.0.0',
+                                example: '127.0.0.1',
+                            },
+                        },
+                    },
+                },
+                tlsSource: {
+                    type: 'string',
+                    enum: ['panel', 'acme', 'manual', 'self-signed'],
+                    default: 'panel',
+                    description: 'TLS source for Xray inbounds. When front.enabled=true, only acme and manual are accepted.',
+                },
+                front: { $ref: '#/components/schemas/XrayFrontConfig' },
+            },
+        },
         NodeCreate: {
             type: 'object',
             required: ['name'],
-            description: `Payload for creating a Hysteria, Xray, or Virtual (load-balancer) node.
+            description: `Payload for creating a Hysteria, Xray, Virtual (load-balancer), or CDN node.
 
-\`ip\` is **required** for \`hysteria\`/\`xray\` and **must be omitted** for \`virtual\`.
-For \`virtual\` you must additionally pass a non-empty \`virtual\` object.`,
+\`ip\` is **required** for \`hysteria\`/\`xray\` and omitted for \`virtual\`/\`cdn\`.
+Serverless node types require their corresponding \`virtual\` or \`cdn\` object.`,
             properties: {
                 name: { type: 'string', example: 'Germany 1', description: 'Display name shown in panel and subscriptions.' },
-                ip: { type: 'string', example: '203.0.113.10', description: 'Server IP address. Required for hysteria/xray, ignored (always null) for virtual.' },
-                type: { type: 'string', enum: ['hysteria', 'xray', 'virtual'], default: 'hysteria', description: 'Node protocol family. `virtual` = load-balancer entry over real sibling nodes (no remote server).' },
+                ip: { type: 'string', example: '203.0.113.10', description: 'Server IP address. Required for hysteria/xray, ignored for serverless node types.' },
+                type: { type: 'string', enum: ['hysteria', 'xray', 'virtual', 'cdn'], default: 'hysteria', description: 'Node type. `virtual` and `cdn` have no remote server.' },
                 domain: { type: 'string', example: 'de.example.com', description: 'Public domain for TLS/SNI.' },
                 sni: { type: 'string', example: 'de.example.com', description: 'Optional SNI override.' },
                 port: { type: 'integer', example: 443, description: 'Main service port.' },
@@ -115,8 +224,9 @@ For \`virtual\` you must additionally pass a non-empty \`virtual\` object.`,
                 groups: { type: 'array', items: { type: 'string' }, example: ['64a1b2c3d4e5f6a7b8c9d0e1'], description: 'Server group ObjectIds.' },
                 maxOnlineUsers: { type: 'integer', example: 0, description: '0 = unlimited.' },
                 ssh: { type: 'object', description: 'SSH credentials. Password or privateKey can be provided. Ignored for virtual nodes.' },
-                xray: { type: 'object', description: 'Xray-specific settings when `type=xray`.' },
+                xray: { $ref: '#/components/schemas/XrayConfig' },
                 virtual: { $ref: '#/components/schemas/VirtualConfig' },
+                cdn: { $ref: '#/components/schemas/CdnConfig' },
                 cascadeRole: { type: 'string', enum: ['standalone', 'portal', 'bridge'], default: 'standalone', description: 'Always forced to `standalone` for virtual nodes.' },
                 country: { type: 'string', example: 'DE' },
                 comment: { type: 'string', maxLength: 500, example: 'Hetzner FSN1 — backup node', description: 'Free-form operator note shown in panel UI.' },
@@ -127,11 +237,17 @@ For \`virtual\` you must additionally pass a non-empty \`virtual\` object.`,
             type: 'object',
             description: `Partial node update payload. Any omitted field is left unchanged.
 
-When changing \`type\` to \`virtual\`, you must also pass a valid \`virtual\` object;
-the API will clear \`ip\` automatically. When the resulting \`type\` is not virtual,
-\`ip\` (kept from the existing document or supplied here) must be non-empty.`,
+When changing \`type\` to \`virtual\` or \`cdn\`, pass the corresponding config
+object; the API clears \`ip\` automatically. Other node types require an IP, so
+converting a serverless node back into a physical one must send \`ip\` in the
+same request. A node still referenced by a cascade link cannot be converted.
+
+\`xray\` and \`cdn\` are merged field by field. Secrets omitted from \`xray\`
+(\`realityPrivateKey\`, \`realityPublicKey\`, \`manualKey\`) and settings
+omitted from \`cdn\` are preserved.`,
             properties: {
                 name: { type: 'string' },
+                ip: { type: 'string', format: 'ip', description: 'Required when converting a virtual/CDN node back to hysteria or xray.' },
                 domain: { type: 'string' },
                 sni: { type: 'string' },
                 port: { type: 'integer' },
@@ -143,9 +259,10 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 settings: { type: 'object' },
                 active: { type: 'boolean' },
                 rankingCoefficient: { type: 'number' },
-                type: { type: 'string', enum: ['hysteria', 'xray', 'virtual'] },
-                xray: { type: 'object' },
+                type: { type: 'string', enum: ['hysteria', 'xray', 'virtual', 'cdn'] },
+                xray: { $ref: '#/components/schemas/XrayConfig' },
                 virtual: { $ref: '#/components/schemas/VirtualConfig' },
+                cdn: { $ref: '#/components/schemas/CdnConfig' },
                 cascadeRole: { type: 'string' },
                 country: { type: 'string' },
                 comment: { type: 'string', maxLength: 500 },
@@ -824,7 +941,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
 
 Many validation and not-found messages are returned in Russian (e.g. \`userId обязателен\`, \`Пользователь не найден\`). The \`error\` field shape is always the same.
 
-**Production note:** when \`NODE_ENV !== 'development'\` the panel sanitizes all \`5xx\` responses to \`{ "error": "Internal Server Error" }\` regardless of the original message. The \`5xx\` examples in this reference reflect development output; production callers should treat all \`5xx\` bodies as opaque.
+**Production note:** when \`NODE_ENV !== 'development'\` the panel replaces every \`5xx\` body sent to an API key or an unauthenticated caller with \`{ "error": "Internal Server Error", "requestId": "a1b2c3d4" }\`. The original error is written to the panel log under the same \`requestId\`; quote it when reporting a problem. Requests made from a signed-in admin session receive the original body. The \`5xx\` examples in this reference reflect the unmasked output.
 
 ## Non-API endpoints
 
@@ -899,6 +1016,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     _id:               { type: 'string', example: '64a1b2c3d4e5f6a7b8c9d0e1' },
                     userId:            { type: 'string', example: '123456789' },
                     username:          { type: 'string', example: 'JohnDoe' },
+                    comment:           { type: 'string', maxLength: 500, example: 'VIP, paid till June', description: 'Free-form operator note shown in panel UI. Not used in auth.' },
                     password:          { type: 'string', description: 'VPN password (auto-generated on create; returned on read/write responses)' },
                     xrayUuid:          { type: 'string', format: 'uuid', description: 'VLESS UUID for Xray nodes' },
                     enabled:           { type: 'boolean', example: true },
@@ -927,6 +1045,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                 properties: {
                     userId:       { type: 'string', example: '123456789', description: 'Unique user ID (e.g. Telegram ID)' },
                     username:     { type: 'string', example: 'JohnDoe' },
+                    comment:      { type: 'string', maxLength: 500, description: 'Free-form operator note (panel only).' },
                     enabled:      { type: 'boolean', default: false },
                     groups:       { type: 'array', items: { type: 'string' }, example: [] },
                     trafficLimit: { type: 'integer', example: 0, description: 'Bytes, 0 = unlimited' },
@@ -938,6 +1057,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                 type: 'object',
                 properties: {
                     username:     { type: 'string' },
+                    comment:      { type: 'string', maxLength: 500 },
                     enabled:      { type: 'boolean' },
                     groups:       { type: 'array', items: { type: 'string' } },
                     trafficLimit: { type: 'integer' },
@@ -2007,15 +2127,18 @@ These endpoints are not under \`/api\` and are not part of this specification:
             post: {
                 tags: ['Nodes'],
                 summary: 'Create node',
-                description: `Creates a Hysteria, Xray, or Virtual (load-balancer) node.
+                description: `Creates a Hysteria, Xray, Virtual (load-balancer), or CDN front node.
 
 - **\`type=hysteria\`** (default) / **\`type=xray\`** — \`ip\` required. \`statsSecret\` is
   generated server-side. Returns 409 if the same IP already has a node of the same \`type\`.
 - **\`type=virtual\`** — pure logical balancer over real sibling nodes. **Do not** pass
   \`ip\` or \`ssh\`; pass a \`virtual\` object instead. Virtual nodes never run setup,
   health checks, traffic collection, or restart — they only appear in subscriptions.
+- **\`type=cdn\`** — serverless front for a compatible Xray XHTTP, WebSocket, or gRPC
+  inbound. Pass a \`cdn\` object with \`originNode\` and a public domain and/or edge
+  addresses; do not pass \`ip\` or \`ssh\`.
 
-See the request body examples panel for both flavours.`,
+See the request body examples panel for representative variants.`,
                 requestBody: {
                     required: true,
                     content: {
@@ -2039,7 +2162,7 @@ See the request body examples panel for both flavours.`,
                                 examples: {
                                     required: { value: { error: 'name is required' } },
                                     missingIp: { value: { error: 'ip is required for hysteria and xray nodes' } },
-                                    badType: { value: { error: 'type must be hysteria, xray, or virtual' } },
+                                    badType: { value: { error: 'type must be hysteria, xray, virtual, or cdn' } },
                                     virtualNoSources: { value: { error: 'Virtual node (manual): at least one source required' } },
                                     virtualNoGroup: { value: { error: 'Virtual node (group): sourceGroup required' } },
                                 },
@@ -2073,7 +2196,7 @@ See the request body examples panel for both flavours.`,
                 responses: {
                     200: {
                         description: 'Matching nodes',
-                        content: { 'application/json': { schema: { type: 'object', properties: { nodes: { type: 'array', items: { type: 'object', properties: { _id: { type: 'string' }, type: { type: 'string', enum: ['hysteria', 'xray', 'virtual'] }, name: { type: 'string' } } } } } } } },
+                        content: { 'application/json': { schema: { type: 'object', properties: { nodes: { type: 'array', items: { type: 'object', properties: { _id: { type: 'string' }, type: { type: 'string', enum: ['hysteria', 'xray', 'virtual', 'cdn'] }, name: { type: 'string' } } } } } } } },
                     },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
@@ -2107,6 +2230,17 @@ See the request body examples panel for both flavours.`,
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
+                    409: {
+                        description: 'Duplicate name+flag, or the node is a CDN origin and the change would break the fronts pointing at it',
+                        content: {
+                            'application/json': {
+                                schema: { $ref: '#/components/schemas/Error' },
+                                examples: {
+                                    cdnDependent: { value: { error: 'CDN node "Timeweb front" depends on this node: CDN origin inbound must use XHTTP, WebSocket, or gRPC' } },
+                                },
+                            },
+                        },
+                    },
                 },
             },
 
@@ -2131,6 +2265,17 @@ See the request body examples panel for both flavours.`,
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
+                    409: {
+                        description: 'The node is the origin of at least one CDN node; delete those first',
+                        content: {
+                            'application/json': {
+                                schema: { $ref: '#/components/schemas/Error' },
+                                examples: {
+                                    cdnDependent: { value: { error: 'Node is used as the origin by CDN node "Timeweb front"' } },
+                                },
+                            },
+                        },
+                    },
                     500: { description: 'Internal error', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
                 },
             },

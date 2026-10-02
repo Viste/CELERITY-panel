@@ -5,11 +5,34 @@
 
 const { z } = require('zod');
 const { Client } = require('ssh2');
+const net = require('net');
 const HyNode = require('../../models/hyNodeModel');
 const HyUser = require('../../models/hyUserModel');
 const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const logger = require('../../utils/logger');
+const { isServerlessNode, checkCascadeMembership } = require('../../utils/nodeTypes');
+const nodeSetupLock = require('../../utils/nodeSetupLock');
+const {
+    mergeCdnConfig,
+    normalizeCdnConfig,
+    validateCdnOrigin,
+    checkCdnDependents,
+} = require('../../utils/cdnConfig');
+const {
+    XHTTP_DATA_PLACEMENT_VALUES,
+    XHTTP_METHOD_VALUES,
+    XHTTP_PADDING_METHOD_VALUES,
+    XHTTP_PADDING_PLACEMENT_VALUES,
+    XHTTP_PLACEMENT_VALUES,
+    XHTTP_SESSION_TABLE_VALUES,
+    validateXrayXhttp,
+} = require('../../utils/xhttpOptions');
+const {
+    FRONT_HIDDEN_SELECT,
+    applyFrontPatch,
+    captureFrontRollbackState,
+} = require('../../services/edgeFront/frontConfig');
 
 async function invalidateNodesCache() {
     await cache.invalidateNodes();
@@ -43,6 +66,10 @@ const queryNodesSchema = z.object({
 // Xray stream/security fields shared by the main inbound and extras. Enums
 // mirror xrayConfigSchema/xrayExtraInboundSchema in hyNodeModel.js.
 const xrayInboundCommonZ = {
+    listen: z.string()
+        .refine(value => net.isIP(value.trim()) !== 0, 'listen must be a valid IPv4 or IPv6 address')
+        .optional()
+        .describe('Server bind IPv4/IPv6 address; defaults to 0.0.0.0'),
     transport: z.enum(['tcp', 'ws', 'grpc', 'xhttp']).optional(),
     security: z.enum(['reality', 'tls', 'none']).optional(),
     flow: z.string().optional(),
@@ -61,6 +88,33 @@ const xrayInboundCommonZ = {
     xhttpPath: z.string().optional(),
     xhttpHost: z.string().optional(),
     xhttpMode: z.enum(['auto', 'packet-up', 'stream-up', 'stream-one']).optional(),
+    // Ranges use the Xray "min-max" string form (a bare number means min==max);
+    // empty keeps the core default. Values failing that shape are stored empty.
+    xhttpXPaddingBytes: z.string().optional().describe('XHTTP padding length range, e.g. "100-1000". Default 100-1000'),
+    xhttpScMaxEachPostBytes: z.string().optional().describe('packet-up upload split threshold in bytes, e.g. "1000000"'),
+    xhttpNoGrpcHeader: z.boolean().optional().describe('Omit the gRPC content-type on stream-up/stream-one requests (client-side only)'),
+    xhttpXmuxMaxConcurrency: z.string().optional().describe('XMUX streams per connection, e.g. "16-32" (client-side only)'),
+    xhttpXmuxHMaxRequestTimes: z.string().optional().describe('XMUX requests per connection, e.g. "600-900" (client-side only)'),
+    xhttpXmuxHMaxReusableSecs: z.string().optional().describe('XMUX connection lifetime in seconds, e.g. "1800-3000" (client-side only)'),
+    xhttpUplinkHTTPMethod: z.enum(XHTTP_METHOD_VALUES).optional(),
+    xhttpUplinkDataPlacement: z.enum(XHTTP_DATA_PLACEMENT_VALUES).optional(),
+    xhttpUplinkDataKey: z.string().max(64).optional(),
+    xhttpUplinkChunkSize: z.string().optional(),
+    xhttpScMinPostsIntervalMs: z.string().optional(),
+    xhttpServerMaxHeaderBytes: z.number().int().min(0).max(1048576).optional(),
+    xhttpXPaddingObfsMode: z.boolean().optional(),
+    xhttpXPaddingKey: z.string().max(64).optional(),
+    xhttpXPaddingHeader: z.string().max(64).optional().describe('Header carrying the padding when placement is header/queryInHeader, e.g. "Referer"'),
+    xhttpXPaddingPlacement: z.enum(XHTTP_PADDING_PLACEMENT_VALUES).optional(),
+    xhttpXPaddingMethod: z.enum(XHTTP_PADDING_METHOD_VALUES).optional(),
+    // Stored under the pre-rename names; emitted as sessionID* for xray-core
+    // v26.6.22+ (XTLS/Xray-core#6258).
+    xhttpSessionPlacement: z.enum(XHTTP_PLACEMENT_VALUES).optional(),
+    xhttpSessionKey: z.string().max(64).optional(),
+    xhttpSessionIDTable: z.enum(XHTTP_SESSION_TABLE_VALUES).optional().describe('Session ID alphabet: uuid, Base62, BASE36, HEX, number, ...'),
+    xhttpSessionIDLength: z.string().optional().describe('Session ID length range, e.g. "16-32"; requires a session ID table'),
+    xhttpSeqPlacement: z.enum(XHTTP_PLACEMENT_VALUES).optional(),
+    xhttpSeqKey: z.string().max(64).optional(),
     fallbackDest: z.string().optional().describe('VLESS fallbacks[].dest — emitted only on tcp+tls'),
 };
 
@@ -71,6 +125,17 @@ const xrayExtraInboundZ = z.object({
     uniqueName: z.boolean().optional(),
     port: z.number(),
     inboundTag: z.string(),
+});
+
+// Caddy on the node's public port. The listed inbounds move to loopback with
+// TLS terminated by the front, so only ws/grpc/xhttp qualify. ALPN is not a
+// knob: the front advertises h2 and http/1.1 and each transport negotiates
+// what it needs. The decoy page is uploaded through the panel, not here.
+const xrayFrontZ = z.object({
+    enabled: z.boolean().optional(),
+    publicPort: z.number().int().min(1).max(65535).optional().describe('Port clients connect to; Caddy listens here instead of the inbounds (default 443)'),
+    siteMode: z.enum(['nginx', 'custom']).optional().describe('Decoy site on /: built-in nginx welcome page, or HTML uploaded via the panel'),
+    inboundIds: z.array(z.string()).optional().describe('"main" for the main inbound, otherwise extraInbounds[].id'),
 });
 
 const xrayConfigZ = z.object({
@@ -85,6 +150,7 @@ const xrayConfigZ = z.object({
     agentToken: z.string().optional(),
     agentTls: z.boolean().optional(),
     extraInbounds: z.array(xrayExtraInboundZ).optional(),
+    front: xrayFrontZ.optional(),
 });
 
 const manageNodeSchema = z.object({
@@ -92,12 +158,12 @@ const manageNodeSchema = z.object({
     id: z.string().optional().describe('Node MongoDB _id (required for all except create)'),
     data: z.object({
         name: z.string().optional(),
-        ip: z.string().optional().describe('IPv4/IPv6 of the host (required for hysteria/xray; ignored for virtual)'),
+        ip: z.string().optional().describe('IPv4/IPv6 of the host (required for hysteria/xray; ignored for virtual/cdn)'),
         domain: z.string().optional(),
         sni: z.string().optional(),
         port: z.number().optional(),
         portRange: z.string().optional(),
-        type: z.enum(['hysteria', 'xray', 'virtual']).optional().describe('Node type. "virtual" is a load-balancer entry (HAPP/Xray-core balancer + Singbox/Clash url-test/load-balance group) without its own remote server'),
+        type: z.enum(['hysteria', 'xray', 'virtual', 'cdn']).optional().describe('Node type. "virtual" is a client-side load balancer; "cdn" publishes one Xray inbound through a domain and optional pinned edge addresses'),
         groups: z.array(z.string()).optional(),
         active: z.boolean().optional(),
         country: z.string().optional(),
@@ -110,6 +176,9 @@ const manageNodeSchema = z.object({
             sourceGroup: z.string().optional().describe('ServerGroup _id — required when selectMode==="group"'),
             strategy: z.enum(['random', 'roundRobin', 'leastPing', 'leastLoad']).optional().describe('Xray balancer strategy. leastPing/leastLoad require observatory'),
             fallbackToFirst: z.boolean().optional().describe('Use the first source as fallback when all observed peers are down (Xray fallbackTag)'),
+            tolerance: z.number().int().min(0).max(5000).optional().describe('Latency-test clients (sing-box urltest, Mihomo url-test): ms another source must beat the current pick by before switching. Ignored by Xray'),
+            idleTimeout: z.string().optional().describe('sing-box urltest only: stop probing after this long without traffic, e.g. "30m". Empty keeps the core default'),
+            interruptExistConnections: z.boolean().optional().describe('sing-box urltest only: drop open connections when the pick changes'),
             observatory: z.object({
                 destination: z.string().optional().describe('Probe URL returning HTTP 204 (default http://www.gstatic.com/generate_204)'),
                 connectivity: z.string().optional().describe('Local connectivity check URL — only probed when destination fails'),
@@ -117,6 +186,26 @@ const manageNodeSchema = z.object({
                 timeout: z.string().optional().describe('Probe timeout, e.g. "5s"'),
                 sampling: z.number().int().min(1).max(50).optional().describe('Burst Observatory sample window — recent probe results to keep'),
             }).optional(),
+        }).optional(),
+        cdn: z.object({
+            originNode: z.string().optional(),
+            originInboundId: z.string().optional(),
+            domain: z.string().optional(),
+            edges: z.array(z.object({
+                id: z.string(),
+                label: z.string().optional(),
+                address: z.string(),
+                enabled: z.boolean().optional(),
+            })).max(32).optional(),
+            port: z.number().int().min(1).max(65535).optional(),
+            security: z.enum(['tls']).optional(),
+            sni: z.string().optional(),
+            host: z.string().optional(),
+            path: z.string().optional(),
+            alpn: z.array(z.enum(['h3', 'h2', 'http/1.1', 'http/1.0'])).optional(),
+            fingerprint: z.string().optional(),
+            fingerprintPool: z.array(z.string()).optional().describe('TLS fingerprints distributed across CDN edges without repeats until the pool is exhausted; overrides fingerprint'),
+            xhttpMode: z.enum(['', 'auto', 'packet-up', 'stream-up', 'stream-one']).optional(),
         }).optional(),
         ssh: z.object({
             host: z.string().optional(),
@@ -282,10 +371,16 @@ async function queryNodes(args) {
         }
 
         if (parsed.includeConfig) {
-            const configGenerator = require('../../services/configGenerator');
-            const config = require('../../../config');
-            const baseUrl = process.env.BASE_URL || `http://localhost:${config.PORT}`;
-            result.config = configGenerator.generateNodeConfig(node, `${baseUrl}/api/auth`);
+            if (isServerlessNode(node)) {
+                result.configError = 'Serverless nodes have no remote config';
+            } else {
+                const configGenerator = require('../../services/configGenerator');
+                const config = require('../../../config');
+                const baseUrl = process.env.BASE_URL || `http://localhost:${config.PORT}`;
+                result.config = node.type === 'xray'
+                    ? configGenerator.generateXrayConfig(node, [])
+                    : configGenerator.generateNodeConfig(node, `${baseUrl}/api/auth`);
+            }
         }
 
         result.userCount = await HyUser.countDocuments({ nodes: node._id, enabled: true, isProbe: { $ne: true } });
@@ -310,7 +405,7 @@ async function manageNode(args, emit) {
             if (!data.name) throw new Error('name is required for create');
             const nodeType = data.type || 'hysteria';
 
-            if (nodeType !== 'virtual' && !data.ip) {
+            if (!isServerlessNode(nodeType) && !data.ip) {
                 throw new Error('ip is required for hysteria and xray nodes');
             }
 
@@ -325,9 +420,31 @@ async function manageNode(args, emit) {
                 if (selectMode === 'manual' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
                     return { error: 'Virtual node (manual): at least one source required', code: 400 };
                 }
+            } else if (nodeType === 'cdn') {
+                const normalized = normalizeCdnConfig(data.cdn);
+                if (normalized.error) return { error: normalized.error, code: 400 };
+                const originCheck = await validateCdnOrigin(normalized.value, HyNode);
+                if (originCheck.error) return { error: originCheck.error, code: 400 };
+                data.cdn = normalized.value;
             } else {
+                if (nodeType === 'xray') {
+                    const xhttpError = validateXrayXhttp(data.xray);
+                    if (xhttpError) return { error: xhttpError, code: 400 };
+                    if (data.xray?.front) {
+                        // The front takes over data.port.
+                        const frontNode = { port: data.port || 443, domain: data.domain, ip: data.ip };
+                        const frontError = applyFrontPatch(data.xray, frontNode, null);
+                        if (frontError) return { error: frontError, code: 400 };
+                        data.port = frontNode.port;
+                    }
+                }
                 const existing = await HyNode.findOne({ ip: data.ip, type: nodeType });
                 if (existing) return { error: `A ${nodeType} node with this IP already exists`, code: 409 };
+            }
+
+            const labelConflict = await HyNode.findLabelConflict(data.name, data.flag);
+            if (labelConflict) {
+                return { error: 'A node with this name and flag already exists — subscription tags must be unique', code: 409 };
             }
 
             const statsSecret = cryptoService.generateNodeSecret();
@@ -336,7 +453,7 @@ async function manageNode(args, emit) {
             // caller-provided credentials or inherit from a sibling on the same IP.
             const rawSsh = data.ssh || {};
             let resolvedSsh;
-            if (nodeType === 'virtual') {
+            if (isServerlessNode(nodeType)) {
                 resolvedSsh = cryptoService.encryptSshCredentials({});
             } else if (rawSsh.password || rawSsh.privateKey) {
                 resolvedSsh = cryptoService.encryptSshCredentials(rawSsh);
@@ -347,10 +464,10 @@ async function manageNode(args, emit) {
 
             const nodeData = {
                 name: data.name,
-                ip: nodeType === 'virtual' ? null : data.ip,
+                ip: isServerlessNode(nodeType) ? null : data.ip,
                 type: nodeType,
-                domain: data.domain || '',
-                sni: data.sni || '',
+                domain: isServerlessNode(nodeType) ? '' : (data.domain || ''),
+                sni: isServerlessNode(nodeType) ? '' : (data.sni || ''),
                 port: data.port || 443,
                 portRange: data.portRange || '20000-50000',
                 statsPort: 9999,
@@ -359,7 +476,7 @@ async function manageNode(args, emit) {
                 ssh: resolvedSsh,
                 active: true,
                 status: 'offline',
-                cascadeRole: nodeType === 'virtual' ? 'standalone' : (data.cascadeRole || 'standalone'),
+                cascadeRole: isServerlessNode(nodeType) ? 'standalone' : (data.cascadeRole || 'standalone'),
                 country: data.country || '',
             };
             if (data.initScript !== undefined) nodeData.initScript = data.initScript;
@@ -372,6 +489,11 @@ async function manageNode(args, emit) {
                     sourceGroup: v.sourceGroup || null,
                     strategy: v.strategy || 'leastLoad',
                     fallbackToFirst: v.fallbackToFirst !== false,
+                    tolerance: Number.isFinite(v.tolerance)
+                        ? Math.min(Math.max(v.tolerance, 0), 5000)
+                        : 50,
+                    idleTimeout: (v.idleTimeout || '').trim(),
+                    interruptExistConnections: v.interruptExistConnections !== false,
                     observatory: {
                         destination: (v.observatory?.destination || '').trim() || 'http://www.gstatic.com/generate_204',
                         connectivity: (v.observatory?.connectivity || '').trim(),
@@ -380,6 +502,8 @@ async function manageNode(args, emit) {
                         sampling: parseInt(v.observatory?.sampling, 10) || 3,
                     },
                 };
+            } else if (nodeType === 'cdn') {
+                nodeData.cdn = data.cdn;
             }
 
             const hy2Keys = [
@@ -401,17 +525,18 @@ async function manageNode(args, emit) {
 
             const node = new HyNode(nodeData);
             await node.save();
+            getSyncService().maybePushCdnOrigins(null, node);
             await invalidateNodesCache();
-            logger.info(`[MCP] Created ${nodeType} node ${data.name} (${nodeType === 'virtual' ? 'virtual' : data.ip})`);
+            logger.info(`[MCP] Created ${nodeType} node ${data.name} (${isServerlessNode(nodeType) ? nodeType : data.ip})`);
             return { success: true, node };
         }
 
         case 'update': {
             if (!id) throw new Error('id is required for update');
             const allowed = [
-                'name', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'groups', 'ssh', 'paths',
+                'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'groups', 'ssh', 'paths',
                 'settings', 'active', 'rankingCoefficient', 'country', 'comment', 'cascadeRole', 'type',
-                'virtual',
+                'virtual', 'cdn',
                 'hopInterval', 'acme', 'masquerade', 'bandwidth',
                 'ignoreClientBandwidth', 'speedTest', 'disableUDP',
                 'udpIdleTimeout', 'sniff', 'quic', 'resolver', 'acl', 'aclRules', 'useTlsFiles',
@@ -433,18 +558,40 @@ async function manageNode(args, emit) {
             // realityPublicKey, manualKey) are preserved instead of wiped by a full $set.
             if (data.xray && typeof data.xray === 'object') {
                 for (const [k, v] of Object.entries(data.xray)) {
+                    // front is owned by the xray branch below: it merges the
+                    // provisioning state and the decoy page a caller cannot send.
+                    if (k === 'front') continue;
                     updates[`xray.${k}`] = v;
                 }
             }
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
-            const existing = await HyNode.findById(id).select('type ip virtual').lean();
+            // The front subdocument is written whole, so the decoy page has to be
+            // carried over instead of being dropped by the $set.
+            const existing = await HyNode.findById(id)
+                .select(FRONT_HIDDEN_SELECT)
+                .lean();
             if (!existing) return { error: `Node '${id}' not found`, code: 404 };
+
+            // Renames only — pre-existing duplicates stay editable (see panel route).
+            if (updates.name !== undefined
+                && String(updates.name).trim() !== String(existing.name || '').trim()) {
+                const labelConflict = await HyNode.findLabelConflict(updates.name, existing.flag, id);
+                if (labelConflict) {
+                    return { error: 'A node with this name and flag already exists — subscription tags must be unique', code: 409 };
+                }
+            }
 
             const nextType = updates.type || existing.type;
             const nextVirtual = updates.virtual !== undefined ? updates.virtual : existing.virtual;
-            const nextIp = existing.ip;
+            const nextCdn = mergeCdnConfig(existing.cdn, updates.cdn);
+            // A serverless node stores ip=null, so converting one back into a
+            // physical node is only possible when the caller supplies an IP.
+            const nextIp = updates.ip !== undefined ? updates.ip : existing.ip;
+
+            const cascadeError = await checkCascadeMembership(existing, nextType);
+            if (cascadeError) return { error: cascadeError, code: 409 };
 
             if (nextType === 'virtual') {
                 const v = nextVirtual || {};
@@ -455,11 +602,80 @@ async function manageNode(args, emit) {
                     return { error: 'Virtual node (manual): at least one source required', code: 400 };
                 }
                 updates.ip = null;
+                updates.domain = '';
+                updates.sni = '';
+                updates.ssh = cryptoService.encryptSshCredentials({});
+                // findByIdAndUpdate skips the pre-validate hook that would
+                // normally reset the role, and a serverless node can never be
+                // one end of a cascade tunnel.
+                updates.cascadeRole = 'standalone';
+            } else if (nextType === 'cdn') {
+                const normalized = normalizeCdnConfig(nextCdn);
+                if (normalized.error) return { error: normalized.error, code: 400 };
+                const originCheck = await validateCdnOrigin(normalized.value, HyNode, {
+                    selfId: id,
+                    currentOriginId: existing.type === 'cdn' ? existing.cdn?.originNode : null,
+                });
+                if (originCheck.error) return { error: originCheck.error, code: 400 };
+                updates.cdn = normalized.value;
+                updates.ip = null;
+                updates.domain = '';
+                updates.sni = '';
+                updates.ssh = cryptoService.encryptSshCredentials({});
+                updates.cascadeRole = 'standalone';
             } else if (!nextIp) {
                 return { error: `Node type ${nextType} requires ip`, code: 400 };
+            } else if (nextType === 'xray') {
+                const nextXray = { ...(existing.xray || {}), ...(data.xray || {}) };
+                const xhttpError = validateXrayXhttp(nextXray);
+                if (xhttpError) return { error: xhttpError, code: 400 };
+                const frontRuntimeTouched = data.xray !== undefined
+                    || updates.domain !== undefined
+                    || updates.ip !== undefined
+                    || updates.port !== undefined;
+                if (frontRuntimeTouched
+                    && (nextXray.front?.enabled || existing.xray?.front?.enabled)) {
+                    const frontNode = {
+                        port: updates.port !== undefined ? updates.port : existing.port,
+                        domain: updates.domain !== undefined ? updates.domain : existing.domain,
+                        ip: nextIp,
+                    };
+                    const frontError = applyFrontPatch(
+                        nextXray,
+                        frontNode,
+                        existing.xray?.front,
+                        captureFrontRollbackState(existing)
+                    );
+                    if (frontError) return { error: frontError, code: 400 };
+                    // Persist pending state and everything the layout can rewrite.
+                    updates.port = frontNode.port;
+                    for (const key of ['front', 'listen', 'security', 'extraInbounds']) {
+                        if (nextXray[key] !== undefined) updates[`xray.${key}`] = nextXray[key];
+                    }
+                }
             }
 
-            const node = await HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true })
+            // Only an Xray node can be a CDN origin, and only a type or inbound
+            // change can break the fronts. Deactivation is allowed: the fronts
+            // stay stored and drop out of subscriptions until the origin is back.
+            const originTouched = updates.type !== undefined
+                || data.xray !== undefined
+                || updates.active !== undefined;
+            if (existing.type === 'xray' && originTouched) {
+                const dependentError = await checkCdnDependents(
+                    id,
+                    {
+                        type: nextType,
+                        name: existing.name,
+                        active: updates.active !== undefined ? updates.active : existing.active !== false,
+                        xray: { ...(existing.xray || {}), ...(data.xray || {}) },
+                    },
+                    HyNode
+                );
+                if (dependentError) return { error: dependentError, code: 409 };
+            }
+
+            const node = await HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true })
                 .populate('groups', 'name color');
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await invalidateNodesCache();
@@ -468,6 +684,7 @@ async function manageNode(args, emit) {
             // Virtual nodes have no remote service to push to — schedulePush will
             // simply emit a no-op via the existing type guards in syncService.
             getSyncService().schedulePush(node._id, updates);
+            getSyncService().maybePushCdnOrigins(existing, node);
 
             logger.info(`[MCP] Updated node ${node.name}`);
             return { success: true, node };
@@ -475,9 +692,14 @@ async function manageNode(args, emit) {
 
         case 'delete': {
             if (!id) throw new Error('id is required for delete');
+            const dependent = await HyNode.findOne({ type: 'cdn', 'cdn.originNode': id }).select('name').lean();
+            if (dependent) {
+                return { error: `Node is used as CDN origin by '${dependent.name}'`, code: 409 };
+            }
             const node = await HyNode.findByIdAndDelete(id);
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await HyUser.updateMany({ nodes: node._id }, { $pull: { nodes: node._id } });
+            getSyncService().maybePushCdnOrigins(node, null);
             await invalidateNodesCache();
             logger.info(`[MCP] Deleted node ${node.name}`);
             return { success: true, message: `Node '${node.name}' deleted` };
@@ -487,8 +709,8 @@ async function manageNode(args, emit) {
             if (!id) throw new Error('id is required for sync');
             const probe = await HyNode.findById(id).select('type').lean();
             if (!probe) return { error: `Node '${id}' not found`, code: 404 };
-            if (probe.type === 'virtual') {
-                return { error: 'Virtual nodes have no remote service to sync', code: 400 };
+            if (isServerlessNode(probe)) {
+                return { error: 'Serverless nodes have no remote service to sync', code: 400 };
             }
             const node = await HyNode.findByIdAndUpdate(id, { $set: { status: 'syncing' } }, { new: true });
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
@@ -505,8 +727,8 @@ async function manageNode(args, emit) {
             const node = await HyNode.findById(id);
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
 
-            if (node.type === 'virtual') {
-                return { error: 'Virtual nodes have no remote server to set up', code: 400 };
+            if (isServerlessNode(node)) {
+                return { error: 'Serverless nodes have no remote server to set up', code: 400 };
             }
 
             if (!node.ssh?.password && !node.ssh?.privateKey) {
@@ -516,13 +738,23 @@ async function manageNode(args, emit) {
             const opts = setupOptions || { installHysteria: true, setupPortHopping: true, restartService: true };
             const nodeSetup = require('../../services/nodeSetup');
 
+            // Locked by the canonical id: the requested one may differ in case.
+            const lockKey = String(node._id);
+            if (!nodeSetupLock.acquire(lockKey, 'Node setup')) {
+                return { error: `Node is busy: ${nodeSetupLock.holder(lockKey)} is running`, code: 409 };
+            }
+
             emit('progress', { step: 1, total: 3, message: `Connecting to ${node.name} via SSH...` });
 
             let result;
-            if (node.type === 'xray') {
-                result = await nodeSetup.setupXrayNode(node, { restartService: opts.restartService });
-            } else {
-                result = await nodeSetup.setupNode(node, opts);
+            try {
+                if (node.type === 'xray') {
+                    result = await nodeSetup.setupXrayNode(node, { restartService: opts.restartService });
+                } else {
+                    result = await nodeSetup.setupNode(node, opts);
+                }
+            } finally {
+                nodeSetupLock.release(lockKey);
             }
 
             if (result.success) {
@@ -554,8 +786,8 @@ async function manageNode(args, emit) {
             if (!id) throw new Error('id is required for update_config');
             const node = await HyNode.findById(id);
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
-            if (node.type === 'virtual') {
-                return { error: 'Virtual nodes have no remote service to push config to', code: 400 };
+            if (isServerlessNode(node)) {
+                return { error: 'Serverless nodes have no remote service to push config to', code: 400 };
             }
             emit('progress', { message: `Updating config on ${node.name}...` });
             const success = await getSyncService().updateNodeConfig(node);
@@ -567,8 +799,8 @@ async function manageNode(args, emit) {
             if (!id) throw new Error('id is required for setup_port_hopping');
             const node = await HyNode.findById(id);
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
-            if (node.type === 'virtual') {
-                return { error: 'Virtual nodes have no remote server', code: 400 };
+            if (isServerlessNode(node)) {
+                return { error: 'Serverless nodes have no remote server', code: 400 };
             }
             emit('progress', { message: `Configuring port hopping on ${node.name}...` });
             const success = await getSyncService().setupPortHopping(node);
@@ -631,8 +863,8 @@ async function executeSsh(args, emit) {
 
     const node = await HyNode.findById(nodeId);
     if (!node) return { error: `Node '${nodeId}' not found`, code: 404 };
-    if (node.type === 'virtual') {
-        return { error: 'Virtual nodes have no SSH host', code: 400 };
+    if (isServerlessNode(node)) {
+        return { error: 'Serverless nodes have no SSH host', code: 400 };
     }
 
     emit('progress', { message: `Connecting to ${node.name} (${node.ip})...` });
@@ -699,8 +931,8 @@ async function sshSession(args, emit) {
             if (!nodeId) throw new Error('nodeId is required for start');
             const node = await HyNode.findById(nodeId);
             if (!node) return { error: `Node '${nodeId}' not found`, code: 404 };
-            if (node.type === 'virtual') {
-                return { error: 'Virtual nodes have no SSH host', code: 400 };
+            if (isServerlessNode(node)) {
+                return { error: 'Serverless nodes have no SSH host', code: 400 };
             }
 
             const sid = require('crypto').randomUUID();

@@ -10,6 +10,8 @@ const config = require('../../config');
 const cryptoService = require('./cryptoService');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
+const { isServerlessNode } = require('../utils/nodeTypes');
+const { isLoopbackAddress, hasOwnTlsInbound } = require('../utils/xrayFront');
 
 /**
  * Check if a node is on the same VPS as the panel
@@ -426,7 +428,7 @@ function execSSH(conn, command) {
 }
 
 function resolveNodeServiceCandidates(node) {
-    if (!node || node.type === 'virtual') return [];
+    if (!node || isServerlessNode(node)) return [];
     if (node.type === 'xray') return ['xray'];
     if (node.type === 'mieru') return ['mita'];
     return ['hysteria-server', 'hysteria'];
@@ -1004,8 +1006,16 @@ async function setupXrayNode(node, options = {}) {
             return { success: false, error: msg, logs, realityKeys: null };
         }
 
-        // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
         const xrayCfgEarly = node?.xray || {};
+        if (sameVps && xrayCfgEarly.front?.enabled) {
+            const msg = `Reverse proxy front is incompatible with same-VPS deployment: `
+                + `the panel's Caddy already owns port 443 on this server. `
+                + `Move the node to a separate VPS or turn the front off.`;
+            log(`ERROR: ${msg}`);
+            return { success: false, error: msg, logs, realityKeys: null };
+        }
+
+        // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
         if (sameVps && xrayCfgEarly.security === 'tls' && xrayCfgEarly.tlsSource === 'acme') {
             const msg = `tlsSource='acme' is incompatible with same-VPS deployment: ` +
                 `port 80 is held by the panel's Caddy and cannot be used for HTTP-01. ` +
@@ -1112,10 +1122,13 @@ async function setupXrayNode(node, options = {}) {
         logs.push(configContent.substring(0, 500) + (configContent.length > 500 ? '\n...' : ''));
         logs.push('--- End config preview ---');
 
+        // Any inbound may terminate TLS, not just the main one.
+        const terminatesTls = hasOwnTlsInbound(xrayCfg);
+
         // Self-signed TLS: openssl is only invoked when explicitly requested.
         // For tlsSource=panel/manual the certificate is inlined into config.json
         // by configGenerator and never written to disk on the remote node.
-        if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'self-signed') {
+        if (terminatesTls && xrayCfg.tlsSource === 'self-signed') {
             log('Generating self-signed TLS certificate (testing only)...');
             // Strip shell metacharacters from CN (node.sni is admin-only but
             // not strictly validated) and cap at the X.509 64-char CN limit.
@@ -1148,12 +1161,14 @@ fi
             if (!certResult.success) {
                 log(`Self-signed cert generation warning: ${certResult.error}`);
             }
-        } else if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'acme') {
+        } else if (xrayCfg.front?.enabled && xrayCfg.tlsSource === 'acme') {
+            log('TLS source: acme — the reverse proxy front obtains and renews the certificate itself.');
+        } else if (terminatesTls && xrayCfg.tlsSource === 'acme') {
             const domain = String(node.domain || '').trim();
             const email = (String(xrayCfg.acmeEmail || '').trim()) ||
                           (String(config.ACME_EMAIL || '').trim());
             if (!domain) {
-                throw new Error('tlsSource=acme requires node.domain to be set in the Network section.');
+                throw new Error('tlsSource=acme requires node.domain to be set on the Main tab.');
             }
             if (!email) {
                 throw new Error('tlsSource=acme requires acmeEmail (or the panel-wide ACME_EMAIL env var).');
@@ -1166,20 +1181,33 @@ fi
                 throw new Error(`ACME setup failed: ${acmeResult.error || 'see logs above'}`);
             }
             log('ACME cert installed and auto-renewal cron registered on the node.');
-        } else if (xrayCfg.security === 'tls') {
+        } else if (terminatesTls || xrayCfg.front?.enabled) {
             log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
         }
 
-        // Collect all client-facing ports: main inbound + extra inbounds.
-        // apiPort is local-only (127.0.0.1) and does not need a firewall rule.
+        // Collect externally bound client-facing ports. Loopback listeners and
+        // apiPort do not need host firewall rules.
         const mainPort = node.port || 443;
         const apiPort = (node.xray || {}).apiPort || 61000;
-        const extraPorts = ((node.xray || {}).extraInbounds || [])
-            .map(i => parseInt(i.port, 10))
-            .filter(p => Number.isInteger(p) && p > 0 && p < 65536 && p !== mainPort);
-        const allPorts = [mainPort, ...extraPorts];
+        const xrayConfig = node.xray || {};
+        const externalPorts = [];
+        if (!isLoopbackAddress(xrayConfig.listen || '0.0.0.0')) {
+            externalPorts.push(mainPort);
+        }
+        for (const inbound of (xrayConfig.extraInbounds || [])) {
+            const port = parseInt(inbound.port, 10);
+            if (Number.isInteger(port) && port > 0 && port < 65536
+                && !isLoopbackAddress(inbound.listen || '0.0.0.0')) {
+                externalPorts.push(port);
+            }
+        }
+        // The front owns the public port, plus :80 for the ACME challenge.
+        if (xrayConfig.front?.enabled) {
+            externalPorts.push(xrayConfig.front.publicPort || 443, 80);
+        }
+        const allPorts = [...new Set(externalPorts)];
 
-        log(`Opening firewall ports (${allPorts.join(', ')}, api:${apiPort})...`);
+        log(`Opening external firewall ports (${allPorts.join(', ') || 'none'}, api:${apiPort} local)...`);
         const portRules = allPorts.map(p => `
     iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null || true`).join('');
@@ -1947,4 +1975,5 @@ module.exports = {
     setupMieruNode,
     checkMieruNodeStatus,
     getMieruNodeLogs,
+    isLoopbackAddress,
 };

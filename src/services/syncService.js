@@ -19,12 +19,15 @@ const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
 const cache = require('./cacheService');
 const { invalidateNodesCache, invalidateUserCache } = require('../utils/helpers');
+const { isServerlessNode } = require('../utils/nodeTypes');
+const { collectCdnDependentUsers, cdnOriginSyncNeeded, cdnOriginIdsForSync } = require('../utils/cdnConfig');
 const logger = require('../utils/logger');
 const axios = require('axios');
 const https = require('https');
 const config = require('../../config');
 const webhook = require('./webhookService');
 const nodeSetup = require('./nodeSetup');
+const nodeSetupLock = require('../utils/nodeSetupLock');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
@@ -34,6 +37,9 @@ const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
 // Env-overridable so we can absorb transit flaps (e.g. upstream DDoS-scrubber that
 // drops ~29/30 probes) without rolling a new image each time.
 const HEALTH_FAILURE_THRESHOLD = Math.max(1, parseInt(process.env.HEALTH_FAILURE_THRESHOLD, 10) || 10);
+
+// Where the installer puts Xray; the systemd unit points at the same path.
+const XRAY_BIN = '/usr/local/bin/xray';
 
 // Fields whose change requires regenerating the runtime config on the node.
 // Anything not listed here (name, groups, flag, rankingCoefficient, ssh.*, ...)
@@ -115,6 +121,34 @@ async function ensureManualKeyLoaded(node) {
     }
 }
 
+async function restorePreviousXrayConfig(node) {
+    if (!node?.ssh?.password && !node?.ssh?.privateKey) return false;
+    const ssh = new NodeSSH(node);
+    try {
+        await ssh.connect();
+        const result = await ssh.exec(
+            `test -s /usr/local/etc/xray/config.json.prev && `
+            + `cp -f /usr/local/etc/xray/config.json.prev /usr/local/etc/xray/config.json && `
+            + 'systemctl restart xray && systemctl is-active --quiet xray && '
+            + 'rm -f /usr/local/etc/xray/config.json.prev'
+        );
+        return result.code === 0;
+    } finally {
+        ssh.disconnect();
+    }
+}
+
+async function removePreviousXrayConfig(node) {
+    if (!node?.ssh?.password && !node?.ssh?.privateKey) return;
+    const ssh = new NodeSSH(node);
+    try {
+        await ssh.connect();
+        await ssh.exec('rm -f /usr/local/etc/xray/config.json.prev');
+    } finally {
+        ssh.disconnect();
+    }
+}
+
 // ─── Panel certificate rotation watcher ──────────────────────────────────────
 //
 // When Caddy/Greenlock renews the panel's LE certificate the on-disk file
@@ -175,11 +209,16 @@ async function checkPanelCertRotation(syncInstance) {
 
     let nodes;
     try {
+        // The main inbound, an extra one or the front can serve the cert.
         nodes = await HyNode.find({
             type: 'xray',
             active: true,
-            'xray.security': 'tls',
             'xray.tlsSource': 'panel',
+            $or: [
+                { 'xray.security': 'tls' },
+                { 'xray.extraInbounds.security': 'tls' },
+                { 'xray.front.enabled': true },
+            ],
         });
     } catch (err) {
         logger.error(`[CertWatch] Failed to list panel-source nodes: ${err.message}`);
@@ -251,6 +290,7 @@ class SyncService {
     constructor() {
         this.isSyncing = false;
         this.lastSyncTime = null;
+        this.pendingPushTimers = new Map();
     }
 
     /**
@@ -303,6 +343,12 @@ class SyncService {
 
         if (response.status === 401) {
             throw new Error(`[Agent] Unauthorized — check agentToken for node ${node.name}`);
+        }
+        if (response.status < 200 || response.status >= 300) {
+            const detail = typeof response.data === 'string'
+                ? response.data
+                : JSON.stringify(response.data || {});
+            throw new Error(`[Agent] ${method} ${path} returned HTTP ${response.status}: ${detail.slice(0, 300)}`);
         }
 
         return response;
@@ -425,9 +471,13 @@ class SyncService {
             // Node has no groups — all users without group assignment
             byGroups = await HyUser.find({ enabled: true, groups: { $size: 0 }, ...noExplicitNodes }).lean();
         }
+        const fromCdnFronts = node.type === 'xray'
+            ? await collectCdnDependentUsers(node._id, HyNode, HyUser)
+            : [];
+
         // Merge and deduplicate by userId
         const seen = new Set();
-        return [...byNodes, ...byGroups].filter(u => {
+        return [...byNodes, ...byGroups, ...fromCdnFronts].filter(u => {
             if (seen.has(u.userId)) return false;
             seen.add(u.userId);
             return true;
@@ -473,14 +523,21 @@ class SyncService {
     /**
      * Full config update for an Xray node.
      *
-     * Step 1: Upload xray config.json via SSH (inbound/outbound settings, no user list).
+     * Step 1: Upload xray config.json via SSH (inbound/outbound settings, no
+     *         user list), then have the node itself parse it with `-test`. A
+     *         config Xray refuses is rolled back and the restart is skipped.
      * Step 2: Restart Xray via Agent API (no SSH restart needed).
      * Step 3: Sync all users to Xray runtime via Agent /sync endpoint.
      *
      * SSH is only used for the config upload. If agent is not yet installed,
      * falls back to SSH restart.
      */
-    async updateXrayNodeConfig(node) {
+    async updateXrayNodeConfig(node, { lockHeld = false } = {}) {
+        const lockKey = String(node?._id || '');
+        if (!lockHeld && !nodeSetupLock.acquire(lockKey, 'Xray config sync')) {
+            throw new Error(`Node is busy: ${nodeSetupLock.holder(lockKey)} is running`);
+        }
+        try {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
 
@@ -489,6 +546,7 @@ class SyncService {
         await ensureManualKeyLoaded(node);
 
         const users = await this._getUsersForNode(node);
+        const frontService = require('./edgeFront/provisionService');
 
         // Bail out early on cert-availability errors — pushing a broken
         // config would silently crash Xray on the node.
@@ -506,10 +564,34 @@ class SyncService {
                     },
                 });
                 await invalidateNodesCache();
+                await frontService.rollbackFrontDatabaseState(node._id, genErr.message).catch(() => {});
                 return false;
             }
+            await frontService.rollbackFrontDatabaseState(node._id, genErr.message).catch(() => {});
             throw genErr;
         }
+
+        let preparedFront = null;
+        let publishFrontAfterSync = false;
+        const disablingFront = !node.xray?.front?.enabled
+            && !!node.xray?.front?.appliedFingerprint;
+        if (node.xray?.front?.enabled) {
+            const staged = await frontService.prepareFrontForSync(node, {
+                log: message => logger.info(`[Xray Sync] ${node.name}: ${message}`),
+                deferPublication: true,
+            });
+            if (staged.error) {
+                logger.error(`[Xray Sync] Node ${node.name}: front preflight failed — ${staged.error}`);
+                return false;
+            }
+            preparedFront = staged.prepared || null;
+            publishFrontAfterSync = !!staged.publishAfterSync;
+        }
+
+        // Set when the node itself refuses the generated config: the restart is
+        // then skipped so the node keeps serving the config it already runs.
+        let configRejected = null;
+        let configUploadFailed = null;
 
         // Step 1: Upload config.json via SSH (only if SSH is configured)
         if (node.ssh?.password || node.ssh?.privateKey) {
@@ -583,13 +665,34 @@ class SyncService {
 
                 // Xray config always goes to /usr/local/etc/xray/config.json
                 const xrayConfigPath = '/usr/local/etc/xray/config.json';
+                // Keep the running config aside first: systemd does not roll a
+                // failed start back, so without a copy a rejected config leaves
+                // the node with nothing to fall back to.
+                await ssh.exec(`cp -f ${xrayConfigPath} ${xrayConfigPath}.prev 2>/dev/null || true`);
                 await ssh.uploadContent(configContent, xrayConfigPath);
                 logger.info(`[Xray Sync] Node ${node.name}: config uploaded to ${xrayConfigPath}`);
 
+                // Xray parses the config only at startup, so a config it
+                // rejects turns a restart into an outage. -test parses and
+                // exits without touching the running instance. A node without
+                // the binary at the expected path skips the check rather than
+                // failing it — there is nothing to protect there yet.
+                const test = await ssh.exec(
+                    `[ -x ${XRAY_BIN} ] || exit 0; ${XRAY_BIN} run -test -config ${xrayConfigPath} 2>&1`
+                );
+                if (test.code !== 0) {
+                    const reason = String(test.stdout || test.stderr || '')
+                        .trim().split('\n').slice(-3).join(' ').slice(0, 300);
+                    await ssh.exec(`mv -f ${xrayConfigPath}.prev ${xrayConfigPath} 2>/dev/null || true`);
+                    configRejected = reason || 'xray rejected the generated config';
+                    logger.error(`[Xray Sync] Node ${node.name}: config rejected, previous one restored — ${configRejected}`);
+                }
+
                 // Also refresh cc-agent config when extra inbounds may have
-                // changed, so the agent picks up new tag→flow mapping. The
-                // helper restarts cc-agent via systemctl; safe to call always.
-                if (node.xray?.agentToken) {
+                // changed, so the agent picks up new tag→flow mapping. Skipped
+                // after a rollback: the agent would then map inbounds that the
+                // restored config does not have.
+                if (node.xray?.agentToken && !configRejected) {
                     try {
                         await nodeSetup.reloadCcAgent(node, ssh);
                     } catch (reloadErr) {
@@ -597,33 +700,105 @@ class SyncService {
                     }
                 }
             } catch (error) {
+                configUploadFailed = error.message;
                 logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
             } finally {
                 ssh.disconnect();
             }
         }
 
+        if (configRejected || configUploadFailed) {
+            if (preparedFront) {
+                await frontService.discardPreparedFront(node, preparedFront).catch(() => {});
+            }
+            const failure = configRejected
+                ? `Config rejected by Xray: ${configRejected}`
+                : `Config upload failed: ${configUploadFailed}`;
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: {
+                    status: 'error',
+                    lastSync: new Date(),
+                    lastError: failure,
+                },
+            });
+            await invalidateNodesCache();
+            await frontService.rollbackFrontDatabaseState(node._id, failure).catch(() => {});
+            return false;
+        }
+
+        // When disabling the front, release the public port before Xray binds
+        // it again. A failed Xray restart resumes the previous Caddy release.
+        let frontSuspended = false;
+        if (disablingFront) {
+            try {
+                await frontService.setFrontSuspended(node, true);
+                frontSuspended = true;
+            } catch (error) {
+                const restored = await restorePreviousXrayConfig(node).catch(() => false);
+                const resumed = await frontService.setFrontSuspended(node, false)
+                    .then(() => true)
+                    .catch(() => false);
+                await HyNode.updateOne({ _id: node._id }, {
+                    $set: {
+                        status: 'error',
+                        lastError: `Front suspend failed: ${error.message}; rollback ${restored && resumed ? 'succeeded' : 'failed'}`,
+                    },
+                });
+                await frontService.rollbackFrontDatabaseState(
+                    node._id,
+                    `Front suspend failed: ${error.message}`
+                ).catch(() => {});
+                return false;
+            }
+        }
+
         // Step 2: Restart Xray via Agent (preferred) or SSH fallback
         const hasAgent = !!(node.xray?.agentToken);
+        let restartError = null;
         if (hasAgent) {
             try {
                 // /restart blocks until Xray is running and users are restored (~2-3s)
                 await this._agentRequest(node, 'POST', '/restart');
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via agent`);
             } catch (error) {
+                restartError = error;
                 logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
             }
         } else if (node.ssh?.password || node.ssh?.privateKey) {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
-                await ssh.exec('systemctl restart xray');
+                const restart = await ssh.exec('systemctl restart xray');
+                if (restart.code !== 0) {
+                    throw new Error(String(restart.stderr || restart.stdout || 'systemctl restart xray failed').trim());
+                }
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
             } catch (error) {
+                restartError = error;
                 logger.warn(`[Xray Sync] Node ${node.name}: SSH restart failed: ${error.message}`);
             } finally {
                 ssh.disconnect();
             }
+        }
+
+        if (restartError) {
+            const restored = await restorePreviousXrayConfig(node).catch(() => false);
+            let caddyResumed = true;
+            if (frontSuspended) {
+                caddyResumed = await frontService.setFrontSuspended(node, false)
+                    .then(() => true)
+                    .catch(() => false);
+            }
+            if (preparedFront) {
+                await frontService.discardPreparedFront(node, preparedFront).catch(() => {});
+            }
+            const rollbackSucceeded = restored && caddyResumed;
+            const message = `Xray restart failed: ${restartError.message}; rollback ${rollbackSucceeded ? 'succeeded' : 'failed'}`;
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: message },
+            });
+            await frontService.rollbackFrontDatabaseState(node._id, message).catch(() => {});
+            return false;
         }
 
         // Step 3: Sync users via Agent (builds the runtime user list in Xray without restart)
@@ -643,11 +818,68 @@ class SyncService {
             }
         }
 
-        // Update node status
+        // Step 4: commit the prevalidated front only after Xray is healthy on
+        // loopback. Any failure restores config.json.prev and the prior Caddy.
+        let keepFrontRollback = false;
+        if (preparedFront) {
+            const result = await frontService.activateFrontForSync(node, preparedFront, {
+                log: message => logger.info(`[Xray Sync] ${node.name}: ${message}`),
+            });
+            if (result.error) {
+                await restorePreviousXrayConfig(node).catch(() => false);
+                logger.warn(`[Xray Sync] Node ${node.name}: front activation failed: ${result.error}`);
+                return false;
+            }
+            if (result.stale) {
+                keepFrontRollback = true;
+                this.schedulePush(node._id);
+            }
+        } else if (disablingFront) {
+            try {
+                await frontService.completeFrontDisable(node);
+                await removePreviousXrayConfig(node).catch(() => {});
+            } catch (error) {
+                if (error.remoteDisableCompleted) {
+                    await frontService.clearFrontRollbackState(node._id).catch(() => {});
+                    logger.warn(`[Xray Sync] Node ${node.name}: front stopped but state persistence failed: ${error.message}`);
+                    return false;
+                }
+                const restored = await restorePreviousXrayConfig(node).catch(() => false);
+                const resumed = await frontService.setFrontSuspended(node, false)
+                    .then(() => true)
+                    .catch(() => false);
+                const rollback = restored && resumed ? 'succeeded' : 'failed';
+                await HyNode.updateOne({ _id: node._id }, {
+                    $set: { status: 'error', lastError: `Front disable failed: ${error.message}; rollback ${rollback}` },
+                });
+                await frontService.rollbackFrontDatabaseState(
+                    node._id,
+                    `Front disable failed: ${error.message}`
+                ).catch(() => {});
+                return false;
+            }
+        } else {
+            await removePreviousXrayConfig(node).catch(() => {});
+        }
+        if (publishFrontAfterSync) {
+            const promoted = await frontService.promotePendingFront(node._id);
+            if (!promoted) {
+                keepFrontRollback = true;
+                this.schedulePush(node._id);
+                logger.info(`[Xray Sync] ${node.name}: front changed during sync; publication remains pending`);
+            }
+        }
+        if (!keepFrontRollback) {
+            await frontService.clearFrontRollbackState(node._id).catch(() => {});
+        }
+
+        // Update node status. checkXrayAgentHealth owns it: it counts failures
+        // and flips to offline at the threshold. Overwriting the status here
+        // also reset that counter, so the node never settled.
         try {
             const health = await this.checkXrayAgentHealth(node);
             if (!health.online && hasAgent) {
-                await HyNode.updateOne({ _id: node._id }, { $set: { status: 'error', lastSync: new Date(), healthFailures: 0 } });
+                await HyNode.updateOne({ _id: node._id }, { $set: { lastSync: new Date() } });
                 await invalidateNodesCache();
                 return false;
             }
@@ -660,6 +892,9 @@ class SyncService {
 
         logger.info(`[Xray Sync] Node ${node.name}: sync complete, ${users.length} users`);
         return true;
+        } finally {
+            if (!lockHeld) nodeSetupLock.release(lockKey);
+        }
     }
 
     /**
@@ -800,7 +1035,7 @@ class SyncService {
      * Virtual nodes have no remote server — sync is a no-op.
      */
     async updateNodeConfig(node) {
-        if (node.type === 'virtual') return;
+        if (isServerlessNode(node)) return;
         if (node.type === 'xray') {
             return this.updateXrayNodeConfig(node);
         }
@@ -916,8 +1151,26 @@ class SyncService {
      * @param {Object} [updates] - $set payload applied to the node. When omitted,
      *                             the push is assumed relevant and runs unconditionally.
      */
+    /**
+     * Push the origin Xray config when a CDN front starts, stops, or changes
+     * who is allowed to use it. The front itself is serverless and has nothing
+     * to receive; the UUID list lives on the origin.
+     */
+    maybePushCdnOrigins(previous, next) {
+        if (!cdnOriginSyncNeeded(previous, next)) return;
+        for (const originId of cdnOriginIdsForSync(previous, next)) {
+            this.schedulePush(originId);
+        }
+    }
+
     schedulePush(nodeId, updates = null) {
         if (!hasConfigRelevantUpdates(updates)) return;
+        const key = String(nodeId);
+        const pendingTimer = this.pendingPushTimers.get(key);
+        if (pendingTimer) {
+            clearTimeout(pendingTimer);
+            this.pendingPushTimers.delete(key);
+        }
         setImmediate(async () => {
             try {
                 const node = await HyNode.findById(nodeId);
@@ -930,6 +1183,15 @@ class SyncService {
 
                 await this.updateNodeConfig(node);
             } catch (error) {
+                if (/^Node is busy:/.test(error.message)) {
+                    const timer = setTimeout(() => {
+                        this.pendingPushTimers.delete(key);
+                        this.schedulePush(nodeId);
+                    }, 1000);
+                    timer.unref?.();
+                    this.pendingPushTimers.set(key, timer);
+                    return;
+                }
                 logger.warn(`[AutoPush] node ${nodeId}: ${error.message}`);
             }
         });
@@ -1043,7 +1305,7 @@ class SyncService {
         logger.info('[Sync] Starting sync for all nodes');
         
         try {
-            const nodes = await HyNode.find({ active: true });
+            const nodes = await HyNode.find({ active: true, type: { $ne: 'cdn' } });
             
             // Parallel sync with concurrency limit
             const CONCURRENCY = 5;
@@ -1070,7 +1332,7 @@ class SyncService {
      * Virtual nodes never carry traffic of their own.
      */
     async collectTrafficStats(node) {
-        if (node.type === 'virtual') return;
+        if (isServerlessNode(node)) return;
         // mita exposes aggregate metrics only (no per-user traffic via API);
         // we don't try to parse them yet — traffic shows 0 on mieru nodes.
         if (node.type === 'mieru') return;
@@ -1164,7 +1426,7 @@ class SyncService {
      * Virtual nodes are aggregators with no online state of their own.
      */
     async getOnlineUsers(node) {
-        if (node.type === 'virtual') return 0;
+        if (isServerlessNode(node)) return 0;
         if (node.type === 'mieru') {
             // mita's `mita describe connections` is not user-keyed, so we can't
             // report online count — but we still need to flip status online/offline
@@ -1249,7 +1511,7 @@ class SyncService {
         for (const node of user.nodes) {
             try {
                 // Virtual nodes have no remote service to kick from.
-                if (node.type === 'virtual') continue;
+                if (isServerlessNode(node)) continue;
                 // mita has no per-user kick endpoint; user removal happens on
                 // the next full config push (updateMieruNodeConfig).
                 if (node.type === 'mieru') continue;
@@ -1276,7 +1538,7 @@ class SyncService {
      * Collect stats from all nodes (parallel with concurrency limit)
      */
     async collectAllStats() {
-        const nodes = await HyNode.find({ active: true });
+        const nodes = await HyNode.find({ active: true, type: { $ne: 'cdn' } });
         
         // Parallel processing with concurrency limit
         const CONCURRENCY = 5;
@@ -1301,7 +1563,7 @@ class SyncService {
      * Health check all nodes (parallel)
      */
     async healthCheck() {
-        const nodes = await HyNode.find({ active: true });
+        const nodes = await HyNode.find({ active: true, type: { $ne: 'cdn' } });
         
         // Parallel check with concurrency limit
         const CONCURRENCY = 5;

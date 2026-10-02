@@ -24,6 +24,10 @@
                         <span class="value"><%= user.username || '—' %></span>
                     </div>
                     <div class="detail-item">
+                        <label><%= t('users.comment') %></label>
+                        <span class="value"><%= user.comment || '—' %></span>
+                    </div>
+                    <div class="detail-item">
                         <label><%= t('users.hysteriaPassword') %></label>
                         <code class="value"><%= user.password %></code>
                     </div>
@@ -136,7 +140,9 @@
                         <% effectiveNodes.forEach(node => { %>
                         <div class="node-badge">
                             <span class="node-name"><%= node.name %></span>
-                            <span class="node-ip"><%= node.type === 'virtual' ? 'virtual / balancer' : (node.ip || '—') %></span>
+                            <span class="node-ip"><%= node.type === 'virtual'
+                                ? 'virtual / balancer'
+                                : (node.type === 'cdn' ? (node.cdn?.domain || 'CDN edge') : (node.ip || '—')) %></span>
                         </div>
                         <% }); %>
                     <% } else { %>
