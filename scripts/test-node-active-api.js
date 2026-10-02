@@ -35,6 +35,13 @@ function applySet(target, values) {
 
 const HyNode = {
     findById: async (id) => clone(db.get(id) || null),
+    // Used by the CDN-dependency guard on disable; mirrors the Mongoose chain.
+    find: (filter) => ({
+        select: () => ({
+            lean: async () => [...db.values()].filter(node => node.type === 'cdn'
+                && String(node.cdn?.originNode || '') === String(filter?.['cdn.originNode'] || '')).map(clone),
+        }),
+    }),
     findByIdAndUpdate: async (id, update, options) => {
         updates.push({ method: 'findByIdAndUpdate', id, update: clone(update), options });
         const node = db.get(id);
@@ -76,6 +83,7 @@ const stubs = {
         schedulePush: () => {
             throw new Error('schedulePush must not be called by active toggles');
         },
+        maybePushCdnOrigins: () => {},
     },
     '../utils/logger': {
         info: () => {},
@@ -92,6 +100,11 @@ const stubs = {
         invalidateNodesCache: async () => {
             invalidateCount += 1;
         },
+    },
+    // Active toggles never touch the reverse-proxy front; stubbed so the real
+    // module does not pull in the panel config.
+    '../services/edgeFront/frontConfig': {
+        applyFrontPatch: () => null,
     },
 };
 
@@ -256,6 +269,35 @@ function reset() {
     assert.strictEqual(runtimeStopCalls.length, 0);
     assert.strictEqual(db.get('virtual-1').active, false);
     assert.strictEqual(db.get('virtual-1').status, 'offline');
+
+    // Disabling an origin pulls its CDN fronts out of subscriptions but keeps
+    // the front nodes, including their edges.
+    reset();
+    db.set('xray-origin', {
+        _id: 'xray-origin',
+        name: 'Xray Origin',
+        type: 'xray',
+        active: true,
+        status: 'online',
+        onlineUsers: 0,
+        xray: { transport: 'xhttp', security: 'tls', xhttpPath: '/api' },
+        ssh: { password: 'encrypted' },
+    });
+    db.set('cdn-front', {
+        _id: 'cdn-front',
+        name: 'CDN Front',
+        type: 'cdn',
+        active: true,
+        cdn: { originNode: 'xray-origin', path: '/api', security: 'tls', edges: [{ id: 'edge-1', address: '203.0.113.10', enabled: true }] },
+    });
+    res = await runRoute('/:id/disable', 'xray-origin');
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body.success, true);
+    assert.strictEqual(db.get('xray-origin').active, false);
+    assert.strictEqual(db.get('xray-origin').status, 'offline');
+    assert.strictEqual(runtimeStopCalls.length, 1);
+    assert.strictEqual(db.get('cdn-front').active, true);
+    assert.strictEqual(db.get('cdn-front').cdn.edges[0].address, '203.0.113.10');
 
     reset();
     res = await runRoute('/:id/enable', 'missing-node');

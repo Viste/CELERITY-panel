@@ -6,6 +6,7 @@
  *   GET    /panel/probes/api/list           -> probe list with live status
  *   POST   /panel/probes/api/create         -> create a probe, return install command
  *   POST   /panel/probes/api/:id/reissue    -> new one-time enrollment token
+ *   POST   /panel/probes/api/:id/reset-traffic -> clear the cap and unblock
  *   DELETE /panel/probes/api/:id            -> delete probe, user and results
  *   GET    /panel/probes/api/:id/history    -> check history for one probe
  *   GET    /panel/nodes/:id/probe-status    -> external checks block on a node card
@@ -180,14 +181,24 @@ router.get('/probes/api/list', async (req, res) => {
     try {
         const settings = await getSettings();
         const reportSec = settings?.probes?.reportIntervalSec || 900;
-        const probes = await Probe.listProbes();
+        const [probes, traffic] = await Promise.all([
+            Probe.listProbes(),
+            enrollService.probeTrafficStates(),
+        ]);
 
         return res.json({
             enabled: !!settings?.probes?.enabled,
-            probes: probes.map((p) => ({
-                ...p,
-                live: probeIsLive(p, reportSec),
-            })),
+            probes: probes.map((p) => {
+                const state = traffic.get(String(p._id));
+                return {
+                    ...p,
+                    live: probeIsLive(p, reportSec),
+                    trafficUsedBytes: state ? state.usedBytes : p.trafficUsedBytes,
+                    trafficLimitBytes: state?.limitBytes || 0,
+                    blocked: !!state?.blocked,
+                    exhausted: !!state?.exhausted,
+                };
+            }),
         });
     } catch (error) {
         logger.error('[Panel] probes list error:', error.message);
@@ -258,6 +269,23 @@ router.post('/probes/api/:id/reissue', async (req, res) => {
         });
     } catch (error) {
         logger.error('[Panel] probe reissue error:', error.message);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+// Recovery from the traffic cap. Like deletion, it stays available while the
+// feature is off, so a blocked probe can be cleared at any time.
+router.post('/probes/api/:id/reset-traffic', async (req, res) => {
+    try {
+        if (!validObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'invalid probe id' });
+        }
+
+        const reset = await enrollService.resetProbeTraffic(req.params.id);
+        if (!reset) return res.status(404).json({ error: 'probe not found' });
+        return res.json({ success: true });
+    } catch (error) {
+        logger.error('[Panel] probe traffic reset error:', error.message);
         return res.status(500).json({ error: error.message });
     }
 });
@@ -340,10 +368,19 @@ router.get('/probes/api/:id/history', async (req, res) => {
         // it silently describe nothing.
         const nodes = nodeIds.size
             ? await HyNode.find({ _id: { $in: [...nodeIds] } })
-                .select('name flag type ip domain port portRange portConfigs sni obfs hopInterval xray virtual groups')
+                .select('name flag type ip domain port portRange portConfigs sni obfs hopInterval xray virtual cdn groups')
                 .lean()
             : [];
-        const nodeById = new Map(nodes.map((n) => [String(n._id), n]));
+        const originIds = nodes
+            .filter(node => node.type === 'cdn' && node.cdn?.originNode)
+            .map(node => String(node.cdn.originNode));
+        const origins = originIds.length > 0
+            ? await HyNode.find({ _id: { $in: originIds }, type: 'xray' }).select('name flag type ip domain port xray').lean()
+            : [];
+        const nodeById = new Map([...nodes, ...origins].map((n) => [String(n._id), n]));
+        for (const node of nodes) {
+            if (node.type === 'cdn') node._resolvedOrigin = nodeById.get(String(node.cdn?.originNode || ''));
+        }
 
         const targetById = new Map(
             (settings?.probes?.targets || []).map((t) => [String(t.id), t])

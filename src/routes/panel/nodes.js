@@ -1,6 +1,10 @@
 const express = require('express');
+const mongoose = require('mongoose');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 const router = express.Router();
 
+const Admin = require('../../models/adminModel');
 const HyNode = require('../../models/hyNodeModel');
 const HyUser = require('../../models/hyUserModel');
 const ServerGroup = require('../../models/serverGroupModel');
@@ -8,7 +12,10 @@ const Settings = require('../../models/settingsModel');
 const cryptoService = require('../../services/cryptoService');
 const syncService = require('../../services/syncService');
 const configGenerator = require('../../services/configGenerator');
+const { discoverCdnAddresses } = require('../../services/cdnDiscoveryService');
 const nodeSetup = require('../../services/nodeSetup');
+const xrayVersionService = require('../../services/xrayVersionService');
+const totpService = require('../../services/totpService');
 const { isSameVpsAsPanel } = nodeSetup;
 const NodeSSH = require('../../services/nodeSSH');
 const sshKeyService = require('../../services/sshKeyService');
@@ -18,6 +25,22 @@ const statsService = require('../../services/statsService');
 const uaStatsService = require('../../services/uaStatsService');
 const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers');
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
+const { isServerlessNode, checkCascadeMembership } = require('../../utils/nodeTypes');
+const nodeSetupLock = require('../../utils/nodeSetupLock');
+const {
+    normalizeCdnConfig,
+    validateCdnOrigin,
+    checkCdnDependents,
+    isValidHostname,
+    CDN_ORIGIN_CANDIDATE_SELECT,
+} = require('../../utils/cdnConfig');
+const {
+    applyFrontLayout,
+    captureFrontRollbackState,
+    attachFrontRollbackState,
+} = require('../../services/edgeFront/frontConfig');
+const frontProvisionService = require('../../services/edgeFront/provisionService');
+const { MAX_CUSTOM_BYTES, validateCustomHtml } = require('../../utils/decoyPage');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 
@@ -30,15 +53,81 @@ const {
     sanitizeXrayForRender,
     parseBool,
     parseHysteriaFormFields,
+    parseAclRulesInput,
+    parseOutboundsFormFields,
     getHysteriaAclInlineState,
     validateHysteriaFormFields,
     buildSshKeyFilename,
     connectNodeSSH,
     generateSshKeyLimiter,
     sniScanLimiter,
+    buildClonedNodePrefill,
 } = require('./helpers');
 
 const sniScanner = require('../../services/sniScanner');
+
+const xrayVersionCheckLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+const xrayVersionApplyLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 3,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+const frontApplyLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 6,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+const frontUploadLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// In-memory: the page is small and goes straight into the node document.
+const frontSiteUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_CUSTOM_BYTES, files: 1 },
+});
+
+const cdnResolveLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+async function reauthenticateXrayVersionChange(req, res) {
+    const password = String(req.body?.currentPassword || '');
+    const token = String(req.body?.totpToken || '');
+    const admin = await Admin.verifyPassword(req.session.adminUsername, password);
+    if (!admin) {
+        res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentPassword') || 'Invalid current password' });
+        return false;
+    }
+    if (!admin.twoFactor?.enabled) return true;
+
+    const secret = totpService.decryptSecret(admin.twoFactor.secretEncrypted);
+    if (!secret) {
+        res.status(500).json({ error: res.locals.t?.('auth.totpConfigError') || 'TOTP configuration error' });
+        return false;
+    }
+    if (!(await totpService.verifyToken({ secret, token }))) {
+        res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentTotp') || 'Invalid current TOTP code' });
+        return false;
+    }
+    return true;
+}
 
 /**
  * Parse virtual-node form fields and apply them to nodeData.
@@ -66,12 +155,20 @@ function applyVirtualFormFields(nodeData, body) {
         return 'Virtual node: select a source group';
     }
 
+    const toleranceRaw = parseInt(body['virtual.tolerance'], 10);
+    const tolerance = Number.isFinite(toleranceRaw)
+        ? Math.min(Math.max(toleranceRaw, 0), 5000)
+        : 50;
+
     nodeData.virtual = {
         selectMode,
         sources,
         sourceGroup,
         strategy,
         fallbackToFirst: body['virtual.fallbackToFirst'] === 'on',
+        tolerance,
+        idleTimeout: (body['virtual.idleTimeout'] || '').trim(),
+        interruptExistConnections: body['virtual.interruptExistConnections'] === 'on',
         observatory: {
             destination: (body['virtual.observatory.destination'] || '').trim() || 'http://www.gstatic.com/generate_204',
             connectivity: (body['virtual.observatory.connectivity'] || '').trim(),
@@ -80,6 +177,45 @@ function applyVirtualFormFields(nodeData, body) {
             sampling: parseInt(body['virtual.observatory.sampling'], 10) || 3,
         },
     };
+    return null;
+}
+
+async function applyCdnFormFields(nodeData, body, selfId, currentOriginId = null) {
+    const asArray = (value) => {
+        if (value === undefined || value === null) return [];
+        return Array.isArray(value) ? value : [value];
+    };
+    const ids = asArray(body.cdn_edge_id);
+    const labels = asArray(body.cdn_edge_label);
+    const addresses = asArray(body.cdn_edge_address);
+    const enabledIds = new Set(asArray(body.cdn_edge_enabled).map(String));
+    const edges = ids.map((id, index) => ({
+        id,
+        label: labels[index],
+        address: addresses[index],
+        enabled: enabledIds.has(String(id)),
+    }));
+
+    const normalized = normalizeCdnConfig({
+        originNode: body['cdn.originNode'],
+        originInboundId: body['cdn.originInboundId'],
+        edges,
+        domain: body['cdn.domain'],
+        port: body['cdn.port'],
+        security: body['cdn.security'],
+        sni: body['cdn.sni'],
+        host: body['cdn.host'],
+        path: body['cdn.path'],
+        alpn: body['cdn.alpn'],
+        fingerprint: body['cdn.fingerprint'],
+        fingerprintPool: body['cdn.fingerprintPool'],
+        xhttpMode: body['cdn.xhttpMode'],
+    });
+    if (normalized.error) return normalized.error;
+
+    const originCheck = await validateCdnOrigin(normalized.value, HyNode, { selfId, currentOriginId });
+    if (originCheck.error) return originCheck.error;
+    nodeData.cdn = normalized.value;
     return null;
 }
 
@@ -94,7 +230,7 @@ router.get('/', async (req, res) => {
             // Virtual nodes are excluded from dashboard counts: they have no
             // remote service to be "online" and would otherwise inflate
             // nodesTotal while never contributing to nodesOnline.
-            const realNodeFilter = { type: { $ne: 'virtual' } };
+            const realNodeFilter = { type: { $nin: ['virtual', 'cdn'] } };
             const [trafficAgg, usersTotal, usersEnabled, nodesTotal, nodesOnline] = await Promise.all([
                 HyUser.aggregate([
                     { $match: { isProbe: { $ne: true } } },
@@ -128,7 +264,7 @@ router.get('/', async (req, res) => {
         // Virtual nodes are not shown in the dashboard's nodes table either —
         // they are an abstraction over real sibling nodes and would only add
         // noise (no IP, always offline, no traffic of their own).
-        const nodes = await HyNode.find({ active: true, type: { $ne: 'virtual' } })
+        const nodes = await HyNode.find({ active: true, type: { $nin: ['virtual', 'cdn'] } })
             .select('name ip status onlineUsers maxOnlineUsers groups traffic type flag rankingCoefficient comment')
             .populate('groups', 'name color')
             .sort({ rankingCoefficient: 1, name: 1 });
@@ -206,7 +342,10 @@ router.get('/nodes', async (req, res) => {
     try {
         const CascadeLink = require('../../models/cascadeLinkModel');
         const [nodes, groups, linksCount, settings] = await Promise.all([
-            HyNode.find().populate('groups', 'name color').sort({ rankingCoefficient: 1, name: 1 }),
+            HyNode.find()
+                .populate('groups', 'name color')
+                .populate('cdn.originNode', 'name flag')
+                .sort({ rankingCoefficient: 1, name: 1 }),
             getActiveGroups(),
             CascadeLink.countDocuments({ active: true }),
             Settings.get(),
@@ -236,16 +375,18 @@ router.get('/nodes', async (req, res) => {
 });
 
 // GET /panel/nodes/add - Node creation form
-// Supports ?cloneFrom=<nodeId> to pre-fill IP, SSH, groups, flag and country from an existing node
-// and automatically switch to the opposite protocol type.
+// Supports ?cloneFrom=<nodeId> to pre-fill IP, groups, flag and country from an
+// existing node and switch to the opposite protocol (paired protocol on the
+// same host). Supports ?cloneConfig=<nodeId> to copy protocol/config fields
+// onto a new create form, leaving IP/SSH/secrets empty (issue #117).
 router.get('/nodes/add', async (req, res) => {
     try {
         const [groups, settings, candidateNodes] = await Promise.all([
             getActiveGroups(),
             Settings.get(),
-            // Source candidates for virtual nodes — exclude virtual to prevent cycles.
+            // Virtual sources may include CDN fronts; CDN origins are filtered to Xray in the form.
             HyNode.find({ type: { $ne: 'virtual' } })
-                .select('_id name flag type active')
+                .select(CDN_ORIGIN_CANDIDATE_SELECT)
                 .sort({ name: 1 })
                 .lean(),
         ]);
@@ -257,7 +398,7 @@ router.get('/nodes/add', async (req, res) => {
                 .populate('groups', '_id name color')
                 .lean();
             // Virtual nodes can't seed a sibling protocol — they have no IP/transport.
-            if (source && source.type !== 'virtual') {
+            if (source && !isServerlessNode(source)) {
                 // Flip the protocol: if source is hysteria → suggest xray, and vice-versa
                 prefillNode = {
                     ip: source.ip,
@@ -266,6 +407,21 @@ router.get('/nodes/add', async (req, res) => {
                     groups: source.groups || [],
                     type: source.type === 'xray' ? 'hysteria' : 'xray',
                 };
+            }
+        } else if (req.query.cloneConfig) {
+            try {
+                // Do not exclude `xray.accessLogs` here: the schema already
+                // marks `accessLogs.ingestTokenEncrypted` as select:false, and
+                // projecting both the parent and a child as 0 is a Mongo
+                // path collision — the query throws, the catch swallowed it,
+                // and the create form opened empty.
+                const source = await HyNode.findById(req.query.cloneConfig)
+                    .select('-ssh.password -ssh.privateKey -statsSecret -xray.agentToken')
+                    .populate('groups', '_id name color')
+                    .lean();
+                prefillNode = buildClonedNodePrefill(source);
+            } catch (cloneErr) {
+                logger.warn(`[Panel] cloneConfig ignored: ${cloneErr.message}`);
             }
         }
 
@@ -285,12 +441,30 @@ router.get('/nodes/add', async (req, res) => {
             cascadeLinks: [],
             error: req.query.error || null,
             panelDomain: config.PANEL_DOMAIN || '',
-            panelAcmeEmail: config.ACME_EMAIL || '',
             lastInitScript: settings?.lastInitScript || '',
+            canAddPairedProtocol: false,
+            frontSiteMaxBytes: MAX_CUSTOM_BYTES,
         });
     } catch (error) {
         logger.error('[Panel] GET /nodes/add error:', error.message);
         res.status(500).send('Error: ' + error.message);
+    }
+});
+
+router.get('/nodes/resolve-cdn', cdnResolveLimiter, async (req, res) => {
+    const domain = String(req.query.domain || '').trim().toLowerCase();
+    if (!isValidHostname(domain)) {
+        return res.status(400).json({ error: 'A valid CDN domain is required' });
+    }
+    try {
+        const result = await discoverCdnAddresses(domain, 32);
+        if (result.addresses.length === 0) {
+            return res.status(404).json({ error: 'No A or AAAA records found' });
+        }
+        return res.json({ domain, ...result });
+    } catch (error) {
+        logger.warn(`[Panel] CDN DNS lookup failed for ${domain}: ${error.code || error.message}`);
+        return res.status(502).json({ error: 'DNS lookup failed' });
     }
 });
 
@@ -338,26 +512,42 @@ router.patch('/nodes/reorder', async (req, res) => {
     }
 });
 
+function sendNodeFormResult(req, res, redirect, error = '', status = error ? 400 : 200) {
+    if (req.get('accept')?.includes('application/json')) {
+        return res.status(status).json({
+            success: !error,
+            redirect,
+            ...(error ? { error } : {}),
+        });
+    }
+    return res.redirect(error ? `${redirect}?error=${encodeURIComponent(error)}` : redirect);
+}
+
 // POST /panel/nodes - Create node
 router.post('/nodes', async (req, res) => {
     try {
         const { name } = req.body;
-        const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
+        const nodeType = ['xray', 'virtual', 'cdn', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
 
         if (!name) {
-            return res.redirect(`/panel/nodes/add?error=${encodeURIComponent('Name is required')}`);
+            return sendNodeFormResult(req, res, '/panel/nodes/add', 'Name is required');
         }
-        if (nodeType !== 'virtual' && !ip) {
-            return res.redirect(`/panel/nodes/add?error=${encodeURIComponent('IP address is required')}`);
+        if (!isServerlessNode(nodeType) && !ip) {
+            return sendNodeFormResult(req, res, '/panel/nodes/add', 'IP address is required');
         }
 
         // Ensure no duplicate node for the same IP + protocol type (skipped for virtual: no IP).
-        if (nodeType !== 'virtual') {
+        if (!isServerlessNode(nodeType)) {
             const existing = await HyNode.findOne({ ip, type: nodeType });
             if (existing) {
-                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(`A ${nodeType} node with this IP already exists`)}`);
+                return sendNodeFormResult(req, res, '/panel/nodes/add', `A ${nodeType} node with this IP already exists`);
             }
+        }
+
+        const labelConflict = await HyNode.findLabelConflict(name, req.body.flag);
+        if (labelConflict) {
+            return sendNodeFormResult(req, res, '/panel/nodes/add', 'A node with this name and flag already exists — subscription tags must be unique');
         }
 
         const sshPassword = req.body['ssh.password'] || '';
@@ -367,15 +557,16 @@ router.post('/nodes', async (req, res) => {
         let encryptedPrivateKey = '';
         if (sshPrivateKeyRaw.trim()) {
             if (!sshKeyService.isValidPrivateKey(sshPrivateKeyRaw)) {
-                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent('Invalid private key format')}`);
+                return sendNodeFormResult(req, res, '/panel/nodes/add', 'Invalid private key format');
             }
             encryptedPrivateKey = cryptoService.encrypt(sshPrivateKeyRaw.trim());
         }
 
-        // Inherit SSH credentials from sibling node (same IP, different protocol) if caller left them blank
+        // Inherit SSH credentials from sibling node (same IP, different protocol) if caller left them blank.
+        // Serverless nodes have no IP, so they must never pick up a sibling's keys.
         const callerProvidedSsh = !!(encryptedPassword || encryptedPrivateKey);
         let siblingSsh = null;
-        if (!callerProvidedSsh) {
+        if (!callerProvidedSsh && !isServerlessNode(nodeType)) {
             const sibling = await HyNode.findOne({ ip, type: { $ne: nodeType } }).select('ssh').lean();
             siblingSsh = sibling?.ssh || null;
         }
@@ -388,19 +579,21 @@ router.post('/nodes', async (req, res) => {
         const statsSecret = req.body.statsSecret || cryptoService.generateNodeSecret();
 
         // Resolve SSH: use provided values, or fall back to sibling node values
-        const resolvedSsh = {
-            port: parseInt(req.body['ssh.port']) || siblingSsh?.port || 22,
-            username: req.body['ssh.username'] || siblingSsh?.username || 'root',
-            password: encryptedPassword || siblingSsh?.password || '',
-            privateKey: encryptedPrivateKey || siblingSsh?.privateKey || '',
-        };
+        const resolvedSsh = isServerlessNode(nodeType)
+            ? { port: 22, username: 'root', password: '', privateKey: '' }
+            : {
+                port: parseInt(req.body['ssh.port']) || siblingSsh?.port || 22,
+                username: req.body['ssh.username'] || siblingSsh?.username || 'root',
+                password: encryptedPassword || siblingSsh?.password || '',
+                privateKey: encryptedPrivateKey || siblingSsh?.privateKey || '',
+            };
 
         const nodeData = {
             name,
-            ip: nodeType === 'virtual' ? null : ip,
+            ip: isServerlessNode(nodeType) ? null : ip,
             type: nodeType,
-            domain: req.body.domain || '',
-            sni: req.body.sni || '',
+            domain: isServerlessNode(nodeType) ? '' : (req.body.domain || ''),
+            sni: isServerlessNode(nodeType) ? '' : (req.body.sni || ''),
             flag: req.body.flag || '',
             port: parseInt(req.body.port) || 443,
             portRange: req.body.portRange || '20000-50000',
@@ -412,7 +605,7 @@ router.post('/nodes', async (req, res) => {
             active: req.body.active === 'on',
             useCustomConfig: req.body.useCustomConfig === 'on',
             customConfig: req.body.customConfig || '',
-            cascadeRole: req.body.cascadeRole || 'standalone',
+            cascadeRole: isServerlessNode(nodeType) ? 'standalone' : (req.body.cascadeRole || 'standalone'),
             country: req.body.country || '',
             comment: typeof req.body.comment === 'string'
                 ? req.body.comment.trim().slice(0, 500)
@@ -427,37 +620,58 @@ router.post('/nodes', async (req, res) => {
 
         if (nodeType === 'xray') {
             nodeData.xray = parseXrayFormFields(req.body);
+            applyFrontLayout(nodeData.xray, nodeData, null);
             const xrayError = validateXrayFormFields(nodeData.xray, nodeData);
             if (xrayError) {
-                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(xrayError)}`);
+                return sendNodeFormResult(req, res, '/panel/nodes/add', xrayError);
             }
             ensureExtraInboundRealityKeys(nodeData.xray);
+            // Only the Xray create form renders the outbounds/ACL block. The
+            // hidden Hysteria and virtual sections post their own fields, so
+            // these are read inside this branch and nowhere else.
+            nodeData.outbounds = parseOutboundsFormFields(req.body);
+            nodeData.aclRules = parseAclRulesInput(req.body.xrayAclRules);
             if (nodeData.cascadeRole !== 'bridge' && !nodeData.xray.agentToken) {
                 nodeData.xray.agentToken = nodeSetup.generateAgentToken();
             }
         } else if (nodeType === 'virtual') {
             const virtualError = applyVirtualFormFields(nodeData, req.body);
             if (virtualError) {
-                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(virtualError)}`);
+                return sendNodeFormResult(req, res, '/panel/nodes/add', virtualError);
             }
+        } else if (nodeType === 'cdn') {
+            const cdnError = await applyCdnFormFields(nodeData, req.body);
+            if (cdnError) {
+                return sendNodeFormResult(req, res, '/panel/nodes/add', cdnError);
+            }
+        } else if (nodeType === 'mieru') {
+            const m = req.body.mieru || {};
+            nodeData.mieru = {
+                protocol: m.protocol === 'UDP' ? 'UDP' : 'TCP',
+                mtu: parseInt(m.mtu, 10) > 0 ? parseInt(m.mtu, 10) : 1400,
+                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(m.loggingLevel) ? m.loggingLevel : 'INFO',
+                multiplexing: m.multiplexing || '',
+                muxUserHintMandatory: !!m.muxUserHintMandatory,
+            };
         } else {
             const hyFields = parseHysteriaFormFields(req.body);
             const hyValidationError = validateHysteriaFormFields(hyFields);
             if (hyValidationError) {
-                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(hyValidationError)}`);
+                return sendNodeFormResult(req, res, '/panel/nodes/add', hyValidationError);
             }
             delete hyFields.acmeDnsConfigValid;
             Object.assign(nodeData, hyFields);
         }
 
         const newNode = await HyNode.create(nodeData);
-        logger.info(`[Panel] Created ${nodeType} node ${name} (${ip})`);
+        syncService.maybePushCdnOrigins(null, newNode);
+        logger.info(`[Panel] Created ${nodeType} node ${name} (${isServerlessNode(nodeType) ? nodeType : ip})`);
         // Invalidate active-nodes, subscription, and dashboard caches so changes are reflected immediately
         await invalidateNodesCache();
-        res.redirect(`/panel/nodes/${newNode._id}`);
+        sendNodeFormResult(req, res, `/panel/nodes/${newNode._id}`);
     } catch (error) {
         logger.error(`[Panel] Create node error: ${error.message}`);
-        res.redirect(`/panel/nodes/add?error=${encodeURIComponent(error.message)}`);
+        sendNodeFormResult(req, res, '/panel/nodes/add', error.message, 500);
     }
 });
 
@@ -569,6 +783,188 @@ router.post('/nodes/generate-reality-keys', (req, res) => {
     }
 });
 
+router.get('/nodes/:id/xray-version-status', async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'Invalid node id' });
+        }
+        const node = await HyNode.findById(req.params.id);
+        if (!node) return res.status(404).json({ error: 'Node not found' });
+        if (node.type !== 'xray') return res.status(400).json({ error: 'Node is not an Xray node' });
+
+        const [versionInfo, currentVersion] = await Promise.all([
+            xrayVersionService.getVersionInfo(),
+            req.query.live === '1'
+                ? xrayVersionService.detectInstalledVersion(node)
+                : Promise.resolve(xrayVersionService.normalizeVersion(node.xrayVersion)),
+        ]);
+        return res.json({
+            ...versionInfo,
+            currentVersion: currentVersion || null,
+            canChangeVersion: !!(node.ssh?.password || node.ssh?.privateKey),
+            task: xrayVersionService.getTask(node._id),
+        });
+    } catch (error) {
+        logger.error(`[Panel] Xray version status error: ${error.message}`);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+router.post('/nodes/:id/xray-version-check', xrayVersionCheckLimiter, async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'Invalid node id' });
+        }
+        const node = await HyNode.findById(req.params.id);
+        if (!node) return res.status(404).json({ error: 'Node not found' });
+        if (node.type !== 'xray') return res.status(400).json({ error: 'Node is not an Xray node' });
+
+        const [versionInfo, currentVersion] = await Promise.all([
+            xrayVersionService.getVersionInfo({ force: true }),
+            xrayVersionService.detectInstalledVersion(node, { forceSsh: true }),
+        ]);
+        return res.json({
+            ...versionInfo,
+            currentVersion: currentVersion || null,
+            canChangeVersion: !!(node.ssh?.password || node.ssh?.privateKey),
+            task: xrayVersionService.getTask(node._id),
+        });
+    } catch (error) {
+        logger.error(`[Panel] Xray version check error: ${error.message}`);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/nodes/:id/xray-version-changelog', async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'Invalid node id' });
+        }
+        const changelog = await xrayVersionService.getReleaseChangelog(req.query.version);
+        if (!changelog) return res.status(404).json({ error: 'Unknown Xray release' });
+        return res.json(changelog);
+    } catch (error) {
+        logger.error(`[Panel] Xray changelog error: ${error.message}`);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/nodes/:id/xray-version-task', async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid node id' });
+    }
+    return res.json(xrayVersionService.getTask(req.params.id));
+});
+
+router.post('/nodes/:id/xray-version', xrayVersionApplyLimiter, async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'Invalid node id' });
+        }
+        const node = await HyNode.findById(req.params.id);
+        if (!node) return res.status(404).json({ error: 'Node not found' });
+        if (node.type !== 'xray') return res.status(400).json({ error: 'Node is not an Xray node' });
+        if (!node.ssh?.password && !node.ssh?.privateKey) {
+            return res.status(409).json({ error: 'SSH credentials are required to change Xray version' });
+        }
+        if (!(await reauthenticateXrayVersionChange(req, res))) return undefined;
+
+        const task = await xrayVersionService.startVersionChange(node._id, req.body?.version);
+        logger.warn(`[Panel] Xray version change to ${task.targetVersion} started for ${node.name} by ${req.session.adminUsername} (IP: ${req.ip})`);
+        return res.status(202).json({ accepted: true, task });
+    } catch (error) {
+        logger.error(`[Panel] Xray version change error: ${error.message}`);
+        return res.status(error.statusCode || 500).json({ error: error.message });
+    }
+});
+
+// ─── Reverse proxy front ─────────────────────────────────────────────────────
+
+router.get('/nodes/:id/front-task', async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid node id' });
+    }
+    return res.json(frontProvisionService.getTask(req.params.id));
+});
+
+router.post('/nodes/:id/front-apply', frontApplyLimiter, async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'Invalid node id' });
+        }
+        const node = await HyNode.findById(req.params.id);
+        if (!node) return res.status(404).json({ error: 'Node not found' });
+        if (node.type !== 'xray') return res.status(400).json({ error: 'Node is not an Xray node' });
+        if (!node.xray?.front?.enabled) {
+            return res.status(400).json({ error: 'Enable the reverse proxy front and save the node first' });
+        }
+        if (!node.ssh?.password && !node.ssh?.privateKey) {
+            return res.status(409).json({ error: 'SSH credentials are required to apply the front' });
+        }
+
+        const task = frontProvisionService.startFrontApply(node._id);
+        logger.info(`[Panel] Front apply started for ${node.name} by ${req.session.adminUsername} (IP: ${req.ip})`);
+        return res.status(202).json({ accepted: true, task });
+    } catch (error) {
+        logger.error(`[Panel] Front apply error: ${error.message}`);
+        return res.status(error.statusCode || 500).json({ error: error.message });
+    }
+});
+
+// Stored on the node and applied on the next front apply; siteMode switches to
+// 'custom' so the upload takes effect.
+router.post('/nodes/:id/front-site-upload', frontUploadLimiter, (req, res) => {
+    frontSiteUpload.single('file')(req, res, async (err) => {
+        try {
+            if (err) {
+                const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+                return res.status(400).json({
+                    error: tooLarge
+                        ? `File too large (max ${MAX_CUSTOM_BYTES} bytes)`
+                        : err.message,
+                });
+            }
+            if (!mongoose.isValidObjectId(req.params.id)) {
+                return res.status(400).json({ error: 'Invalid node id' });
+            }
+            if (!req.file?.buffer) return res.status(400).json({ error: 'No file uploaded' });
+
+            validateCustomHtml(req.file.buffer);
+            const result = await HyNode.updateOne({ _id: req.params.id, type: 'xray' }, {
+                $set: {
+                    'xray.front.siteMode': 'custom',
+                    'xray.front.siteHtml': req.file.buffer,
+                },
+            });
+            if (result.matchedCount === 0) {
+                return res.status(404).json({ error: 'Node not found' });
+            }
+            await invalidateNodesCache();
+            return res.json({ success: true, size: req.file.buffer.length });
+        } catch (error) {
+            logger.error(`[Panel] Front site upload error: ${error.message}`);
+            return res.status(400).json({ error: error.message });
+        }
+    });
+});
+
+router.delete('/nodes/:id/front-site', async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ error: 'Invalid node id' });
+        }
+        const result = await HyNode.updateOne({ _id: req.params.id, type: 'xray' }, {
+            $set: { 'xray.front.siteMode': 'nginx', 'xray.front.siteHtml': null },
+        });
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Node not found' });
+        await invalidateNodesCache();
+        return res.json({ success: true });
+    } catch (error) {
+        logger.error(`[Panel] Front site reset error: ${error.message}`);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
 // GET /panel/nodes/:id - Edit node form
 router.get('/nodes/:id', async (req, res) => {
     try {
@@ -576,9 +972,9 @@ router.get('/nodes/:id', async (req, res) => {
         // Pull manualKey explicitly (schema marks it select:false) so we can
         // populate the manualKeySet flag in the rendered form. The actual
         // PEM is then stripped via sanitizeXrayForRender before reaching EJS.
-        const [node, groups, cascadeLinks, settings, candidateNodes] = await Promise.all([
+        const [node, groups, cascadeLinks, settings, candidateNodes, currentAdmin] = await Promise.all([
             HyNode.findById(req.params.id)
-                .select('+xray.manualKey')
+                .select('+xray.manualKey +xray.front.siteHtml')
                 .populate('groups', 'name color'),
             getActiveGroups(),
             CascadeLink.find({
@@ -587,12 +983,12 @@ router.get('/nodes/:id', async (req, res) => {
               .populate('bridgeNode', 'name ip flag')
               .sort({ createdAt: -1 }),
             Settings.get(),
-            // Source candidates for virtual nodes — exclude virtual nodes (anti-cycle)
-            // and the current node itself.
+            // Virtual sources may include CDN fronts; CDN origins are filtered to Xray in the form.
             HyNode.find({ type: { $ne: 'virtual' }, _id: { $ne: req.params.id } })
-                .select('_id name flag type active')
+                .select(CDN_ORIGIN_CANDIDATE_SELECT)
                 .sort({ name: 1 })
                 .lean(),
+            Admin.findOne({ username: req.session.adminUsername }).select('twoFactor.enabled').lean(),
         ]);
 
         if (!node) {
@@ -617,6 +1013,12 @@ router.get('/nodes/:id', async (req, res) => {
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
 
+        let canAddPairedProtocol = false;
+        if (node.type !== 'virtual' && node.ip) {
+            const sibling = await HyNode.exists({ _id: { $ne: node._id }, ip: node.ip });
+            canAddPairedProtocol = !sibling;
+        }
+
         render(res, 'node-form', {
             title: `${res.locals.t('nodes.editNode')}: ${node.name}`,
             page: 'nodes',
@@ -627,8 +1029,10 @@ router.get('/nodes/:id', async (req, res) => {
             cascadeLinks: cascadeLinks || [],
             error: req.query.error || null,
             panelDomain: config.PANEL_DOMAIN || '',
-            panelAcmeEmail: config.ACME_EMAIL || '',
             lastInitScript: settings?.lastInitScript || '',
+            canAddPairedProtocol,
+            xrayUpdateTotpEnabled: !!currentAdmin?.twoFactor?.enabled,
+            frontSiteMaxBytes: MAX_CUSTOM_BYTES,
         });
     } catch (error) {
         res.status(500).send('Error: ' + error.message);
@@ -639,8 +1043,11 @@ router.get('/nodes/:id', async (req, res) => {
 router.post('/nodes/:id', async (req, res) => {
     const nodeId = req.params.id;
     try {
-        // Full doc (not partial) — we .save() it below; +manualKey is select:false.
-        const existingNode = await HyNode.findById(nodeId).select('+xray.manualKey');
+        // Full doc (not partial) — we .save() it below; manualKey and the
+        // front's decoy page are select:false.
+        const existingNode = await HyNode.findById(nodeId).select(
+            '+xray.manualKey +xray.front.siteHtml +xray.front.rollbackSnapshot'
+        );
         if (!existingNode) {
             return res.redirect('/panel/nodes');
         }
@@ -651,14 +1058,26 @@ router.post('/nodes/:id', async (req, res) => {
         const previousIp = existingNode.ip;
 
         const { name } = req.body;
-        const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
+        const nodeType = ['xray', 'virtual', 'cdn', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
 
         if (!name) {
-            return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('Name is required')}`);
+            return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, 'Name is required');
         }
-        if (nodeType !== 'virtual' && !ip) {
-            return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('IP address is required')}`);
+        if (!isServerlessNode(nodeType) && !ip) {
+            return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, 'IP address is required');
+        }
+
+        // Only checked when the label actually changes: a database that already
+        // holds duplicates from before this validation must stay editable, and
+        // the generator deduplicates such tags anyway.
+        const labelChanged = String(name).trim() !== String(existingNode.name || '').trim()
+            || String(req.body.flag || '').trim() !== String(existingNode.flag || '').trim();
+        if (labelChanged) {
+            const labelConflict = await HyNode.findLabelConflict(name, req.body.flag, nodeId);
+            if (labelConflict) {
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, 'A node with this name and flag already exists — subscription tags must be unique');
+            }
         }
 
         let groups = [];
@@ -668,7 +1087,7 @@ router.post('/nodes/:id', async (req, res) => {
 
         const updates = {
             name,
-            ip: nodeType === 'virtual' ? null : ip,
+            ip: isServerlessNode(nodeType) ? null : ip,
             type: nodeType,
             domain: req.body.domain || '',
             sni: req.body.sni || '',
@@ -686,7 +1105,7 @@ router.post('/nodes/:id', async (req, res) => {
                 password: req.body['obfs.password'] || '',
             },
             flag: req.body.flag || '',
-            cascadeRole: req.body.cascadeRole || 'standalone',
+            cascadeRole: isServerlessNode(nodeType) ? 'standalone' : (req.body.cascadeRole || 'standalone'),
             country: req.body.country || '',
             comment: typeof req.body.comment === 'string'
                 ? req.body.comment.trim().slice(0, 500)
@@ -713,6 +1132,7 @@ router.post('/nodes/:id', async (req, res) => {
             const existingXray = (existingNode.xray && typeof existingNode.xray.toObject === 'function')
                 ? existingNode.xray.toObject()
                 : (existingNode.xray || {});
+            const frontRollbackState = captureFrontRollbackState(existingNode);
             // resolveManualKeyPlaceholder runs BEFORE the merge so the
             // existing key is restored when the operator did not change it.
             const parsedXray = resolveManualKeyPlaceholder(parseXrayFormFields(req.body), existingXray);
@@ -720,11 +1140,22 @@ router.post('/nodes/:id', async (req, res) => {
                 ...existingXray,
                 ...parsedXray,
             };
-            const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
-            const domainForValidate = String(req.body.domain || '').trim();
-            const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate });
+            if (parsedXray.front) {
+                // The form posts only the operator-editable part of the front.
+                updates.xray.front = { ...existingXray.front, ...parsedXray.front };
+            }
+            const nodeForValidate = {
+                port: parseInt(req.body.port, 10) || existingNode.port,
+                domain: String(req.body.domain || '').trim(),
+                ip: String(req.body.ip || existingNode.ip || '').trim(),
+            };
+            applyFrontLayout(updates.xray, nodeForValidate, existingXray.front);
+            attachFrontRollbackState(updates.xray, frontRollbackState, existingXray.front);
+            // The front takes over the public port, so the inbound moves.
+            updates.port = nodeForValidate.port;
+            const xrayError = validateXrayFormFields(updates.xray, nodeForValidate);
             if (xrayError) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(xrayError)}`);
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, xrayError);
             }
             ensureExtraInboundRealityKeys(updates.xray);
             if ((req.body.cascadeRole || 'standalone') !== 'bridge' && !updates.xray.agentToken) {
@@ -733,13 +1164,32 @@ router.post('/nodes/:id', async (req, res) => {
         } else if (nodeType === 'virtual') {
             const virtualError = applyVirtualFormFields(updates, req.body);
             if (virtualError) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(virtualError)}`);
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, virtualError);
             }
+        } else if (nodeType === 'cdn') {
+            const cdnError = await applyCdnFormFields(
+                updates,
+                req.body,
+                nodeId,
+                existingNode.type === 'cdn' ? existingNode.cdn?.originNode : null
+            );
+            if (cdnError) {
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, cdnError);
+            }
+        } else if (nodeType === 'mieru') {
+            const m = req.body.mieru || {};
+            updates.mieru = {
+                protocol: m.protocol === 'UDP' ? 'UDP' : 'TCP',
+                mtu: parseInt(m.mtu, 10) > 0 ? parseInt(m.mtu, 10) : 1400,
+                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(m.loggingLevel) ? m.loggingLevel : 'INFO',
+                multiplexing: m.multiplexing || '',
+                muxUserHintMandatory: !!m.muxUserHintMandatory,
+            };
         } else {
             const hyFields = parseHysteriaFormFields(req.body);
             const hyValidationError = validateHysteriaFormFields(hyFields);
             if (hyValidationError) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(hyValidationError)}`);
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, hyValidationError);
             }
             delete hyFields.acmeDnsConfigValid;
             Object.assign(updates, hyFields);
@@ -754,16 +1204,57 @@ router.post('/nodes/:id', async (req, res) => {
         } else if (req.body['ssh.privateKey'] && req.body['ssh.privateKey'].trim()) {
             const rawKey = req.body['ssh.privateKey'].trim();
             if (!sshKeyService.isValidPrivateKey(rawKey)) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('Invalid private key format')}`);
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, 'Invalid private key format');
             }
             updates['ssh.privateKey'] = cryptoService.encrypt(rawKey);
         }
+        if (isServerlessNode(nodeType)) {
+            delete updates['ssh.port'];
+            delete updates['ssh.username'];
+            delete updates['ssh.password'];
+            delete updates['ssh.privateKey'];
+            updates.ssh = cryptoService.encryptSshCredentials({});
+            updates.domain = '';
+            updates.sni = '';
+        }
+
+        // Only an Xray node can be a CDN origin, and switching its type or
+        // reshaping the published inbound breaks the fronts as thoroughly as
+        // deleting it would — just silently.
+        if (existingNode.type === 'xray') {
+            const dependentError = await checkCdnDependents(
+                nodeId,
+                {
+                    type: nodeType,
+                    name: existingNode.name,
+                    active: updates.active,
+                    xray: updates.xray || {},
+                },
+                HyNode
+            );
+            if (dependentError) {
+                return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, dependentError);
+            }
+        }
+
+        const cascadeError = await checkCascadeMembership(existingNode, nodeType);
+        if (cascadeError) {
+            return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, cascadeError);
+        }
+
+        const previousCdnSync = {
+            type: existingNode.type,
+            active: existingNode.active,
+            groups: existingNode.groups,
+            cdn: existingNode.cdn,
+        };
 
         // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
         existingNode.set(updates);
         await existingNode.save();
 
         syncService.schedulePush(nodeId, updates);
+        syncService.maybePushCdnOrigins(previousCdnSync, existingNode);
 
         // Sync SSH credentials to the sibling node on the same host (if SSH was
         // part of this update). Skipped when the node was moved to another IP:
@@ -786,15 +1277,16 @@ router.post('/nodes/:id', async (req, res) => {
 
         // Invalidate active-nodes, subscription, and dashboard caches so ranking/config changes apply immediately
         await invalidateNodesCache();
-        res.redirect('/panel/nodes');
+        sendNodeFormResult(req, res, '/panel/nodes');
     } catch (error) {
         logger.error(`[Panel] Update node error: ${error.message}`);
-        res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(error.message)}`);
+        sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, error.message, 500);
     }
 });
 
 // POST /panel/nodes/:id/setup - Auto-setup node via SSH
 router.post('/nodes/:id/setup', async (req, res) => {
+    let lockKey = null;
     try {
         const node = await HyNode.findById(req.params.id);
         
@@ -802,14 +1294,26 @@ router.post('/nodes/:id/setup', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Нода не найдена', logs: [] });
         }
 
-        if (node.type === 'virtual') {
-            return res.status(400).json({ success: false, error: 'Virtual nodes have no remote service to set up', logs: [] });
+        if (isServerlessNode(node)) {
+            return res.status(400).json({ success: false, error: 'This node type has no remote service to set up', logs: [] });
         }
 
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             return res.status(400).json({ success: false, error: 'SSH данные не настроены', logs: [] });
         }
-        
+
+        // Locked by the canonical id: the one in the URL may differ in case.
+        lockKey = String(node._id);
+        if (!nodeSetupLock.acquire(lockKey, 'Node setup')) {
+            const holder = nodeSetupLock.holder(lockKey);
+            lockKey = null;
+            return res.status(409).json({
+                success: false,
+                error: `Node is busy: ${holder} is running`,
+                logs: [],
+            });
+        }
+
         logger.info(`[Panel] Starting setup for node ${node.name} (type: ${node.type || 'hysteria'}, role: ${node.cascadeRole || 'standalone'})`);
         
         let result;
@@ -863,6 +1367,8 @@ router.post('/nodes/:id/setup', async (req, res) => {
     } catch (error) {
         logger.error(`[Panel] Setup error: ${error.message}`);
         res.status(500).json({ success: false, error: error.message, logs: [`Exception: ${error.message}`] });
+    } finally {
+        if (lockKey) nodeSetupLock.release(lockKey);
     }
 });
 
@@ -1021,9 +1527,14 @@ router.get('/nodes/:id/logs', async (req, res) => {
         }
 
         logger.debug(`[Panel] Getting logs for node ${node.name} (type: ${node.type})`);
-        const result = node.type === 'xray'
-            ? await nodeSetup.getXrayNodeLogs(node, 100)
-            : await nodeSetup.getNodeLogs(node, 100);
+        let result;
+        if (node.type === 'xray') {
+            result = await nodeSetup.getXrayNodeLogs(node, 100);
+        } else if (node.type === 'mieru') {
+            result = await nodeSetup.getMieruNodeLogs(node, 100);
+        } else {
+            result = await nodeSetup.getNodeLogs(node, 100);
+        }
         res.json(result);
     } catch (error) {
         logger.error(`[Panel] Get logs error for node ${req.params.id}: ${error.message}`);
@@ -1068,39 +1579,12 @@ router.post('/nodes/:id/outbounds', async (req, res) => {
 
         const aclInlineState = getHysteriaAclInlineState(node);
         
-        const outbounds = [];
         const rawBody = req.body;
-        
-        if (rawBody.outbound_name) {
-            const names = Array.isArray(rawBody.outbound_name) ? rawBody.outbound_name : [rawBody.outbound_name];
-            const types = Array.isArray(rawBody.outbound_type) ? rawBody.outbound_type : [rawBody.outbound_type];
-            const addrs = Array.isArray(rawBody.outbound_addr) ? rawBody.outbound_addr : [rawBody.outbound_addr || ''];
-            const usernames = Array.isArray(rawBody.outbound_username) ? rawBody.outbound_username : [rawBody.outbound_username || ''];
-            const passwords = Array.isArray(rawBody.outbound_password) ? rawBody.outbound_password : [rawBody.outbound_password || ''];
-            
-            for (let i = 0; i < names.length; i++) {
-                const name = (names[i] || '').trim();
-                const type = (types[i] || '').trim();
-                
-                if (!name || !type) continue;
-                if (!['direct', 'block', 'socks5', 'http'].includes(type)) continue;
-                
-                outbounds.push({
-                    name,
-                    type,
-                    addr: (addrs[i] || '').trim(),
-                    username: (usernames[i] || '').trim(),
-                    password: (passwords[i] || '').trim(),
-                });
-            }
-        }
-        
+        const outbounds = parseOutboundsFormFields(rawBody);
+
         let aclRules = Array.isArray(node.aclRules) ? node.aclRules : [];
         if (aclInlineState.editable) {
-            const aclRaw = (rawBody.aclRules || '').trim();
-            aclRules = aclRaw
-                ? aclRaw.split('\n').map(r => r.trim()).filter(Boolean)
-                : [];
+            aclRules = parseAclRulesInput(rawBody.aclRules);
         }
         
         await HyNode.findByIdAndUpdate(req.params.id, {
@@ -1254,8 +1738,8 @@ router.post('/nodes/:id/restart', async (req, res) => {
             return res.status(404).json({ error: 'Node not found' });
         }
 
-        if (node.type === 'virtual') {
-            return res.status(400).json({ error: 'Virtual nodes have no remote service to restart' });
+        if (isServerlessNode(node)) {
+            return res.status(400).json({ error: 'This node type has no remote service to restart' });
         }
 
         // Xray nodes with agent: restart + sync through the agent API

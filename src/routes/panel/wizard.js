@@ -17,6 +17,8 @@ const Settings = require('../../models/settingsModel');
 const cryptoService = require('../../services/cryptoService');
 const sshKeyService = require('../../services/sshKeyService');
 const nodeSetup = require('../../services/nodeSetup');
+const { isServerlessNode } = require('../../utils/nodeTypes');
+const nodeSetupLock = require('../../utils/nodeSetupLock');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { invalidateOnboardingCache } = require('./helpers');
@@ -377,14 +379,21 @@ async function _runBootstrap(taskId, nodeIds) {
             allSuccess = false;
             continue;
         }
-        if (node.type === 'virtual') {
-            pushLog(`[Skip] Virtual node ${node.name}: nothing to install`);
+        if (isServerlessNode(node)) {
+            pushLog(`[Skip] Serverless node ${node.name}: nothing to install`);
             continue;
         }
 
         pushLog(`\n--- Setting up ${node.type.toUpperCase()} node: ${node.name} (${node.ip}) ---`);
 
         let result;
+        // Locked by the canonical id: the requested one may differ in case.
+        const lockKey = String(node._id);
+        if (!nodeSetupLock.acquire(lockKey, 'Node setup')) {
+            pushLog(`[Skip] ${node.name}: ${nodeSetupLock.holder(lockKey)} is already running`);
+            allSuccess = false;
+            continue;
+        }
         try {
             if (node.type === 'xray') {
                 result = await nodeSetup.setupXrayNodeWithAgent(node, { restartService: true });
@@ -397,6 +406,8 @@ async function _runBootstrap(taskId, nodeIds) {
             }
         } catch (err) {
             result = { success: false, error: err.message, logs: [] };
+        } finally {
+            nodeSetupLock.release(lockKey);
         }
 
         for (const line of (result.logs || [])) { pushLog(line); }

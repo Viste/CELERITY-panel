@@ -152,6 +152,7 @@ Use `latest` for fast updates, or pin an explicit tag for predictable production
 - 🗺 **Network Map** — Visual cascade topology with Forward/Reverse chain routing *(beta)*
 - 🤖 **MCP Integration** — Native AI assistant support (Claude, Cursor, etc.) for panel management
 - 📡 **External Probes** — A standalone agent with a real sing-box core verifies node connectivity from real networks ([guide](docs/probes.md))
+- ☁️ **Generic CDN Nodes** — Publish Xray WebSocket, gRPC, or XHTTP inbounds through a domain or pinned edge addresses ([guide](docs/cdn-nodes.md))
 
 ---
 
@@ -330,7 +331,7 @@ Modern protocol with Reality support and various transports.
 | gRPC | Multiplexing, good for CDN | All clients |
 | XHTTP | New splithttp transport | Limited* |
 
-*XHTTP is not supported by all clients (Clash/Sing-box don't support it yet)
+*XHTTP is not supported by all clients. sing-box forks that implement it get the full framing; Mihomo's `xhttp-opts` carries path, mode and host only, so an inbound that negotiates framing is omitted from the Clash subscription instead of being published as a proxy that fails on every request.
 
 **Security:**
 
@@ -749,6 +750,26 @@ disk usage in check.
 | `xhttpPath` | String | XHTTP path |
 | `xhttpHost` | String | XHTTP host header |
 | `xhttpMode` | String | auto, packet-up, stream-up |
+| `xhttpXPaddingBytes` | String | XHTTP padding length, `"min-max"` or a single number (empty = core default 100-1000). Published to clients in the subscription; the inbound accepts the union with the default range so clients that ignore it keep working |
+| `xhttpScMaxEachPostBytes` | String | packet-up upload split threshold in bytes (empty = 1000000). The inbound accepts at least the default, so a smaller value applies only to clients that read it |
+| `xhttpNoGrpcHeader` | Boolean | Omit the gRPC content-type on stream-up/stream-one (client-side only) |
+| `xhttpXmuxMaxConcurrency` | String | XMUX streams per connection, e.g. `"16-32"` (client-side only) |
+| `xhttpXmuxHMaxRequestTimes` | String | XMUX requests per connection, e.g. `"600-900"` (client-side only) |
+| `xhttpXmuxHMaxReusableSecs` | String | XMUX connection lifetime in seconds, e.g. `"1800-3000"` (client-side only) |
+| `xhttpUplinkHTTPMethod` | String | `GET` or `POST` for the upload; `GET` requires `packet-up` and is what a CDN that blocks POST needs |
+| `xhttpUplinkDataPlacement` | String | `body` or `header` — where the client puts uploaded data |
+| `xhttpUplinkDataKey` | String | Header name when `uplinkDataPlacement: header`, e.g. `X-Data` |
+| `xhttpUplinkChunkSize` | String | Upload chunk size, `"min-max"` or a single number |
+| `xhttpScMinPostsIntervalMs` | String | Minimum interval between client posts, in ms |
+| `xhttpServerMaxHeaderBytes` | Number | Header limit on the inbound; does not change the CDN edge limit |
+| `xhttpXPaddingObfsMode` | Boolean | Disguise the padding as an ordinary parameter instead of `x_padding` |
+| `xhttpXPaddingKey` | String | Parameter/header name carrying the padding, e.g. `utm_source` |
+| `xhttpXPaddingPlacement` | String | `query` or `header` |
+| `xhttpXPaddingMethod` | String | `tokenish` — the padding value format |
+| `xhttpSessionPlacement` | String | `query`, `header` or `path` — where the session id travels |
+| `xhttpSessionKey` | String | Session parameter/header name, e.g. `sid` |
+| `xhttpSeqPlacement` | String | `query`, `header` or `path` — where the packet number travels |
+| `xhttpSeqKey` | String | Packet-number parameter/header name |
 | `apiPort` | Number | Xray gRPC API port (61000) |
 | `inboundTag` | String | Inbound tag (vless-in) |
 | `agentPort` | Number | CC Agent port (62080) |

@@ -10,6 +10,8 @@ const config = require('../../config');
 const cryptoService = require('./cryptoService');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
+const { isServerlessNode } = require('../utils/nodeTypes');
+const { isLoopbackAddress, hasOwnTlsInbound } = require('../utils/xrayFront');
 
 /**
  * Check if a node is on the same VPS as the panel
@@ -426,8 +428,9 @@ function execSSH(conn, command) {
 }
 
 function resolveNodeServiceCandidates(node) {
-    if (!node || node.type === 'virtual') return [];
+    if (!node || isServerlessNode(node)) return [];
     if (node.type === 'xray') return ['xray'];
+    if (node.type === 'mieru') return ['mita'];
     return ['hysteria-server', 'hysteria'];
 }
 
@@ -1003,8 +1006,16 @@ async function setupXrayNode(node, options = {}) {
             return { success: false, error: msg, logs, realityKeys: null };
         }
 
-        // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
         const xrayCfgEarly = node?.xray || {};
+        if (sameVps && xrayCfgEarly.front?.enabled) {
+            const msg = `Reverse proxy front is incompatible with same-VPS deployment: `
+                + `the panel's Caddy already owns port 443 on this server. `
+                + `Move the node to a separate VPS or turn the front off.`;
+            log(`ERROR: ${msg}`);
+            return { success: false, error: msg, logs, realityKeys: null };
+        }
+
+        // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
         if (sameVps && xrayCfgEarly.security === 'tls' && xrayCfgEarly.tlsSource === 'acme') {
             const msg = `tlsSource='acme' is incompatible with same-VPS deployment: ` +
                 `port 80 is held by the panel's Caddy and cannot be used for HTTP-01. ` +
@@ -1111,10 +1122,13 @@ async function setupXrayNode(node, options = {}) {
         logs.push(configContent.substring(0, 500) + (configContent.length > 500 ? '\n...' : ''));
         logs.push('--- End config preview ---');
 
+        // Any inbound may terminate TLS, not just the main one.
+        const terminatesTls = hasOwnTlsInbound(xrayCfg);
+
         // Self-signed TLS: openssl is only invoked when explicitly requested.
         // For tlsSource=panel/manual the certificate is inlined into config.json
         // by configGenerator and never written to disk on the remote node.
-        if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'self-signed') {
+        if (terminatesTls && xrayCfg.tlsSource === 'self-signed') {
             log('Generating self-signed TLS certificate (testing only)...');
             // Strip shell metacharacters from CN (node.sni is admin-only but
             // not strictly validated) and cap at the X.509 64-char CN limit.
@@ -1147,12 +1161,14 @@ fi
             if (!certResult.success) {
                 log(`Self-signed cert generation warning: ${certResult.error}`);
             }
-        } else if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'acme') {
+        } else if (xrayCfg.front?.enabled && xrayCfg.tlsSource === 'acme') {
+            log('TLS source: acme — the reverse proxy front obtains and renews the certificate itself.');
+        } else if (terminatesTls && xrayCfg.tlsSource === 'acme') {
             const domain = String(node.domain || '').trim();
             const email = (String(xrayCfg.acmeEmail || '').trim()) ||
                           (String(config.ACME_EMAIL || '').trim());
             if (!domain) {
-                throw new Error('tlsSource=acme requires node.domain to be set in the Network section.');
+                throw new Error('tlsSource=acme requires node.domain to be set on the Main tab.');
             }
             if (!email) {
                 throw new Error('tlsSource=acme requires acmeEmail (or the panel-wide ACME_EMAIL env var).');
@@ -1165,20 +1181,33 @@ fi
                 throw new Error(`ACME setup failed: ${acmeResult.error || 'see logs above'}`);
             }
             log('ACME cert installed and auto-renewal cron registered on the node.');
-        } else if (xrayCfg.security === 'tls') {
+        } else if (terminatesTls || xrayCfg.front?.enabled) {
             log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
         }
 
-        // Collect all client-facing ports: main inbound + extra inbounds.
-        // apiPort is local-only (127.0.0.1) and does not need a firewall rule.
+        // Collect externally bound client-facing ports. Loopback listeners and
+        // apiPort do not need host firewall rules.
         const mainPort = node.port || 443;
         const apiPort = (node.xray || {}).apiPort || 61000;
-        const extraPorts = ((node.xray || {}).extraInbounds || [])
-            .map(i => parseInt(i.port, 10))
-            .filter(p => Number.isInteger(p) && p > 0 && p < 65536 && p !== mainPort);
-        const allPorts = [mainPort, ...extraPorts];
+        const xrayConfig = node.xray || {};
+        const externalPorts = [];
+        if (!isLoopbackAddress(xrayConfig.listen || '0.0.0.0')) {
+            externalPorts.push(mainPort);
+        }
+        for (const inbound of (xrayConfig.extraInbounds || [])) {
+            const port = parseInt(inbound.port, 10);
+            if (Number.isInteger(port) && port > 0 && port < 65536
+                && !isLoopbackAddress(inbound.listen || '0.0.0.0')) {
+                externalPorts.push(port);
+            }
+        }
+        // The front owns the public port, plus :80 for the ACME challenge.
+        if (xrayConfig.front?.enabled) {
+            externalPorts.push(xrayConfig.front.publicPort || 443, 80);
+        }
+        const allPorts = [...new Set(externalPorts)];
 
-        log(`Opening firewall ports (${allPorts.join(', ')}, api:${apiPort})...`);
+        log(`Opening external firewall ports (${allPorts.join(', ') || 'none'}, api:${apiPort} local)...`);
         const portRules = allPorts.map(p => `
     iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null || true`).join('');
@@ -1694,6 +1723,234 @@ async function reloadCcAgent(node, ssh) {
     logger.info(`[Agent] Node ${node.name}: cc-agent config refreshed (${agentConfig.inbounds.length} inbound(s))`);
 }
 
+// ==================== MIERU (mita server) auto-install ====================
+
+// Pinned version of mita installed by the panel. Bumping here is enough — the
+// install script detects already-present binaries and skips when found, so
+// existing nodes are not disturbed by a panel-side version bump.
+const MITA_VERSION = '3.33.0';
+
+/**
+ * Build the install-or-detect shell script for mita. The script:
+ *  1. detects package manager (dnf vs apt) and CPU arch;
+ *  2. if mita is already installed AND systemd unit exists, prints version
+ *     and skips downloading — this is how we "adopt" hand-installed nodes;
+ *  3. otherwise downloads the pinned RPM/DEB and installs it;
+ *  4. opens the configured port/protocol via firewalld or ufw if either is
+ *     present (silently noops if neither — assume security-group at the
+ *     cloud layer);
+ *  5. enables + starts mita.service.
+ *
+ * The script is idempotent — re-running on a fully set-up node is a no-op.
+ */
+function buildMitaInstallScript(port, protocol) {
+    const proto = (protocol || 'TCP').toLowerCase() === 'udp' ? 'udp' : 'tcp';
+    const safePort = Number(port) || 443;
+    return `#!/bin/bash
+set -euo pipefail
+
+PORT=${safePort}
+PROTOCOL=${proto}
+MITA_VERSION=${MITA_VERSION}
+
+if command -v dnf >/dev/null 2>&1; then
+    PKG_MGR=dnf
+    PKG_EXT=rpm
+elif command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR=apt
+    PKG_EXT=deb
+else
+    echo "ERROR: neither dnf nor apt-get available"
+    exit 1
+fi
+
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)         DEB_ARCH=amd64; RPM_ARCH=x86_64 ;;
+    aarch64|arm64)  DEB_ARCH=arm64; RPM_ARCH=aarch64 ;;
+    *) echo "ERROR: unsupported arch $ARCH"; exit 1 ;;
+esac
+
+# --- adopt path: skip install if mita already wired into systemd ---
+if command -v mita >/dev/null 2>&1 \\
+   && systemctl list-unit-files mita.service --no-legend 2>/dev/null | grep -q .; then
+    INSTALLED_VER=$(mita help 2>&1 | head -3 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1 || echo unknown)
+    echo "OK: mita already installed (version $INSTALLED_VER) — skipping download"
+else
+    echo "Installing mita $MITA_VERSION ($PKG_MGR/$PKG_EXT, $ARCH)..."
+    cd /tmp
+    if [ "$PKG_EXT" = "rpm" ]; then
+        URL="https://github.com/enfein/mieru/releases/download/v$MITA_VERSION/mita-$MITA_VERSION-1.\${RPM_ARCH}.rpm"
+        curl -fsSL -o mita.rpm "$URL"
+        dnf install -y /tmp/mita.rpm
+        rm -f /tmp/mita.rpm
+    else
+        URL="https://github.com/enfein/mieru/releases/download/v$MITA_VERSION/mita_\${MITA_VERSION}_\${DEB_ARCH}.deb"
+        curl -fsSL -o mita.deb "$URL"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/mita.deb
+        rm -f /tmp/mita.deb
+    fi
+    echo "OK: mita installed"
+fi
+
+# --- firewall: best-effort, never fatal (security groups often live elsewhere) ---
+if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --add-port=$PORT/$PROTOCOL --permanent >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "OK: firewalld opened $PORT/$PROTOCOL"
+elif command -v ufw >/dev/null 2>&1; then
+    ufw allow $PORT/$PROTOCOL >/dev/null 2>&1 || true
+    echo "OK: ufw allowed $PORT/$PROTOCOL"
+else
+    echo "WARN: no firewalld/ufw — assuming $PORT/$PROTOCOL open via cloud SG"
+fi
+
+# --- service ---
+systemctl enable mita >/dev/null 2>&1 || true
+systemctl restart mita >/dev/null 2>&1 || systemctl start mita >/dev/null 2>&1
+sleep 1
+if systemctl is-active mita >/dev/null 2>&1; then
+    echo "OK: mita.service running"
+else
+    echo "ERROR: mita.service failed to start"
+    journalctl -u mita -n 30 --no-pager || true
+    exit 1
+fi
+`;
+}
+
+/**
+ * Set up a mieru node end-to-end:
+ *  1. SSH into the node and run the install/adopt script;
+ *  2. push the current users + listener config via NodeSSH.updateMieruConfig;
+ *  3. verify mita is listening on the configured port.
+ *
+ * Returns the same shape as setupNode / setupXrayNode for parity with the
+ * existing API caller in routes/nodes.js.
+ */
+async function setupMieruNode(node, options = {}) {
+    const { installPackage = true, restartService = true } = options;
+
+    const logs = [];
+    const log = (msg) => {
+        const line = `[${new Date().toISOString()}] ${msg}`;
+        logs.push(line);
+        logger.info(`[MieruSetup] ${msg}`);
+    };
+
+    log(`Starting setup for mieru node ${node.name} (${node.ip})`);
+
+    if (!hasSshCredentials(node)) {
+        return { success: false, error: 'SSH credentials not configured', logs };
+    }
+
+    const protocol = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
+    const port = node.port || 443;
+
+    let conn;
+    try {
+        log('Connecting via SSH...');
+        conn = await connectSSH(node);
+        log('SSH connected');
+
+        await runInitScript(conn, node, log, logs);
+
+        if (installPackage) {
+            log(`Installing/adopting mita ${MITA_VERSION} (port ${port}/${protocol})...`);
+            const installResult = await execSSH(conn, buildMitaInstallScript(port, protocol));
+            logs.push(installResult.output || '');
+            if (!installResult.success) {
+                log(`ERROR: mita install failed (exit code ${installResult.code})`);
+                throw new Error(`mita install failed: ${installResult.error || 'see logs'}`);
+            }
+            log('mita install/adopt completed');
+        }
+
+        // Push the actual user pool + listener config via the same path
+        // schedulePush uses, so this stays one source of truth.
+        log('Pushing mita config (users + portBindings)...');
+        const syncService = require('./syncService');
+        const success = await syncService.updateMieruNodeConfig(node);
+        if (!success) {
+            return { success: false, error: 'updateMieruNodeConfig failed (see node journal)', logs };
+        }
+
+        if (restartService) {
+            log('Verifying mita.service status...');
+            const status = await execSSH(conn, 'systemctl is-active mita 2>/dev/null || echo inactive');
+            const isActive = (status.output || '').trim() === 'active';
+            if (!isActive) {
+                log('WARN: mita is not active after setup');
+            } else {
+                log('OK: mita.service active');
+            }
+        }
+
+        return { success: true, logs, message: `mieru node ${node.name} ready` };
+    } catch (error) {
+        logger.error(`[MieruSetup] ${node.name}: ${error.message}`);
+        return { success: false, error: error.message, logs };
+    } finally {
+        if (conn) {
+            try { conn.end(); } catch { /* best-effort */ }
+        }
+    }
+}
+
+/**
+ * Quick health probe for a mieru node — service active + port open.
+ * Mirrors checkNodeStatus / checkXrayNodeStatus signatures.
+ */
+async function checkMieruNodeStatus(node) {
+    if (!hasSshCredentials(node)) {
+        return { online: false, message: 'SSH credentials not configured' };
+    }
+    let conn;
+    try {
+        conn = await connectSSH(node);
+        const svc = await execSSH(conn, 'systemctl is-active mita 2>/dev/null || echo inactive');
+        const isActive = (svc.output || '').trim() === 'active';
+        const port = node.port || 443;
+        const protoFlag = (node.mieru && node.mieru.protocol === 'UDP') ? '-uln' : '-tln';
+        const listen = await execSSH(conn, `ss ${protoFlag}p 2>/dev/null | grep -E ":${port}\\b" | head -1 || true`);
+        const listening = (listen.output || '').includes(`:${port}`);
+        return {
+            online: isActive && listening,
+            serviceActive: isActive,
+            listening,
+            port,
+            message: isActive && listening ? 'mita running' : 'mita not ready',
+        };
+    } catch (error) {
+        return { online: false, message: error.message };
+    } finally {
+        if (conn) {
+            try { conn.end(); } catch { /* best-effort */ }
+        }
+    }
+}
+
+/**
+ * Fetch the last N lines of mita journal output.
+ */
+async function getMieruNodeLogs(node, lines = 50) {
+    if (!hasSshCredentials(node)) {
+        return { success: false, error: 'SSH credentials not configured', logs: '' };
+    }
+    let conn;
+    try {
+        conn = await connectSSH(node);
+        const result = await execSSH(conn, `journalctl -u mita -n ${Number(lines) || 50} --no-pager 2>/dev/null || true`);
+        return { success: true, logs: result.output || '' };
+    } catch (error) {
+        return { success: false, error: error.message, logs: '' };
+    } finally {
+        if (conn) {
+            try { conn.end(); } catch { /* best-effort */ }
+        }
+    }
+}
+
 module.exports = {
     setupNode,
     checkNodeStatus,
@@ -1715,4 +1972,8 @@ module.exports = {
     getXrayNodeLogs,
     getPanelCertificates,
     isSameVpsAsPanel,
+    setupMieruNode,
+    checkMieruNodeStatus,
+    getMieruNodeLogs,
+    isLoopbackAddress,
 };
