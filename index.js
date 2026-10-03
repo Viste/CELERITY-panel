@@ -40,6 +40,7 @@ const authRoutes = require('./src/routes/auth');
 const panelRoutes = require('./src/routes/panel');
 const mcpRoutes = require('./src/routes/mcp');
 const marzbanCompat = require('./src/routes/marzbanCompat');
+const remnawaveCompat = require('./src/routes/remnawaveCompat');
 const { subscriptionLimiter, authLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
 const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
@@ -319,6 +320,7 @@ async function reloadSettings() {
     // rebuilt whenever Settings.migration.marzban changes (path, secret,
     // enabled flag, salt mode).
     marzbanCompat.invalidate();
+    remnawaveCompat.invalidate();
 }
 module.exports = { reloadSettings };
 
@@ -448,6 +450,10 @@ app.use('/panel', panelRoutes);
 // Hot path is in-memory only; no DB/disk reads per request.
 app.get('/', (req, res) => homepageService.respond(req, res));
 app.head('/', (req, res) => homepageService.respond(req, res));
+
+// Remnawave legacy-link compatibility: GET /<short_uuid>. Mounted last so it
+// can never shadow a real route; refuses when disabled in settings.
+app.use(remnawaveCompat);
 
 // ==================== ERROR HANDLING ====================
 

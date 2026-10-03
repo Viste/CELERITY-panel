@@ -94,6 +94,27 @@ const hyUserSchema = new mongoose.Schema({
         default: null,
     },
 
+    // Remnawave migration: legacy short_uuid tokens that keep resolving to this
+    // user via the compat route. Imported once, never rotated by the panel.
+    legacyTokens: {
+        type: [String],
+        default: [],
+    },
+    legacy: {
+        remnawaveId: { type: String, default: '' },
+        telegramId: { type: String, default: '' },
+        email: { type: String, default: '' },
+        description: { type: String, default: '' },
+        importedAt: { type: Date, default: null },
+        importBatch: { type: String, default: '' },
+        createdByImport: { type: Boolean, default: false },
+    },
+
+    // Last subscription fetch by a client app (not browser views). Lets the
+    // operator see who has picked up a changed subscription.
+    lastSubFetchAt: { type: Date, default: null },
+    lastSubUserAgent: { type: String, default: '' },
+
     /**
      * Marks a hidden user owned by a diagnostic probe. Such users are excluded
      * from listings and statistics, but still take part in node sync and
@@ -114,6 +135,7 @@ hyUserSchema.index({ enabled: 1, nodes: 1 });
 hyUserSchema.index({ enabled: 1, groups: 1 });
 // Covers expireScheduler queries (next upcoming + overdue sweep).
 hyUserSchema.index({ enabled: 1, expireAt: 1 });
+hyUserSchema.index({ legacyTokens: 1 }, { sparse: true });
 
 hyUserSchema.virtual('trafficUsedGB').get(function() {
     return ((this.traffic.tx + this.traffic.rx) / (1024 * 1024 * 1024)).toFixed(2);

@@ -70,8 +70,19 @@ function isBrowser(req) {
     return accept.includes('text/html') && /mozilla|chrome|safari|edge|opera/.test(ua);
 }
 
+/** Best-effort "last fetched by a client app" marker; never affects the response. */
+function trackSubscriptionFetch(user, userAgent) {
+    try {
+        const p = HyUser.updateOne(
+            { _id: user._id },
+            { $set: { lastSubFetchAt: new Date(), lastSubUserAgent: String(userAgent || '').slice(0, 200) } }
+        );
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (_) { /* stubbed model or disconnected db */ }
+}
+
 async function getUserByToken(token) {
-    const user = await HyUser.findOne({ subscriptionToken: token })
+    const user = await HyUser.findOne({ $or: [{ subscriptionToken: token }, { legacyTokens: token }] })
         .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray cascadeRole groups virtual cdn')
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
@@ -844,6 +855,7 @@ function generateVlessURIForInbound(user, node, inbound, dedupeLabel = _passthro
     // `type=xhttp`. The legacy `splithttp` keyword is rejected by some
     // clients and silently falls back to tcp, breaking the connection.
     params.set('type', transport);
+    params.set('encryption', 'none');
     params.set('security', security);
 
     if (security === 'reality') {
@@ -1384,9 +1396,10 @@ function _buildMieruSimpleURI(user, node, dedupeLabel = _passthroughLabel) {
     return `mierus://${u}:${p}@${host}?${params.toString()}#${remark}`;
 }
 
-function generateURIList(user, nodes) {
+function generateURIList(user, nodes, userAgent = '') {
     const uris = [];
     const dedupeLabel = _createLabelDeduplicator();
+    const skipMieru = isXrayProfileClient(userAgent);
     nodes.forEach(node => {
         if (node.type === 'virtual') {
             // URI list cannot represent a balancer; clients that hit this format
@@ -1394,6 +1407,9 @@ function generateURIList(user, nodes) {
             return;
         }
         if (node.type === 'mieru') {
+            // Xray-core clients (HAPP, Incy) have no mieru outbound; keep the
+            // unknown scheme out of their list.
+            if (skipMieru) return;
             // Shadowrocket 2.2.81+ and the mieru CLI accept the simple mierus://
             // URI; older clients on the URI-list path (Happ, Streisand) will skip
             // the unknown scheme. Clash / sing-box subscribers get the node via
@@ -3455,6 +3471,7 @@ async function serveSubscription(req, res, ctx) {
         logger.debug(`[Sub] UA: "${userAgent}" → format: ${format}`);
     }
     uaStats.track(cacheToken, userAgent);
+    trackSubscriptionFetch(user, userAgent);
 
     const settings = await getSettings();
 
@@ -3577,7 +3594,7 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
                 effectiveFormat = 'xray-json';
                 break;
             }
-            content = generateURIList(user, nodes);
+            content = generateURIList(user, nodes, userAgent);
             // HAPP reads #providerid from body as fallback (in case headers are stripped by a proxy)
             if (happProviderId) {
                 content = `#providerid ${happProviderId}\n${content}`;
@@ -3639,7 +3656,9 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
         'Subscription-Userinfo': [
             `upload=${data.traffic.tx}`,
             `download=${data.traffic.rx}`,
-            data.trafficLimit > 0 ? `total=${data.trafficLimit}` : null,
+            data.trafficLimit > 0
+                ? `total=${data.trafficLimit}`
+                : (settings?.subscription?.userinfoTotalZeroWhenUnlimited !== false ? 'total=0' : null),
             `expire=${data.expireAt ? Math.floor(new Date(data.expireAt).getTime() / 1000) : 0}`,
         ].filter(Boolean).join('; '),
     };
@@ -3674,7 +3693,7 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
                     content = `${routingLink}\n${content}`;
                 }
             }
-        } else if (isHappClient) {
+        } else if (isHappClient && settings?.subscription?.happ?.sendRoutingOffWhenDisabled) {
             // Incy has no "routing off" directive — clear rules for HAPP only.
             headers['routing'] = 'happ://routing/off';
             if (isUriBody) {

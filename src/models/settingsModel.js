@@ -93,6 +93,9 @@ const settingsSchema = new mongoose.Schema({
         // Instruction shown under the title on the public subscription page.
         pageNote:       { type: String, default: '', maxlength: 2000 },
         updateInterval: { type: Number, default: 12 },
+        // Remnawave/Marzban emit `total=0` for unlimited users; some clients
+        // render a missing `total` as "0 of 0" instead of unlimited.
+        userinfoTotalZeroWhenUnlimited: { type: Boolean, default: true },
         buttons: {
             type: [{
                 _id: false,
@@ -103,6 +106,10 @@ const settingsSchema = new mongoose.Schema({
             default: [],
         },
         happ: {
+            // Send `routing: happ://routing/off` when panel routing is disabled.
+            // Off by default: the directive wipes routing rules the user set up
+            // by hand on every subscription refresh.
+            sendRoutingOffWhenDisabled: { type: Boolean, default: false },
             announce:     { type: String, default: '' },
             hideSettings: { type: Boolean, default: false },
             notifyExpire: { type: Boolean, default: false },
@@ -262,6 +269,20 @@ const settingsSchema = new mongoose.Schema({
     // delegates to the regular subscription pipeline. Stays inert until the
     // migration wizard finalizes — `enabled:false` is the safe default.
     migration: {
+        // Remnawave legacy links: https://host/<short_uuid>[/<client>]. The
+        // compat route answers for users whose legacyTokens contain the token.
+        // `hosts` restricts the route to the listed hostnames (empty = any).
+        remnawave: {
+            enabled:     { type: Boolean, default: false },
+            hosts:       { type: [String], default: [] },
+            completedAt: { type: Date, default: null },
+            stats: {
+                merged:  { type: Number, default: 0 },
+                created: { type: Number, default: 0 },
+                skipped: { type: Number, default: 0 },
+                errors:  { type: Number, default: 0 },
+            },
+        },
         marzban: {
             enabled:            { type: Boolean, default: false },
             path:               { type: String,  default: 'sub' },

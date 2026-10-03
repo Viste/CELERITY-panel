@@ -843,6 +843,20 @@ async function getNodeLogs(node, lines = 50) {
 
 // ==================== XRAY SETUP ====================
 
+/** Client-facing TCP ports the node's xray must bind (main + extra inbounds, non-loopback). */
+function collectExternalListenPorts(node) {
+    const xrayCfg = node.xray || {};
+    const ports = [];
+    if (!isLoopbackAddress(xrayCfg.listen || '0.0.0.0')) ports.push(node.port || 443);
+    for (const inbound of (xrayCfg.extraInbounds || [])) {
+        const port = parseInt(inbound.port, 10);
+        if (Number.isInteger(port) && port > 0 && port < 65536 && !isLoopbackAddress(inbound.listen || '0.0.0.0')) {
+            ports.push(port);
+        }
+    }
+    return [...new Set(ports)];
+}
+
 const XRAY_INSTALL_SCRIPT = `#!/bin/bash
 
 echo "=== [1/4] Installing Xray-core ==="
@@ -856,11 +870,30 @@ if ! command -v curl &> /dev/null; then
     apt-get update && apt-get install -y curl || yum install -y curl || apk add curl
 fi
 
+XRAY_PIN="${process.env.XRAY_VERSION || ''}"
+NEED_INSTALL=0
 if ! command -v xray &> /dev/null; then
-    echo "Xray not found. Installing via official script..."
+    echo "Xray not found."
+    NEED_INSTALL=1
+elif [ -L /usr/local/bin/xray ]; then
+    # A symlink here belongs to another panel's node agent (e.g. /opt/remnawave/xray).
+    # Never adopt it: install a dedicated binary so both can coexist.
+    echo "Xray at /usr/local/bin/xray is a symlink to $(readlink -f /usr/local/bin/xray) — installing a dedicated binary."
+    rm -f /usr/local/bin/xray
+    NEED_INSTALL=1
+elif [ -n "$XRAY_PIN" ] && ! xray version 2>/dev/null | head -1 | grep -q "Xray \${XRAY_PIN#v} "; then
+    echo "Xray $(xray version | head -1) does not match pinned $XRAY_PIN — reinstalling."
+    NEED_INSTALL=1
+fi
+if [ "$NEED_INSTALL" = "1" ]; then
+    echo "Installing Xray via official script\${XRAY_PIN:+ (version $XRAY_PIN)}..."
     curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
     chmod +x /tmp/xray-install.sh
-    bash /tmp/xray-install.sh install 2>&1
+    if [ -n "$XRAY_PIN" ]; then
+        bash /tmp/xray-install.sh install --version "$XRAY_PIN" 2>&1
+    else
+        bash /tmp/xray-install.sh install 2>&1
+    fi
     INSTALL_EXIT=$?
     rm -f /tmp/xray-install.sh
     if [ $INSTALL_EXIT -ne 0 ]; then
@@ -1039,6 +1072,26 @@ async function setupXrayNode(node, options = {}) {
 
         await runInitScript(conn, node, log, logs);
 
+        if (!exitOnly) {
+            // A foreign listener on a client-facing port (mita, nginx, another
+            // panel's xray) would make `systemctl restart xray` succeed while
+            // the inbound never binds. Fail here, with the owner in the message.
+            const portsToCheck = collectExternalListenPorts(node);
+            if (portsToCheck.length > 0) {
+                const busyResult = await execSSH(conn, `
+for p in ${portsToCheck.join(' ')}; do
+    owner=$(ss -Hltnp "sport = :$p" 2>/dev/null | grep -v '"xray"' | head -1)
+    [ -n "$owner" ] && echo "BUSY $p $owner"
+done
+exit 0`);
+                const busy = String(busyResult.output || '').split('\n').filter(l => l.startsWith('BUSY '));
+                if (busy.length > 0) {
+                    throw new Error(`Port already in use on the node — stop the other service first: ${busy.join(' | ')}`);
+                }
+                log(`Ports ${portsToCheck.join(', ')} are free`);
+            }
+        }
+
         // Install Xray
         log('Installing Xray-core...');
         const installResult = await execSSH(conn, XRAY_INSTALL_SCRIPT);
@@ -1105,6 +1158,13 @@ async function setupXrayNode(node, options = {}) {
         let configContent;
         try {
             configContent = configGenerator.generateXrayConfig(node, users);
+            // Sync adds the private-range block after cascade rules; the very
+            // first config must not route RFC1918/metadata either.
+            if (typeof configGenerator.ensurePrivateIpBlock === 'function') {
+                const configObj = JSON.parse(configContent);
+                configGenerator.ensurePrivateIpBlock(configObj);
+                configContent = JSON.stringify(configObj, null, 2);
+            }
         } catch (genErr) {
             if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
                 const human = genErr.code === 'PANEL_CERT_UNAVAILABLE'
@@ -1215,8 +1275,14 @@ fi
     ufw allow ${p}/tcp 2>/dev/null || true
     ufw allow ${p}/udp 2>/dev/null || true`).join('');
 
+        const firewalldRules = allPorts.map(p => `
+    firewall-cmd --permanent --add-port=${p}/tcp >/dev/null 2>&1 || true`).join('');
         const firewallResult = await execSSH(conn, `
 echo "=== Opening firewall ports ==="
+if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then${firewalldRules}
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "Done: firewalld rules added"
+fi
 if command -v iptables &> /dev/null; then${portRules}
     echo "Done: iptables rules added"
 fi
@@ -1233,6 +1299,7 @@ echo "Done: Firewall configured"
             log('Installing systemd service and starting Xray...');
             const serviceContent = configGenerator.generateXraySystemdService();
             await uploadFile(conn, serviceContent, '/etc/systemd/system/xray.service');
+            const verifyPorts = xrayConfig.front?.enabled ? [] : collectExternalListenPorts(node);
             const restartResult = await execSSH(conn, `
 echo "=== Starting Xray service ==="
 systemctl daemon-reload
@@ -1244,13 +1311,23 @@ systemctl status xray --no-pager -l || true
 echo ""
 echo "Journal (last 15 lines):"
 journalctl -u xray -n 15 --no-pager || true
+if ! systemctl is-active --quiet xray; then
+    echo "ERROR: xray.service is not active after restart"
+    exit 1
+fi
+for p in ${verifyPorts.join(' ')}; do
+    if ! ss -Hltn "sport = :$p" 2>/dev/null | grep -q .; then
+        echo "ERROR: xray is active but nothing listens on :$p"
+        exit 1
+    fi
+done
+echo "Done: xray active${verifyPorts.length ? `, listening on ${verifyPorts.join(', ')}` : ''}"
             `);
             logs.push(restartResult.output);
             if (!restartResult.success) {
-                log(`Service restart warning: ${restartResult.error}`);
-            } else {
-                log('Xray service started');
+                throw new Error(`Xray did not start cleanly: ${restartResult.error || 'see logs above'}`);
             }
+            log('Xray service started');
         }
 
         log('Xray setup completed successfully!');
@@ -1405,6 +1482,11 @@ fi`;
     } else if (panelSource) {
         firewallRules = `
 echo "Remote setup: allowing panel source ${panelSource}"
+if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then
+    firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${panelSource}/32 port port=${agentPort} protocol=tcp accept" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "Done: firewalld rich rule added"
+fi
 if command -v iptables &> /dev/null; then
     iptables -I INPUT -p tcp -s ${panelSource} --dport ${agentPort} -j ACCEPT 2>/dev/null || true
     echo "Done: iptables rule added"

@@ -163,7 +163,7 @@ const manageNodeSchema = z.object({
         sni: z.string().optional(),
         port: z.number().optional(),
         portRange: z.string().optional(),
-        type: z.enum(['hysteria', 'xray', 'virtual', 'cdn']).optional().describe('Node type. "virtual" is a client-side load balancer; "cdn" publishes one Xray inbound through a domain and optional pinned edge addresses'),
+        type: z.enum(['hysteria', 'xray', 'virtual', 'cdn', 'mieru']).optional().describe('Node type. "virtual" is a client-side load balancer; "cdn" publishes one Xray inbound through a domain and optional pinned edge addresses'),
         groups: z.array(z.string()).optional(),
         active: z.boolean().optional(),
         country: z.string().optional(),
