@@ -128,7 +128,7 @@ async function restorePreviousXrayConfig(node) {
     try {
         await ssh.connect();
         const restartXray = nodeOsFamily(node) === 'freebsd'
-            ? 'service xray restart && sleep 1 && service xray status >/dev/null 2>&1 && '
+            ? 'service xray restart </dev/null >/dev/null 2>&1 && sleep 1 && service xray status >/dev/null 2>&1 && '
             : 'systemctl restart xray && systemctl is-active --quiet xray && ';
         const result = await ssh.exec(
             `test -s /usr/local/etc/xray/config.json.prev && `

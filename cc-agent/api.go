@@ -16,7 +16,9 @@ import (
 // xray service on this host: systemd on Linux, rc.d via service(8) on FreeBSD.
 func restartXrayCommand() *exec.Cmd {
 	if runtime.GOOS == "freebsd" {
-		return exec.Command("service", "xray", "restart")
+		// daemon(8) would inherit the output pipe and CombinedOutput would
+		// block until xray itself exits; detach stdio in a shell instead.
+		return exec.Command("sh", "-c", "service xray restart </dev/null >/dev/null 2>&1")
 	}
 	return exec.Command("systemctl", "restart", "xray")
 }

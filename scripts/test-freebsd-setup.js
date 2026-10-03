@@ -38,7 +38,7 @@ assert.ok(new HyNode({ name: 'n', type: 'xray', ip: '192.0.2.1', osFamily: 'darw
 // --- service command builders ---------------------------------------------
 assert.strictEqual(nodeSetup.buildServiceCommand('linux', 'restart', 'xray'), 'systemctl restart xray');
 assert.strictEqual(nodeSetup.buildServiceCommand('linux', 'is-active', 'xray'), 'systemctl is-active xray');
-assert.strictEqual(nodeSetup.buildServiceCommand('freebsd', 'restart', 'xray'), 'service xray restart');
+assert.strictEqual(nodeSetup.buildServiceCommand('freebsd', 'restart', 'xray'), 'service xray restart </dev/null >/dev/null 2>&1');
 assert.strictEqual(nodeSetup.buildServiceCommand('freebsd', 'enable', 'xray'), 'sysrc xray_enable=YES');
 assert.strictEqual(nodeSetup.buildServiceCommand('freebsd', 'disable', 'cc_agent'), 'sysrc cc_agent_enable=NO');
 assert.strictEqual(

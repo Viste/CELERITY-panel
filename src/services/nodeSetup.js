@@ -493,7 +493,7 @@ function buildRuntimeStartScript(osFamily, service) {
         return `
 ${serviceExistsCommand(service, osFamily)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
 sysrc ${service}_enable=YES 2>&1
-service ${service} restart 2>&1
+service ${service} restart </dev/null >/dev/null 2>&1 2>&1
 sleep 2
 if service ${service} status >/dev/null 2>&1; then STATE=active; else STATE=inactive; fi
 echo "STATE:$STATE"

@@ -17,7 +17,10 @@ function buildServiceCommand(osFamily, verb, service) {
         if (verb === 'enable') return `sysrc ${service}_enable=YES`;
         if (verb === 'disable') return `sysrc ${service}_enable=NO`;
         if (verb === 'is-active') return `service ${service} status >/dev/null 2>&1 && echo active || echo inactive`;
-        return `service ${service} ${verb}`;
+        if (verb === 'status') return `service ${service} status`;
+        // rc.d services started via daemon(8) inherit our stdio: without the
+        // redirects an SSH exec never sees EOF and hangs until the service dies.
+        return `service ${service} ${verb} </dev/null >/dev/null 2>&1`;
     }
     return `systemctl ${verb} ${service}`;
 }
