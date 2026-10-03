@@ -1396,6 +1396,38 @@ function _buildMieruSimpleURI(user, node, dedupeLabel = _passthroughLabel) {
     return `mierus://${u}:${p}@${host}?${params.toString()}#${remark}`;
 }
 
+/**
+ * Format for the Potato mobile apps: Xray profiles (same shape as xray-json)
+ * plus mieru client profiles the app runs with the embedded mieru client.
+ */
+function generatePotatoJSON(user, nodes, routing) {
+    const dedupeLabel = _createLabelDeduplicator();
+    const uname = user.username || user.userId;
+    const mieru = [];
+    for (const node of nodes) {
+        if (node.type !== 'mieru') continue;
+        const server = node.domain || node.ip;
+        if (!server || !uname || !user.password) continue;
+        const mtu = node.mieru && node.mieru.mtu;
+        mieru.push({
+            name: dedupeLabel(`${node.flag || ''} ${node.name}`.trim()),
+            server,
+            port: node.port || 443,
+            protocol: (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP',
+            username: uname,
+            password: user.password,
+            mtu: (Number.isFinite(mtu) && mtu > 0) ? mtu : 1400,
+            multiplexing: (node.mieru && node.mieru.multiplexing) || '',
+            handshakeMode: '',
+        });
+    }
+    return {
+        version: 1,
+        xray: generateXrayJSON(user, nodes.filter(n => n.type !== 'mieru'), routing),
+        mieru,
+    };
+}
+
 function generateURIList(user, nodes, userAgent = '') {
     const uris = [];
     const dedupeLabel = _createLabelDeduplicator();
@@ -3583,6 +3615,9 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
         case 'xray-json':
             content = JSON.stringify(generateXrayJSON(user, nodes, routing), null, 2);
             break;
+        case 'potato':
+            content = JSON.stringify(generatePotatoJSON(user, nodes, routing));
+            break;
         case 'uri':
         case 'raw':
         default: {
@@ -3644,6 +3679,7 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
         case 'json':
         case 'v2ray-json':
         case 'xray-json':
+        case 'potato':
             contentType = 'application/json';
             break;
     }
@@ -3754,6 +3790,7 @@ module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
 module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
+module.exports._generatePotatoJSON = generatePotatoJSON;
 // Exposed for the diagnostic probe manifest. The probe matches subscription
 // outbounds to nodes by tag, so the panel must predict those tags with the
 // very same code that generates the subscription.
