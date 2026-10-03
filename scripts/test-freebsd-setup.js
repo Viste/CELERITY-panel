@@ -134,3 +134,14 @@ assert.ok(rc.includes('run_rc_command "$1"'));
 assert.ok(!rc.includes('\\$'), 'rc.d script must not carry JS escape backslashes');
 
 console.log('freebsd setup tests passed');
+
+// host metrics over SSH: FreeBSD variants must not depend on /proc or GNU tools
+const NodeSSH = require('../src/utils/nodeOs');
+const bsdStats = NodeSSH.buildSystemStatsScript('freebsd');
+for (const bad of ['/proc', 'free -b', 'nproc', 'df -B1']) assert.ok(!bsdStats.includes(bad), `freebsd stats script contains ${bad}`);
+for (const need of ['kern.cp_time', 'vm.loadavg', 'hw.ncpu', 'hw.physmem', 'df -k', 'kern.boottime', '===CPUSAMPLE===', '===UPTIME===']) assert.ok(bsdStats.includes(need), `freebsd stats script lacks ${need}`);
+assert.ok(NodeSSH.buildSystemStatsScript('linux').includes('head -1 /proc/stat'));
+assert.ok(NodeSSH.buildNetStatsCommand('freebsd').includes('netstat -ibn'));
+assert.ok(!NodeSSH.buildNetStatsCommand('freebsd').includes('/proc/net/dev'));
+assert.ok(NodeSSH.buildNetStatsCommand('linux').includes('/proc/net/dev'));
+console.log('freebsd host metrics builders ok');

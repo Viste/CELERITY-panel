@@ -25,4 +25,47 @@ function buildServiceCommand(osFamily, verb, service) {
     return `systemctl ${verb} ${service}`;
 }
 
-module.exports = { normalizeOsFamily, nodeOsFamily, buildServiceCommand };
+// Host metrics scripts. The FreeBSD variants print the same line shapes as
+// the Linux tools so one parser serves both (cpu line: idle at index 3).
+function buildSystemStatsScript(osFamily) {
+    if (osFamily === 'freebsd') {
+        return `
+echo "===CPUSAMPLE==="
+sysctl -n kern.cp_time | awk '{print "cpu", $1, $2, $3, $5, 0, $4}'
+echo "===LOADAVG==="
+sysctl -n vm.loadavg | tr -d '{}' | awk '{print $1, $2, $3}'
+echo "===CORES==="
+sysctl -n hw.ncpu
+echo "===MEM==="
+PS=$(sysctl -n hw.pagesize); T=$(sysctl -n hw.physmem)
+F=$(( ( $(sysctl -n vm.stats.vm.v_free_count) + $(sysctl -n vm.stats.vm.v_inactive_count) ) * PS ))
+echo "Mem: $T $(( T - F )) $F"
+echo "===DISK==="
+df -k / | tail -1 | awk '{printf "%s %d %d %d %s %s\n", $1, $2*1024, $3*1024, $4*1024, $5, $6}'
+echo "===UPTIME==="
+echo $(( $(date +%s) - $(sysctl -n kern.boottime | awk -F'[ =,]+' '{print $3}') ))
+`;
+    }
+    return `
+echo "===CPUSAMPLE==="
+head -1 /proc/stat
+echo "===LOADAVG==="
+cat /proc/loadavg
+echo "===CORES==="
+nproc
+echo "===MEM==="
+free -b | grep -E "^Mem:"
+echo "===DISK==="
+df -B1 / | tail -1
+echo "===UPTIME==="
+cat /proc/uptime | cut -d' ' -f1
+`;
+}
+function buildNetStatsCommand(osFamily) {
+    if (osFamily === 'freebsd') {
+        return `IF=$(route -n get default | awk '/interface:/{print $2}'); netstat -ibn -I "$IF" | awk -v i="$IF" '/<Link/ {printf "%s: %d 0 0 0 0 0 0 0 %d\n", i, $8, $11}'`;
+    }
+    return `cat /proc/net/dev | grep -E '(eth|ens|enp|eno)' | head -1`;
+}
+
+module.exports = { normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildSystemStatsScript, buildNetStatsCommand };

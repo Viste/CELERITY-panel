@@ -28,6 +28,7 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
+const { nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand } = require('../utils/nodeOs');
 
 // Hard cap to keep CPU usage bounded on weak hardware (1 vCPU).
 // Each SSH handshake involves DH key-exchange which is CPU-heavy on Node.js.
@@ -574,7 +575,7 @@ echo "Port hopping: ${startPort}-${endPort} -> ${mainPort}"
     async getNetworkSpeed() {
         try {
             const getNetStats = async () => {
-                const result = await this.exec(`cat /proc/net/dev | grep -E '(eth|ens|enp|eno)' | head -1`);
+                const result = await this.exec(NodeSSH.buildNetStatsCommand(nodeOsFamily(this.node)));
                 const line = result.stdout.trim();
                 
                 if (!line) return null;
@@ -738,20 +739,7 @@ fi
      */
     async getSystemStats() {
         try {
-            const result = await this.exec(`
-echo "===CPUSAMPLE==="
-head -1 /proc/stat
-echo "===LOADAVG==="
-cat /proc/loadavg
-echo "===CORES==="
-nproc
-echo "===MEM==="
-free -b | grep -E "^Mem:"
-echo "===DISK==="
-df -B1 / | tail -1
-echo "===UPTIME==="
-cat /proc/uptime | cut -d' ' -f1
-            `);
+            const result = await this.exec(NodeSSH.buildSystemStatsScript(nodeOsFamily(this.node)));
             
             const output = result.stdout || '';
             const lines = output.split('\n');
@@ -841,6 +829,8 @@ cat /proc/uptime | cut -d' ' -f1
     }
 }
 
+NodeSSH.buildSystemStatsScript = buildSystemStatsScript;
+NodeSSH.buildNetStatsCommand = buildNetStatsCommand;
 NodeSSH._cpuSamples = new Map();
 
 // Direct-connection semaphore (issue #70 hardening).
