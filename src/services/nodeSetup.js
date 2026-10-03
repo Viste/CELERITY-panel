@@ -1758,7 +1758,11 @@ fi`;
     log('Downloading cc-agent binary...');
     let freebsdDownloadScript = '';
     if (osFamily === 'freebsd') {
-        freebsdDownloadScript = buildFreebsdAgentDownloadScript(process.env.CC_AGENT_FREEBSD_URL);
+        // The image ships the freebsd build under public/agents/ (see Dockerfile),
+        // so the panel itself is the default download source.
+        const freebsdAgentUrl = process.env.CC_AGENT_FREEBSD_URL
+            || (config.BASE_URL ? `${config.BASE_URL}/agents/cc-agent-freebsd-amd64` : '');
+        freebsdDownloadScript = buildFreebsdAgentDownloadScript(freebsdAgentUrl);
         if (!freebsdDownloadScript) {
             const msg = 'CC_AGENT_FREEBSD_URL is not set (or is not an http(s) URL) — point it at a freebsd/amd64 cc-agent binary built by cc-agent/build.sh';
             log(`ERROR: ${msg}`);
