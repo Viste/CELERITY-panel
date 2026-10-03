@@ -541,7 +541,8 @@ sysrc xray_config=/usr/local/etc/xray
 sysctl net.inet.ip.portrange.reservedhigh=0 >/dev/null
 grep -q '^net.inet.ip.portrange.reservedhigh=' /etc/sysctl.conf 2>/dev/null || echo 'net.inet.ip.portrange.reservedhigh=0' >> /etc/sysctl.conf
 chmod 644 /usr/local/etc/xray/config.json 2>/dev/null || true
-service xray restart
+# daemon(8) inherits our stdio; without this the SSH exec never sees EOF
+service xray restart </dev/null >/tmp/xray-restart.out 2>&1; cat /tmp/xray-restart.out
 sleep 2
 echo "Service status:"
 service xray status || true
@@ -1823,7 +1824,7 @@ WantedBy=multi-user.target
     const startResult = await execSSH(conn, osFamily === 'freebsd' ? `
 ${firewallRules}
 sysrc cc_agent_enable=YES
-service cc_agent restart
+service cc_agent restart </dev/null >/tmp/cc_agent-restart.out 2>&1; cat /tmp/cc_agent-restart.out
 sleep 2
 if service cc_agent status >/dev/null 2>&1; then
     echo "OK: cc-agent running"
@@ -2049,7 +2050,7 @@ async function reloadCcAgent(node, ssh) {
     // racing the bring-up. The loop polls for up to ~5 s and exits 0 as soon
     // as the unit is active again, exit 1 on timeout.
     const waitResult = await ssh.exec(nodeOsFamily(node) === 'freebsd'
-        ? 'service cc_agent restart && '
+        ? 'service cc_agent restart </dev/null >/dev/null 2>&1 && '
         + 'for i in 1 2 3 4 5; do '
         + '  service cc_agent status >/dev/null 2>&1 && exit 0; '
         + '  sleep 1; '
