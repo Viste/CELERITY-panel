@@ -1,4 +1,10 @@
 # Hysteria Backend - Docker Image
+FROM golang:alpine AS agent
+WORKDIR /src
+COPY cc-agent/ ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/cc-agent-linux-amd64 . \
+ && CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/cc-agent-freebsd-amd64 .
+
 FROM node:20-alpine
 
 WORKDIR /app
@@ -16,6 +22,7 @@ RUN npm install --omit=dev
 
 # Копируем исходники
 COPY . .
+COPY --from=agent /out/ ./public/agents/
 
 # Create directories for logs, certificates, backups and access-logs data.
 RUN mkdir -p logs greenlock.d/live greenlock.d/accounts backups data/access-logs && \
