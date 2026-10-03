@@ -27,6 +27,7 @@ const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers')
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const { isServerlessNode, checkCascadeMembership } = require('../../utils/nodeTypes');
 const nodeSetupLock = require('../../utils/nodeSetupLock');
+const { nodeOsFamily, buildServiceCommand } = require('../../utils/nodeOs');
 const {
     normalizeCdnConfig,
     validateCdnOrigin,
@@ -1759,7 +1760,8 @@ router.post('/nodes/:id/restart', async (req, res) => {
 
         const conn = await nodeSetup.connectSSH(node);
         const serviceName = node.type === 'xray' ? 'xray' : 'hysteria-server';
-        const result = await nodeSetup.execSSH(conn, `systemctl restart ${serviceName} && sleep 2 && systemctl is-active ${serviceName}`);
+        const osFamily = nodeOsFamily(node);
+        const result = await nodeSetup.execSSH(conn, `${buildServiceCommand(osFamily, 'restart', serviceName)} && sleep 2 && ${buildServiceCommand(osFamily, 'is-active', serviceName)}`);
         conn.end();
 
         const isActive = result.output.trim().includes('active');

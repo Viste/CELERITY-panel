@@ -28,6 +28,7 @@ const config = require('../../config');
 const webhook = require('./webhookService');
 const nodeSetup = require('./nodeSetup');
 const nodeSetupLock = require('../utils/nodeSetupLock');
+const { nodeOsFamily, buildServiceCommand } = require('../utils/nodeOs');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
@@ -126,10 +127,13 @@ async function restorePreviousXrayConfig(node) {
     const ssh = new NodeSSH(node);
     try {
         await ssh.connect();
+        const restartXray = nodeOsFamily(node) === 'freebsd'
+            ? 'service xray restart && sleep 1 && service xray status >/dev/null 2>&1 && '
+            : 'systemctl restart xray && systemctl is-active --quiet xray && ';
         const result = await ssh.exec(
             `test -s /usr/local/etc/xray/config.json.prev && `
             + `cp -f /usr/local/etc/xray/config.json.prev /usr/local/etc/xray/config.json && `
-            + 'systemctl restart xray && systemctl is-active --quiet xray && '
+            + restartXray
             + 'rm -f /usr/local/etc/xray/config.json.prev'
         );
         return result.code === 0;
@@ -768,9 +772,10 @@ class SyncService {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
-                const restart = await ssh.exec('systemctl restart xray');
+                const restartCmd = buildServiceCommand(nodeOsFamily(node), 'restart', 'xray');
+                const restart = await ssh.exec(restartCmd);
                 if (restart.code !== 0) {
-                    throw new Error(String(restart.stderr || restart.stdout || 'systemctl restart xray failed').trim());
+                    throw new Error(String(restart.stderr || restart.stdout || `${restartCmd} failed`).trim());
                 }
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
             } catch (error) {

@@ -14,6 +14,7 @@ const crypto = require('crypto');
 
 const cache = require('./cacheService');
 const nodeSetup = require('./nodeSetup');
+const { nodeOsFamily } = require('../utils/nodeOs');
 const HyNode = require('../models/hyNodeModel');
 const logger = require('../utils/logger');
 const { invalidateNodesCache } = require('../utils/helpers');
@@ -500,6 +501,9 @@ async function runVersionChange(task, release) {
         const node = await HyNode.findById(task.nodeId);
         if (!node) throw new Error('Node not found');
         if (node.type !== 'xray') throw new Error('Node is not an Xray node');
+        if (nodeOsFamily(node) === 'freebsd') {
+            throw new Error('Xray version changes are not supported on FreeBSD nodes — upgrade xray-core with pkg on the host');
+        }
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error('SSH credentials are required');
         }

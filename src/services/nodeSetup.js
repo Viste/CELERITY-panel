@@ -12,6 +12,7 @@ const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
 const { isServerlessNode } = require('../utils/nodeTypes');
 const { isLoopbackAddress, hasOwnTlsInbound } = require('../utils/xrayFront');
+const { normalizeOsFamily, nodeOsFamily, buildServiceCommand } = require('../utils/nodeOs');
 
 /**
  * Check if a node is on the same VPS as the panel
@@ -438,8 +439,175 @@ function hasSshCredentials(node) {
     return !!(node?.ssh?.password || node?.ssh?.privateKey);
 }
 
-function serviceExistsCommand(serviceName) {
+function serviceExistsCommand(serviceName, osFamily) {
+    if (osFamily === 'freebsd') {
+        return `[ -x /usr/local/etc/rc.d/${serviceName} ] || [ -x /etc/rc.d/${serviceName} ]`;
+    }
     return `systemctl list-unit-files ${serviceName}.service --no-legend 2>/dev/null | grep -q . || systemctl status ${serviceName} >/dev/null 2>&1`;
+}
+
+// ==================== OS FAMILY (linux / freebsd) ====================
+//
+// FreeBSD nodes have no systemd and no bash in base: service control goes
+// through service(8)/sysrc(8) and every script sent over SSH must be POSIX sh.
+
+/** Run `uname -s` once, persist the result on the node document and return it. */
+async function detectOsFamily(conn, node) {
+    const result = await execSSH(conn, 'uname -s');
+    const osFamily = normalizeOsFamily(result.success ? result.output : '');
+    if (node && node.osFamily !== osFamily) {
+        node.osFamily = osFamily;
+        if (node._id) {
+            const HyNode = require('../models/hyNodeModel');
+            await HyNode.updateOne({ _id: node._id }, { $set: { osFamily } });
+        }
+    }
+    return osFamily;
+}
+
+function buildRuntimeStopScript(osFamily, service) {
+    if (osFamily === 'freebsd') {
+        return `
+${serviceExistsCommand(service, osFamily)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
+service ${service} stop 2>&1 || true
+sysrc ${service}_enable=NO 2>&1 || true
+sleep 1
+if service ${service} status >/dev/null 2>&1; then STATE=active; else STATE=inactive; fi
+echo "STATE:$STATE"
+[ "$STATE" != "active" ]
+`;
+    }
+    return `
+${serviceExistsCommand(service)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
+systemctl stop ${service} 2>&1 || true
+systemctl disable ${service} 2>&1 || true
+sleep 1
+STATE="$(systemctl is-active ${service} 2>/dev/null || true)"
+echo "STATE:$STATE"
+[ "$STATE" != "active" ]
+`;
+}
+
+function buildRuntimeStartScript(osFamily, service) {
+    if (osFamily === 'freebsd') {
+        return `
+${serviceExistsCommand(service, osFamily)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
+sysrc ${service}_enable=YES 2>&1
+service ${service} restart 2>&1
+sleep 2
+if service ${service} status >/dev/null 2>&1; then STATE=active; else STATE=inactive; fi
+echo "STATE:$STATE"
+[ "$STATE" = "active" ]
+`;
+    }
+    return `
+${serviceExistsCommand(service)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
+systemctl daemon-reload 2>&1 || true
+systemctl enable ${service} 2>&1
+systemctl restart ${service} 2>&1
+sleep 2
+STATE="$(systemctl is-active ${service} 2>/dev/null || true)"
+echo "STATE:$STATE"
+[ "$STATE" = "active" ]
+`;
+}
+
+function buildXrayLogsCommand(osFamily, lines) {
+    if (osFamily === 'freebsd') {
+        // No journald: the pkg rc script runs xray under daemon(8), so only
+        // syslog lines and file logs (if any) are available.
+        return `service xray status 2>&1; grep -i xray /var/log/messages 2>/dev/null | tail -n ${lines}; `
+            + `for f in /var/log/xray.log /var/log/xray/error.log; do [ -f "$f" ] && { echo "--- $f ---"; tail -n ${lines} "$f"; }; done; exit 0`;
+    }
+    return `journalctl -u xray -n ${lines} --no-pager`;
+}
+
+function buildFreebsdBusyPortsScript(ports) {
+    return `
+for p in ${ports.join(' ')}; do
+    owner=$(sockstat -46l -P tcp -p "$p" 2>/dev/null | awk 'NR > 1 && $2 != "xray"' | head -1)
+    [ -n "$owner" ] && echo "BUSY $p $owner"
+done
+exit 0`;
+}
+
+function buildFreebsdXrayStartScript(verifyPorts) {
+    return `
+echo "=== Starting Xray service (rc.d) ==="
+sysrc xray_enable=YES
+sysrc xray_config=/usr/local/etc/xray/config.json
+service xray restart
+sleep 2
+echo "Service status:"
+service xray status || true
+if ! service xray status >/dev/null 2>&1; then
+    echo "ERROR: xray is not running after restart"
+    exit 1
+fi
+for p in ${verifyPorts.join(' ')}; do
+    if ! sockstat -46l -P tcp -p "$p" 2>/dev/null | awk 'NR > 1' | grep -q .; then
+        echo "ERROR: xray is running but nothing listens on :$p"
+        exit 1
+    fi
+done
+echo "Done: xray running${verifyPorts.length ? `, listening on ${verifyPorts.join(', ')}` : ''}"
+`;
+}
+
+/** Returns '' when CC_AGENT_FREEBSD_URL is unset or not a plain http(s) URL. */
+function buildFreebsdAgentDownloadScript(url) {
+    const safeUrl = String(url || '').trim();
+    if (!/^https?:\/\/[^\s'"\\]+$/.test(safeUrl)) return '';
+    return `
+rm -f /usr/local/bin/cc-agent
+URL='${safeUrl}'
+echo "Downloading $URL ..."
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 120 "$URL" -o /usr/local/bin/cc-agent
+else
+    fetch -q -o /usr/local/bin/cc-agent "$URL"
+fi
+if [ ! -s /usr/local/bin/cc-agent ]; then
+    echo "ERROR: Download failed or file is empty"
+    exit 1
+fi
+chmod +x /usr/local/bin/cc-agent
+echo "OK: cc-agent binary ready"
+ls -la /usr/local/bin/cc-agent
+`;
+}
+
+function buildCcAgentRcScript() {
+    return `#!/bin/sh
+#
+# PROVIDE: cc_agent
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# rc.conf knobs:
+#   cc_agent_enable="YES"
+#   cc_agent_config="/etc/cc-agent/config.json"
+
+. /etc/rc.subr
+
+name="cc_agent"
+rcvar="cc_agent_enable"
+
+load_rc_config $name
+
+: \${cc_agent_enable:="NO"}
+: \${cc_agent_config:="/etc/cc-agent/config.json"}
+# service(8) strips /usr/local from PATH; the agent runs \`xray version\`.
+: \${cc_agent_env:="PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"}
+
+pidfile="/var/run/\${name}.pid"
+command="/usr/sbin/daemon"
+# -P keeps the supervisor pid, so \`service cc_agent stop\` signals daemon(8),
+# which forwards SIGTERM to cc-agent instead of restarting it (-R 5).
+command_args="-f -S -T cc-agent -R 5 -P \${pidfile} /usr/local/bin/cc-agent -config \${cc_agent_config}"
+
+run_rc_command "$1"
+`;
 }
 
 async function runRuntimeServiceCommand(node, action, buildCommand) {
@@ -497,28 +665,13 @@ async function runRuntimeServiceCommand(node, action, buildCommand) {
 }
 
 async function stopNodeRuntime(node) {
-    return runRuntimeServiceCommand(node, 'stop', service => `
-${serviceExistsCommand(service)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
-systemctl stop ${service} 2>&1 || true
-systemctl disable ${service} 2>&1 || true
-sleep 1
-STATE="$(systemctl is-active ${service} 2>/dev/null || true)"
-echo "STATE:$STATE"
-[ "$STATE" != "active" ]
-`);
+    const osFamily = nodeOsFamily(node);
+    return runRuntimeServiceCommand(node, 'stop', service => buildRuntimeStopScript(osFamily, service));
 }
 
 async function startNodeRuntime(node) {
-    return runRuntimeServiceCommand(node, 'start', service => `
-${serviceExistsCommand(service)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
-systemctl daemon-reload 2>&1 || true
-systemctl enable ${service} 2>&1
-systemctl restart ${service} 2>&1
-sleep 2
-STATE="$(systemctl is-active ${service} 2>/dev/null || true)"
-echo "STATE:$STATE"
-[ "$STATE" = "active" ]
-`);
+    const osFamily = nodeOsFamily(node);
+    return runRuntimeServiceCommand(node, 'start', service => buildRuntimeStartScript(osFamily, service));
 }
 
 function uploadFile(conn, content, remotePath) {
@@ -914,16 +1067,61 @@ mkdir -p /usr/local/etc/xray
 echo "Done: Directory /usr/local/etc/xray ready"
 `;
 
+// POSIX sh: FreeBSD root's login shell is /bin/sh and bash is not in base.
+const XRAY_INSTALL_SCRIPT_FREEBSD = `
+echo "=== [1/4] Installing Xray-core (FreeBSD pkg) ==="
+echo "OS: $(uname -sr)"
+echo "Arch: $(uname -m)"
+
+XRAY_PIN="${process.env.XRAY_VERSION || ''}"
+if [ -n "$XRAY_PIN" ]; then
+    echo "Note: XRAY_VERSION=$XRAY_PIN is ignored on FreeBSD — the pkg repository version is installed."
+fi
+
+if [ -x /usr/local/bin/xray ] && command -v curl >/dev/null 2>&1; then
+    echo "Done: xray-core and curl already installed"
+else
+    echo "Installing xray-core and curl via pkg..."
+    ASSUME_ALWAYS_YES=yes pkg install -y xray-core curl 2>&1
+    if [ ! -x /usr/local/bin/xray ]; then
+        echo "ERROR: /usr/local/bin/xray not found after pkg install"
+        exit 1
+    fi
+fi
+echo "Done: Xray installed ($(/usr/local/bin/xray version | head -1))"
+
+mkdir -p /usr/local/etc/xray /var/log/xray
+echo "Done: Directory /usr/local/etc/xray ready"
+`;
+
 // ACME (acme.sh) setup for tlsSource='acme': issue LE cert for `domain` via
 // HTTP-01 standalone, install to /usr/local/etc/xray/{cert,key}.pem, register
 // acme.sh cron for autonomous renewal. Inputs sanitized at the call-site.
-function buildAcmeSetupScript({ domain, email, nodeIp }) {
+function buildAcmeSetupScript({ domain, email, nodeIp, osFamily }) {
     const safe = (raw, allowed, max) => String(raw || '').replace(allowed, '').slice(0, max);
     const d = safe(domain, /[^A-Za-z0-9.\-]/g, 253);
     const e = safe(email, /[^A-Za-z0-9.\-_+@]/g, 254);
     const ip = safe(nodeIp, /[^A-Za-z0-9.:]/g, 45);
     if (!d) throw new Error('buildAcmeSetupScript: domain is required');
     if (!e) throw new Error('buildAcmeSetupScript: email is required');
+
+    const freebsd = osFamily === 'freebsd';
+    const port80Busy = freebsd
+        ? `sockstat -46l -P tcp -p 80 2>/dev/null | awk 'NR > 1' | grep -q .`
+        : `ss -tlnH 'sport = :80' 2>/dev/null | grep -q LISTEN`;
+    const port80Show = freebsd
+        ? `sockstat -46l -P tcp -p 80 2>/dev/null || true`
+        : `ss -tlnp 'sport = :80' 2>/dev/null || true`;
+    const ensureCurl = freebsd
+        ? `    if ! command -v curl >/dev/null 2>&1; then
+        pkg install -y curl
+    fi`
+        : `    if ! command -v curl &> /dev/null; then
+        apt-get update && apt-get install -y curl || yum install -y curl || apk add --no-cache curl
+    fi`;
+    const reloadXray = freebsd
+        ? `service xray restart >/dev/null 2>&1 || true`
+        : `systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true`;
 
     return `#!/bin/bash
 set -e
@@ -946,17 +1144,15 @@ if [ "\${RESOLVED}" != "\${NODE_IP}" ] && [ -n "\${NODE_IP}" ]; then
 fi
 
 # Pre-flight 2: port 80 must be free for HTTP-01 standalone.
-if ss -tlnH 'sport = :80' 2>/dev/null | grep -q LISTEN; then
+if ${port80Busy}; then
     echo "ERROR: Port 80 is busy on the node. Stop the listener (nginx/apache/caddy/etc.) and retry."
-    ss -tlnp 'sport = :80' 2>/dev/null || true
+    ${port80Show}
     exit 12
 fi
 
 if [ ! -f "\${HOME}/.acme.sh/acme.sh" ]; then
     echo "Installing acme.sh..."
-    if ! command -v curl &> /dev/null; then
-        apt-get update && apt-get install -y curl || yum install -y curl || apk add --no-cache curl
-    fi
+${ensureCurl}
     curl -fsSL https://get.acme.sh | sh -s email="\${EMAIL}" >/dev/null 2>&1 || {
         echo "ERROR: acme.sh installer failed."
         exit 13
@@ -982,7 +1178,7 @@ mkdir -p /usr/local/etc/xray
 # unprivileged service to read the key. Re-applied via --reloadcmd on renewal.
 # 'nobody' primary group differs by distro (nogroup on Debian/Ubuntu).
 NOBODY_GROUP="\$(id -gn nobody 2>/dev/null || echo nobody)"
-RELOAD_CMD="chown 'nobody:\${NOBODY_GROUP}' '\${KEY_PATH}' '\${CERT_PATH}' 2>/dev/null || true; chmod 644 '\${CERT_PATH}' 2>/dev/null || true; chmod 600 '\${KEY_PATH}' 2>/dev/null || true; systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true"
+RELOAD_CMD="chown 'nobody:\${NOBODY_GROUP}' '\${KEY_PATH}' '\${CERT_PATH}' 2>/dev/null || true; chmod 644 '\${CERT_PATH}' 2>/dev/null || true; chmod 600 '\${KEY_PATH}' 2>/dev/null || true; ${reloadXray}"
 
 "\${ACME}" --install-cert -d "\${DOMAIN}" --ecc \\
     --key-file       "\${KEY_PATH}" \\
@@ -1070,6 +1266,23 @@ async function setupXrayNode(node, options = {}) {
         conn = await connectSSH(node);
         log('SSH connected');
 
+        const osFamily = await detectOsFamily(conn, node);
+        log(`Detected OS family: ${osFamily}`);
+        if (osFamily === 'freebsd') {
+            // Every script below runs as `$SHELL -c`; csh cannot parse POSIX sh.
+            const shellResult = await execSSH(conn, 'echo "$SHELL"');
+            const loginShell = String(shellResult.output || '').trim().split('\n')[0];
+            if (/csh$/.test(loginShell)) {
+                throw new Error(`Login shell on the node is ${loginShell}; set it to /bin/sh (chsh -s /bin/sh ${node.ssh?.username || 'root'}) and retry.`);
+            }
+            if (exitOnly) {
+                throw new Error('Cascade bridge/exit nodes are not supported on FreeBSD (xray-bridge is a systemd unit).');
+            }
+            if ((node.xray || {}).front?.enabled) {
+                throw new Error('Reverse proxy front (Caddy) is not supported on FreeBSD nodes — turn the front off.');
+            }
+        }
+
         await runInitScript(conn, node, log, logs);
 
         if (!exitOnly) {
@@ -1078,7 +1291,7 @@ async function setupXrayNode(node, options = {}) {
             // the inbound never binds. Fail here, with the owner in the message.
             const portsToCheck = collectExternalListenPorts(node);
             if (portsToCheck.length > 0) {
-                const busyResult = await execSSH(conn, `
+                const busyResult = await execSSH(conn, osFamily === 'freebsd' ? buildFreebsdBusyPortsScript(portsToCheck) : `
 for p in ${portsToCheck.join(' ')}; do
     owner=$(ss -Hltnp "sport = :$p" 2>/dev/null | grep -v '"xray"' | head -1)
     [ -n "$owner" ] && echo "BUSY $p $owner"
@@ -1094,7 +1307,7 @@ exit 0`);
 
         // Install Xray
         log('Installing Xray-core...');
-        const installResult = await execSSH(conn, XRAY_INSTALL_SCRIPT);
+        const installResult = await execSSH(conn, osFamily === 'freebsd' ? XRAY_INSTALL_SCRIPT_FREEBSD : XRAY_INSTALL_SCRIPT);
         logs.push(installResult.output);
         if (!installResult.success) {
             throw new Error(`Xray installation failed: ${installResult.error}`);
@@ -1234,7 +1447,7 @@ fi
                 throw new Error('tlsSource=acme requires acmeEmail (or the panel-wide ACME_EMAIL env var).');
             }
             log(`TLS source: acme — installing acme.sh and issuing LE cert for ${domain}...`);
-            const acmeScript = buildAcmeSetupScript({ domain, email, nodeIp: node.ip });
+            const acmeScript = buildAcmeSetupScript({ domain, email, nodeIp: node.ip, osFamily });
             const acmeResult = await execSSH(conn, acmeScript);
             logs.push(acmeResult.output);
             if (!acmeResult.success) {
@@ -1267,7 +1480,9 @@ fi
         }
         const allPorts = [...new Set(externalPorts)];
 
-        log(`Opening external firewall ports (${allPorts.join(', ') || 'none'}, api:${apiPort} local)...`);
+        log(osFamily === 'freebsd'
+            ? `FreeBSD: skipping host firewall (no pf/ipfw managed by the panel); ports ${allPorts.join(', ') || 'none'} must be reachable`
+            : `Opening external firewall ports (${allPorts.join(', ') || 'none'}, api:${apiPort} local)...`);
         const portRules = allPorts.map(p => `
     iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null || true`).join('');
@@ -1277,7 +1492,9 @@ fi
 
         const firewalldRules = allPorts.map(p => `
     firewall-cmd --permanent --add-port=${p}/tcp >/dev/null 2>&1 || true`).join('');
-        const firewallResult = await execSSH(conn, `
+        const firewallResult = osFamily === 'freebsd'
+            ? { output: 'FreeBSD: firewall step skipped' }
+            : await execSSH(conn, `
 echo "=== Opening firewall ports ==="
 if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then${firewalldRules}
     firewall-cmd --reload >/dev/null 2>&1 || true
@@ -1293,14 +1510,18 @@ ${IPTABLES_SAVE_SNIPPET}
 echo "Done: Firewall configured"
         `);
         logs.push(firewallResult.output);
-        log('Firewall configured');
+        log(osFamily === 'freebsd' ? 'Firewall step skipped' : 'Firewall configured');
 
         if (restartService) {
-            log('Installing systemd service and starting Xray...');
-            const serviceContent = configGenerator.generateXraySystemdService();
-            await uploadFile(conn, serviceContent, '/etc/systemd/system/xray.service');
+            if (osFamily === 'freebsd') {
+                log('Enabling rc.d service and starting Xray...');
+            } else {
+                log('Installing systemd service and starting Xray...');
+                const serviceContent = configGenerator.generateXraySystemdService();
+                await uploadFile(conn, serviceContent, '/etc/systemd/system/xray.service');
+            }
             const verifyPorts = xrayConfig.front?.enabled ? [] : collectExternalListenPorts(node);
-            const restartResult = await execSSH(conn, `
+            const restartResult = await execSSH(conn, osFamily === 'freebsd' ? buildFreebsdXrayStartScript(verifyPorts) : `
 echo "=== Starting Xray service ==="
 systemctl daemon-reload
 systemctl enable xray
@@ -1354,7 +1575,7 @@ async function checkXrayNodeStatus(node) {
     try {
         const conn = await connectSSH(node);
         try {
-            const result = await execSSH(conn, 'systemctl is-active xray');
+            const result = await execSSH(conn, buildServiceCommand(nodeOsFamily(node), 'is-active', 'xray'));
             return result.output.trim() === 'active' ? 'online' : 'offline';
         } finally {
             conn.end();
@@ -1371,7 +1592,7 @@ async function getXrayNodeLogs(node, lines = 50) {
     try {
         const conn = await connectSSH(node);
         try {
-            const result = await execSSH(conn, `journalctl -u xray -n ${lines} --no-pager`);
+            const result = await execSSH(conn, buildXrayLogsCommand(nodeOsFamily(node), lines));
             return { success: true, logs: result.output };
         } finally {
             conn.end();
@@ -1461,10 +1682,13 @@ async function installCCAgent(conn, node, token, panelSource, sameVps, log) {
 
     const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls);
     const configJson = JSON.stringify(agentConfig, null, 2);
+    const osFamily = nodeOsFamily(node);
 
     // Build firewall rules based on setup type
     let firewallRules = '';
-    if (sameVps) {
+    if (osFamily === 'freebsd') {
+        firewallRules = 'echo "FreeBSD: host firewall not managed by the panel, skipping agent port rules"';
+    } else if (sameVps) {
         firewallRules = `
 echo "Same-VPS setup: allowing loopback and Docker networks"
 if command -v iptables &> /dev/null; then
@@ -1500,13 +1724,22 @@ fi`;
     }
 
     // Persist iptables rules across reboots
-    if (firewallRules && !firewallRules.includes('WARNING')) {
+    if (osFamily !== 'freebsd' && firewallRules && !firewallRules.includes('WARNING')) {
         firewallRules += '\n' + IPTABLES_SAVE_SNIPPET;
     }
 
     // Step 1: Download binary
     log('Downloading cc-agent binary...');
-    const downloadResult = await execSSH(conn, `
+    let freebsdDownloadScript = '';
+    if (osFamily === 'freebsd') {
+        freebsdDownloadScript = buildFreebsdAgentDownloadScript(process.env.CC_AGENT_FREEBSD_URL);
+        if (!freebsdDownloadScript) {
+            const msg = 'CC_AGENT_FREEBSD_URL is not set (or is not an http(s) URL) — point it at a freebsd/amd64 cc-agent binary built by cc-agent/build.sh';
+            log(`ERROR: ${msg}`);
+            return { success: false, agentVersion: '', output: msg };
+        }
+    }
+    const downloadResult = await execSSH(conn, freebsdDownloadScript || `
 rm -f /usr/local/bin/cc-agent
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
@@ -1553,8 +1786,7 @@ echo "OK: TLS cert generated"
         log('TLS certificate ready');
     }
 
-    // Step 4: Install systemd service
-    log('Installing systemd service...');
+    // Step 4: Install service (systemd unit / rc.d script)
     const serviceUnit = `[Unit]
 Description=CC Xray Agent
 After=network.target xray.service
@@ -1570,12 +1802,32 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 `;
-    await uploadFile(conn, serviceUnit, '/etc/systemd/system/cc-agent.service');
-    log('Service unit installed');
+    if (osFamily === 'freebsd') {
+        log('Installing rc.d service...');
+        await uploadFile(conn, buildCcAgentRcScript(), '/usr/local/etc/rc.d/cc_agent');
+        await execSSH(conn, 'chmod 755 /usr/local/etc/rc.d/cc_agent');
+        log('rc.d script installed');
+    } else {
+        log('Installing systemd service...');
+        await uploadFile(conn, serviceUnit, '/etc/systemd/system/cc-agent.service');
+        log('Service unit installed');
+    }
 
     // Step 5: Firewall + start service
     log('Configuring firewall and starting service...');
-    const startResult = await execSSH(conn, `
+    const startResult = await execSSH(conn, osFamily === 'freebsd' ? `
+${firewallRules}
+sysrc cc_agent_enable=YES
+service cc_agent restart
+sleep 2
+if service cc_agent status >/dev/null 2>&1; then
+    echo "OK: cc-agent running"
+    /usr/local/bin/cc-agent -version 2>/dev/null || true
+else
+    echo "ERROR: cc-agent failed to start"
+    grep -i cc-agent /var/log/messages 2>/dev/null | tail -n 10 || true
+fi
+` : `
 ${firewallRules}
 systemctl daemon-reload
 systemctl enable cc-agent
@@ -1791,8 +2043,14 @@ async function reloadCcAgent(node, ssh) {
     // so the caller (syncService) can immediately POST /restart to it without
     // racing the bring-up. The loop polls for up to ~5 s and exits 0 as soon
     // as the unit is active again, exit 1 on timeout.
-    const waitResult = await ssh.exec(
-        'systemctl restart cc-agent && '
+    const waitResult = await ssh.exec(nodeOsFamily(node) === 'freebsd'
+        ? 'service cc_agent restart && '
+        + 'for i in 1 2 3 4 5; do '
+        + '  service cc_agent status >/dev/null 2>&1 && exit 0; '
+        + '  sleep 1; '
+        + 'done; '
+        + 'exit 1'
+        : 'systemctl restart cc-agent && '
         + 'for i in 1 2 3 4 5; do '
         + '  systemctl is-active cc-agent >/dev/null 2>&1 && exit 0; '
         + '  sleep 1; '
@@ -2058,4 +2316,18 @@ module.exports = {
     checkMieruNodeStatus,
     getMieruNodeLogs,
     isLoopbackAddress,
+    normalizeOsFamily,
+    nodeOsFamily,
+    detectOsFamily,
+    buildServiceCommand,
+    buildRuntimeStopScript,
+    buildRuntimeStartScript,
+    buildXrayLogsCommand,
+    buildFreebsdBusyPortsScript,
+    buildFreebsdXrayStartScript,
+    buildFreebsdAgentDownloadScript,
+    buildCcAgentRcScript,
+    buildAcmeSetupScript,
+    XRAY_INSTALL_SCRIPT,
+    XRAY_INSTALL_SCRIPT_FREEBSD,
 };

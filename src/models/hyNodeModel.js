@@ -552,6 +552,9 @@ const hyNodeSchema = new mongoose.Schema({
     lastError: { type: String, default: '' },
     lastSync: { type: Date, default: null },
 
+    // Detected by Xray auto-setup (`uname -s`); selects service/package commands.
+    osFamily: { type: String, enum: ['linux', 'freebsd'], default: 'linux' },
+
     // Agent & Xray version info (populated by health checks)
     xrayVersion: { type: String, default: '' },
     agentVersion: { type: String, default: '' },
