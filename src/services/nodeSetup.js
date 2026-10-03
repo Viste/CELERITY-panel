@@ -1097,8 +1097,8 @@ fi
 echo "Done: Xray installed ($(/usr/local/bin/xray version | head -1))"
 
 # The pkg ships no geo data; routing rules (geoip:private) need geoip.dat next
-# to the binary for `xray run -test` and via XRAY_LOCATION_ASSET for the rc.d run.
-ASSET=/usr/local/share/xray
+# to the binary for the config test and in the rc.d asset dir for the service.
+ASSET=/usr/local/share/xray-core
 mkdir -p "$ASSET"
 if [ ! -s "$ASSET/geoip.dat" ] || [ ! -s "$ASSET/geosite.dat" ]; then
     if ASSUME_ALWAYS_YES=yes pkg install -y v2ray-geoip v2ray-geosite >/dev/null 2>&1; then
@@ -1115,7 +1115,6 @@ fi
 [ -s "$ASSET/geoip.dat" ] || { echo "ERROR: geoip.dat missing"; exit 1; }
 ln -sf "$ASSET/geoip.dat" /usr/local/bin/geoip.dat
 ln -sf "$ASSET/geosite.dat" /usr/local/bin/geosite.dat
-sysrc xray_env="XRAY_LOCATION_ASSET=$ASSET" >/dev/null
 
 mkdir -p /usr/local/etc/xray /var/log/xray
 echo "Done: Directory /usr/local/etc/xray ready"
