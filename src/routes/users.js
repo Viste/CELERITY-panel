@@ -721,4 +721,35 @@ router.post('/sync-from-main', requireScope('users:write'), async (req, res) => 
     }
 });
 
+/**
+ * POST /users/:id/app-password — set (or generate) the mobile-app password.
+ * The plaintext is returned exactly once; only the scrypt hash is stored.
+ */
+router.post('/:id/app-password', requireScope('users:write'), async (req, res) => {
+    try {
+        const { hashPassword, generatePassword } = require('../utils/appPassword');
+        const user = await HyUser.findById(req.params.id).select('userId');
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        const plain = (typeof req.body?.password === 'string' && req.body.password) ? req.body.password : generatePassword();
+        let hash;
+        try { hash = hashPassword(plain); } catch (e) { return res.status(400).json({ error: e.message }); }
+        await HyUser.updateOne({ _id: user._id }, { $set: { appPasswordHash: hash, appPasswordSetAt: new Date() } });
+        logger.info(`[Users API] App password set for ${user.userId}`);
+        res.json({ success: true, userId: user.userId, password: plain });
+    } catch (error) {
+        logger.error(`[Users API] App password error: ${error.message}`);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.delete('/:id/app-password', requireScope('users:write'), async (req, res) => {
+    try {
+        const r = await HyUser.updateOne({ _id: req.params.id }, { $set: { appPasswordHash: '', appPasswordSetAt: null } });
+        if (!r.matchedCount) return res.status(404).json({ error: 'User not found' });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 module.exports = router;

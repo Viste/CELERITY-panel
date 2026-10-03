@@ -181,6 +181,7 @@ app.get('/health', async (req, res) => {
 // ==================== API ROUTES ====================
 
 app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/client', authLimiter, require('./src/routes/client'));
 
 const Admin = require('./src/models/adminModel');
 const totpService = require('./src/services/totpService');

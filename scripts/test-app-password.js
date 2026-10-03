@@ -1,0 +1,22 @@
+const assert = require('assert');
+const { generatePassword, hashPassword, verifyPassword } = require('../src/utils/appPassword');
+const pw = generatePassword();
+assert.strictEqual(pw.length, 12);
+assert.ok(/^[A-Za-z0-9]+$/.test(pw));
+const h = hashPassword(pw);
+assert.ok(h.startsWith('scrypt$16384$'));
+assert.strictEqual(h.split('$').length, 4);
+assert.ok(verifyPassword(pw, h));
+assert.ok(!verifyPassword(pw + 'x', h));
+assert.ok(!verifyPassword('', h));
+assert.ok(!verifyPassword(pw, ''));
+assert.ok(!verifyPassword(pw, 'plaintext'));
+assert.ok(!verifyPassword(pw, 'scrypt$512$AAAA$BBBB'));
+assert.notStrictEqual(hashPassword(pw), h, 'salted');
+assert.throws(() => hashPassword('short'));
+assert.throws(() => hashPassword('x'.repeat(129)));
+// client route: module loads and exposes a router with /login
+process.env.PANEL_DOMAIN = process.env.PANEL_DOMAIN || 'test.local'; process.env.ACME_EMAIL = process.env.ACME_EMAIL || 't@t'; process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '0123456789abcdef0123456789abcdef'; process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'x';
+const router = require('../src/routes/client');
+assert.ok(router.stack.some(l => l.route && l.route.path === '/login' && l.route.methods.post));
+console.log('app password tests passed');

@@ -115,6 +115,11 @@ const hyUserSchema = new mongoose.Schema({
     lastSubFetchAt: { type: Date, default: null },
     lastSubUserAgent: { type: String, default: '' },
 
+    // Login for the mobile app (scrypt hash, see utils/appPassword.js).
+    // select:false — never returned by list/get routes.
+    appPasswordHash: { type: String, default: '', select: false },
+    appPasswordSetAt: { type: Date, default: null },
+
     /**
      * Marks a hidden user owned by a diagnostic probe. Such users are excluded
      * from listings and statistics, but still take part in node sync and
