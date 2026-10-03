@@ -2098,7 +2098,7 @@ async function reloadCcAgent(node, ssh) {
 // Pinned version of mita installed by the panel. Bumping here is enough — the
 // install script detects already-present binaries and skips when found, so
 // existing nodes are not disturbed by a panel-side version bump.
-const MITA_VERSION = '3.33.0';
+const MITA_VERSION = process.env.MITA_VERSION || '3.38.0';
 
 /**
  * Build the install-or-detect shell script for mita. The script:
@@ -2141,12 +2141,17 @@ case "$ARCH" in
     *) echo "ERROR: unsupported arch $ARCH"; exit 1 ;;
 esac
 
-# --- adopt path: skip install if mita already wired into systemd ---
+# --- adopt path: keep an existing mita only when it matches the pinned version ---
+INSTALLED_VER=""
 if command -v mita >/dev/null 2>&1 \\
    && systemctl list-unit-files mita.service --no-legend 2>/dev/null | grep -q .; then
-    INSTALLED_VER=$(mita help 2>&1 | head -3 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1 || echo unknown)
-    echo "OK: mita already installed (version $INSTALLED_VER) — skipping download"
+    INSTALLED_VER=$(mita version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1 || echo unknown)
+fi
+if [ "$INSTALLED_VER" = "$MITA_VERSION" ]; then
+    echo "OK: mita $INSTALLED_VER already installed — skipping download"
 else
+    [ -n "$INSTALLED_VER" ] && echo "mita $INSTALLED_VER installed, pinned $MITA_VERSION — upgrading"
+
     echo "Installing mita $MITA_VERSION ($PKG_MGR/$PKG_EXT, $ARCH)..."
     cd /tmp
     if [ "$PKG_EXT" = "rpm" ]; then
