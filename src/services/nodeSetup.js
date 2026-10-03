@@ -1096,6 +1096,27 @@ else
 fi
 echo "Done: Xray installed ($(/usr/local/bin/xray version | head -1))"
 
+# The pkg ships no geo data; routing rules (geoip:private) need geoip.dat next
+# to the binary for `xray run -test` and via XRAY_LOCATION_ASSET for the rc.d run.
+ASSET=/usr/local/share/xray
+mkdir -p "$ASSET"
+if [ ! -s "$ASSET/geoip.dat" ] || [ ! -s "$ASSET/geosite.dat" ]; then
+    if ASSUME_ALWAYS_YES=yes pkg install -y v2ray-geoip v2ray-geosite >/dev/null 2>&1; then
+        for f in $(pkg info -l v2ray-geoip v2ray-geosite 2>/dev/null | grep -E '\.dat$'); do
+            ln -sf "$f" "$ASSET/$(basename "$f")"
+        done
+        echo "Done: geo data from pkg"
+    else
+        fetch -q -o "$ASSET/geoip.dat" https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+        fetch -q -o "$ASSET/geosite.dat" https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+        echo "Done: geo data fetched from GitHub"
+    fi
+fi
+[ -s "$ASSET/geoip.dat" ] || { echo "ERROR: geoip.dat missing"; exit 1; }
+ln -sf "$ASSET/geoip.dat" /usr/local/bin/geoip.dat
+ln -sf "$ASSET/geosite.dat" /usr/local/bin/geosite.dat
+sysrc xray_env="XRAY_LOCATION_ASSET=$ASSET" >/dev/null
+
 mkdir -p /usr/local/etc/xray /var/log/xray
 echo "Done: Directory /usr/local/etc/xray ready"
 `;
