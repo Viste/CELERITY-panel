@@ -534,8 +534,13 @@ exit 0`;
 function buildFreebsdXrayStartScript(verifyPorts) {
     return `
 echo "=== Starting Xray service (rc.d) ==="
+# The pkg rc script runs xray as user v2ray with -confdir: point it at the
+# directory and let that user bind :443 (FreeBSD reserves ports < 1024).
 sysrc xray_enable=YES
-sysrc xray_config=/usr/local/etc/xray/config.json
+sysrc xray_config=/usr/local/etc/xray
+sysctl net.inet.ip.portrange.reservedhigh=0 >/dev/null
+grep -q '^net.inet.ip.portrange.reservedhigh=' /etc/sysctl.conf 2>/dev/null || echo 'net.inet.ip.portrange.reservedhigh=0' >> /etc/sysctl.conf
+chmod 644 /usr/local/etc/xray/config.json 2>/dev/null || true
 service xray restart
 sleep 2
 echo "Service status:"

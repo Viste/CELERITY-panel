@@ -82,7 +82,8 @@ assert.ok(nodeSetup.XRAY_INSTALL_SCRIPT.startsWith('#!/bin/bash'), 'linux instal
 const start = nodeSetup.buildFreebsdXrayStartScript([443, 8443]);
 assertPosixNoSystemd(start, 'freebsd xray start script');
 assert.ok(start.includes('sysrc xray_enable=YES'));
-assert.ok(start.includes('sysrc xray_config=/usr/local/etc/xray/config.json'));
+assert.ok(start.includes('sysrc xray_config=/usr/local/etc/xray\n'));
+assert.ok(start.includes('net.inet.ip.portrange.reservedhigh=0'));
 assert.ok(start.indexOf('sysrc xray_enable=YES') < start.indexOf('service xray restart'));
 assert.ok(start.includes('service xray status'));
 assert.ok(start.includes('for p in 443 8443; do'));
