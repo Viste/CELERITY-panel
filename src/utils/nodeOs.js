@@ -41,7 +41,7 @@ PS=$(sysctl -n hw.pagesize); T=$(sysctl -n hw.physmem)
 F=$(( ( $(sysctl -n vm.stats.vm.v_free_count) + $(sysctl -n vm.stats.vm.v_inactive_count) ) * PS ))
 echo "Mem: $T $(( T - F )) $F"
 echo "===DISK==="
-df -k / | tail -1 | awk '{printf "%s %d %d %d %s %s\n", $1, $2*1024, $3*1024, $4*1024, $5, $6}'
+df -k / | tail -1 | awk '{printf "%s %d %d %d %s %s\\n", $1, $2*1024, $3*1024, $4*1024, $5, $6}'
 echo "===UPTIME==="
 echo $(( $(date +%s) - $(sysctl -n kern.boottime | awk -F'[ =,]+' '{print $3}') ))
 `;
@@ -63,7 +63,7 @@ cat /proc/uptime | cut -d' ' -f1
 }
 function buildNetStatsCommand(osFamily) {
     if (osFamily === 'freebsd') {
-        return `IF=$(route -n get default | awk '/interface:/{print $2}'); netstat -ibn -I "$IF" | awk -v i="$IF" '/<Link/ {printf "%s: %d 0 0 0 0 0 0 0 %d\n", i, $8, $11}'`;
+        return `IF=$(route -n get default | awk '/interface:/{print $2}'); netstat -ibn -I "$IF" | awk -v i="$IF" '/<Link/ {printf "%s: %d 0 0 0 0 0 0 0 %d\\n", i, $8, $11}'`;
     }
     return `cat /proc/net/dev | grep -E '(eth|ens|enp|eno)' | head -1`;
 }
