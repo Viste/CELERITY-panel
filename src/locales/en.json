@@ -1727,7 +1727,7 @@
     "serverDisk": "Disk",
     "serverDiskFree": "Free",
     "usersTitle": "Users",
-    "usersDesc": "Who is on which server right now, which app fetches their subscription and how much traffic went through in the selected period. \"Online now\" means traffic within the last 10 minutes.",
+    "usersDesc": "Who is on which server right now, which app fetches their subscription and how much traffic went through in the selected period. \"Online now\" means traffic within the last 10 minutes. The counter at the top of the page counts connections, not people: one person can be on several servers at once. A pale dashed label means only background traffic on that server (the client checks connectivity), a green one means real use.",
     "usersOnlineOnly": "Online only",
     "user": "User",
     "usersOnlineNow": "Online now",
@@ -1744,9 +1744,13 @@
     "usersSummaryOnline": "online",
     "usersSummaryNoClient": "no app in 30 days",
     "usersMatrixTitle": "Who is on which server",
-    "usersMatrixDesc": "Traffic of every user per server in the selected period. A green dot means the user is on that server now. For mieru, periods shorter than a day are shown as one day.",
+    "usersMatrixDesc": "Traffic of every user per server in the selected period. A green dot means the user is really on that server now. For mieru, periods shorter than a day are shown as one day.",
     "usersNoActivity": "No activity data yet: it accumulates from the moment the panel was updated",
-    "usersTotal": "Total"
+    "usersTotal": "Total",
+    "usersConnections": "connections",
+    "usersConnectionsHint": "User + server pairs with traffic in the last 10 minutes, mieru included. The counter at the top of the page is the same without mieru.",
+    "usersActive": "with real traffic",
+    "usersBackgroundHint": "Less than 100 KB in the last poll: the client checks connectivity, the server is not in use"
   },
   "apiKeys": {
     "title": "API Keys",

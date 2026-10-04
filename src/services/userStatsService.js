@@ -14,6 +14,9 @@ const PERIOD_HOURS = { '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 };
 const PERIOD_WINDOW = { '1h': 'd1', '6h': 'd1', '24h': 'd1', '7d': 'd7', '30d': 'd30' };
 // The poll runs every 5 minutes: "online" means traffic in one of the last two polls.
 const ONLINE_WINDOW_MS = 11 * 60 * 1000;
+// Clients probe every server of the subscription in the background. Less than this in the last
+// poll is shown as background, not as the server the user is really on.
+const BACKGROUND_BYTES = 100 * 1024;
 // A client counts for the summary if it fetched the subscription within this many days.
 const CLIENT_ACTIVE_DAYS = 30;
 
@@ -56,7 +59,7 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
     const cell = (userId, nodeId) => {
         if (!perUser.has(userId)) perUser.set(userId, new Map());
         const byNode = perUser.get(userId);
-        if (!byNode.has(nodeId)) byNode.set(nodeId, { tx: 0, rx: 0, lastSeen: null });
+        if (!byNode.has(nodeId)) byNode.set(nodeId, { tx: 0, rx: 0, lastSeen: null, lastDelta: null });
         return byNode.get(nodeId);
     };
     for (const row of hourly) {
@@ -65,7 +68,10 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
         const c = cell(row.userId, nodeId);
         c.tx += row.tx || 0;
         c.rx += row.rx || 0;
-        if (toTime(row.lastSeen) > toTime(c.lastSeen)) c.lastSeen = row.lastSeen;
+        if (toTime(row.lastSeen) > toTime(c.lastSeen)) {
+            c.lastSeen = row.lastSeen;
+            c.lastDelta = row.lastDelta ?? null;
+        }
     }
     for (const row of rolling) {
         const nodeId = String(row.node);
@@ -82,6 +88,10 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
     const clientCutoff = nowMs - CLIENT_ACTIVE_DAYS * 24 * HOUR_MS;
     let onlineUsers = 0;
     let withClient = 0;
+    let connections = 0;
+    let activeConnections = 0;
+    // mita reports no per-poll amount (lastDelta is null there): such a connection counts as active.
+    const isBackground = c => c.lastDelta != null && c.lastDelta < BACKGROUND_BYTES;
 
     const outUsers = users.map(user => {
         const byNodeMap = perUser.get(user.userId) || new Map();
@@ -94,10 +104,15 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
             tx += c.tx;
             rx += c.rx;
             if (toTime(c.lastSeen) >= nowMs - ONLINE_WINDOW_MS) {
-                online.push(nodeId);
+                const background = isBackground(c);
+                online.push({ node: nodeId, delta: c.lastDelta, background });
                 (onlineByNode[nodeId] = onlineByNode[nodeId] || []).push(user.userId);
+                connections++;
+                if (!background) activeConnections++;
             }
         }
+        // real use first, then by the amount of the last poll
+        online.sort((a, b) => (a.background - b.background) || ((b.delta ?? Infinity) - (a.delta ?? Infinity)));
         if (online.length > 0) onlineUsers++;
 
         const clients = userClients(user);
@@ -139,6 +154,8 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
         summary: {
             users: users.length,
             online: onlineUsers,
+            connections,
+            activeConnections,
             withClient,
             clients: clientTotals,
             onlineByNode,
@@ -160,14 +177,15 @@ class UserStatsService {
                 .lean(),
             UserNodeStat.aggregate([
                 { $match: { hour: { $gte: since } } },
-                { $group: { _id: { userId: '$userId', node: '$node' }, tx: { $sum: '$tx' }, rx: { $sum: '$rx' }, lastSeen: { $max: '$lastSeen' } } },
+                { $sort: { lastSeen: 1 } },
+                { $group: { _id: { userId: '$userId', node: '$node' }, tx: { $sum: '$tx' }, rx: { $sum: '$rx' }, lastSeen: { $max: '$lastSeen' }, lastDelta: { $last: '$lastDelta' } } },
             ]),
             UserNodeStat.find({ hour: null }).select('userId node windows lastSeen').lean(),
         ]);
         return buildOverview({
             users,
             nodes,
-            hourly: hourly.map(r => ({ userId: r._id.userId, node: r._id.node, tx: r.tx, rx: r.rx, lastSeen: r.lastSeen })),
+            hourly: hourly.map(r => ({ userId: r._id.userId, node: r._id.node, tx: r.tx, rx: r.rx, lastSeen: r.lastSeen, lastDelta: r.lastDelta })),
             rolling,
             period: p,
             now,
@@ -197,3 +215,4 @@ module.exports = new UserStatsService();
 module.exports.buildOverview = buildOverview;
 module.exports.userClients = userClients;
 module.exports.ONLINE_WINDOW_MS = ONLINE_WINDOW_MS;
+module.exports.BACKGROUND_BYTES = BACKGROUND_BYTES;

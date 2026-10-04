@@ -17,6 +17,8 @@ const userNodeStatSchema = new mongoose.Schema({
     rx: { type: Number, default: 0 },
     windows: { d1: windowSchema, d7: windowSchema, d30: windowSchema },
     lastSeen: { type: Date, default: null },
+    // xray: bytes moved in the most recent poll, to tell real use from keep-alive probes
+    lastDelta: { type: Number, default: null },
 }, { timestamps: false, versionKey: false });
 
 userNodeStatSchema.index({ userId: 1, node: 1, hour: 1 }, { unique: true });
@@ -41,7 +43,7 @@ userNodeStatSchema.statics.recordXray = async function (nodeId, entries, now = n
         ops.push({
             updateOne: {
                 filter: { userId, node: nodeId, hour },
-                update: { $inc: { tx, rx }, $set: { lastSeen: now } },
+                update: { $inc: { tx, rx }, $set: { lastSeen: now, lastDelta: tx + rx } },
                 upsert: true,
             },
         });

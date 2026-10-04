@@ -481,6 +481,7 @@
 .user-chip small { color: var(--text-muted); font-size: 11px; }
 .user-chip.chip-online { border-color: var(--success); background: var(--success-bg); color: var(--success); }
 .user-chip.chip-potato { border-color: var(--accent); color: var(--accent-hover); }
+.user-chip.chip-background { border-style: dashed; color: var(--text-muted); background: transparent; }
 .users-table td { vertical-align: middle; }
 .users-table .cell-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .users-table .user-name { font-weight: 600; color: var(--text-primary); text-decoration: none; }
@@ -547,6 +548,10 @@ const i18n = {
     usersSummaryNoClient: <%- JSON.stringify(t('stats.usersSummaryNoClient')) %>,
     usersNoActivity: <%- JSON.stringify(t('stats.usersNoActivity')) %>,
     usersTotal: <%- JSON.stringify(t('stats.usersTotal')) %>,
+    usersConnections: <%- JSON.stringify(t('stats.usersConnections')) %>,
+    usersConnectionsHint: <%- JSON.stringify(t('stats.usersConnectionsHint')) %>,
+    usersActive: <%- JSON.stringify(t('stats.usersActive')) %>,
+    usersBackgroundHint: <%- JSON.stringify(t('stats.usersBackgroundHint')) %>,
     user: <%- JSON.stringify(t('stats.user')) %>,
 };
 
@@ -1295,7 +1300,10 @@ function renderUsers() {
         && (!query || u.userId.toLowerCase().includes(query) || (u.username || '').toLowerCase().includes(query)));
 
     // summary chips
-    const chips = [`<span class="user-chip chip-online"><b>${data.summary.online}</b> / ${data.summary.users} ${escapeHtml(i18n.usersSummaryOnline)}</span>`];
+    const chips = [
+        `<span class="user-chip chip-online"><b>${data.summary.online}</b> / ${data.summary.users} ${escapeHtml(i18n.usersSummaryOnline)}</span>`,
+        `<span class="user-chip" title="${escapeHtml(i18n.usersConnectionsHint)}">${escapeHtml(i18n.usersConnections)} <b>${data.summary.connections}</b> · ${escapeHtml(i18n.usersActive)} <b>${data.summary.activeConnections}</b></span>`,
+    ];
     Object.entries(data.summary.clients).sort((a, b) => b[1] - a[1]).forEach(([key, count]) => {
         chips.push(`<span class="user-chip ${key.startsWith('potato') ? 'chip-potato' : ''}">${escapeHtml(CLIENT_LABELS[key] || key)} <b>${count}</b></span>`);
     });
@@ -1313,7 +1321,9 @@ function renderUsers() {
             const off = u.enabled ? '' : ` <span class="user-chip">${escapeHtml(i18n.usersDisabled)}</span>`;
             let where;
             if (u.online.length > 0) {
-                where = `<div class="cell-chips">${u.online.map(id => `<span class="user-chip chip-online">${escapeHtml(nodeLabel(id))}</span>`).join('')}</div>`;
+                where = `<div class="cell-chips">${u.online.map(o => o.background
+                    ? `<span class="user-chip chip-background" title="${escapeHtml(i18n.usersBackgroundHint)}">${escapeHtml(nodeLabel(o.node))}</span>`
+                    : `<span class="user-chip chip-online"${o.delta != null ? ` title="${escapeHtml(formatBytes(o.delta))} / 5 min"` : ''}>${escapeHtml(nodeLabel(o.node))}</span>`).join('')}</div>`;
             } else {
                 const last = Object.entries(u.byNode).filter(([, c]) => c.lastSeen).sort((a, b) => new Date(b[1].lastSeen) - new Date(a[1].lastSeen))[0];
                 where = last
@@ -1362,9 +1372,10 @@ function renderUsersMatrix(data, users) {
         const cells = data.nodes.map(n => {
             const c = u.byNode[n.id];
             const total = c ? c.tx + c.rx : 0;
-            if (!c || (total === 0 && !u.online.includes(n.id))) return '<td class="cell-empty">·</td>';
+            const live = u.online.find(o => o.node === n.id);
+            if (!c || (total === 0 && !live)) return '<td class="cell-empty">·</td>';
             totals[n.id] += total;
-            const online = u.online.includes(n.id);
+            const online = !!live && !live.background;
             // log scale: a few megabytes should still be visible next to gigabytes
             const alpha = total > 0 ? (0.08 + 0.42 * Math.log1p(total) / Math.log1p(max)).toFixed(2) : 0;
             const title = `↑ ${formatBytes(c.tx)}  ↓ ${formatBytes(c.rx)}${c.lastSeen ? '  ·  ' + timeAgo(c.lastSeen) : ''}`;

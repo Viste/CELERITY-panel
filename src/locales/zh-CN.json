@@ -1727,7 +1727,7 @@
     "serverDisk": "磁盘",
     "serverDiskFree": "可用",
     "usersTitle": "用户",
-    "usersDesc": "谁正在使用哪台服务器、用哪个应用获取订阅，以及所选时段内的流量。“当前在线”指最近 10 分钟内有流量。",
+    "usersDesc": "谁正在使用哪台服务器、用哪个应用获取订阅，以及所选时段内的流量。“当前在线”指最近 10 分钟内有流量。页面顶部的计数是连接数而非人数：一个人可能同时连接多台服务器。虚线浅色标签表示该服务器上只有后台流量（客户端在检测连通性），绿色表示正在实际使用。",
     "usersOnlineOnly": "仅在线",
     "user": "用户",
     "usersOnlineNow": "当前在线",
@@ -1744,9 +1744,13 @@
     "usersSummaryOnline": "在线",
     "usersSummaryNoClient": "30 天内无应用",
     "usersMatrixTitle": "谁在哪台服务器",
-    "usersMatrixDesc": "所选时段内每个用户在各服务器上的流量。绿点表示用户当前在该服务器上。mieru 节点不足一天的时段按一天显示。",
+    "usersMatrixDesc": "所选时段内每个用户在各服务器上的流量。绿点表示用户当前正在实际使用该服务器。mieru 节点不足一天的时段按一天显示。",
     "usersNoActivity": "暂无活动数据：从面板更新后开始累计",
-    "usersTotal": "合计"
+    "usersTotal": "合计",
+    "usersConnections": "连接数",
+    "usersConnectionsHint": "最近 10 分钟内有流量的“用户 + 服务器”组合，包含 mieru。页面顶部的计数不含 mieru。",
+    "usersActive": "有实际流量",
+    "usersBackgroundHint": "最近一次轮询不足 100 KB：客户端在检测连通性，未实际使用该服务器"
   },
   "apiKeys": {
     "title": "API 密钥",

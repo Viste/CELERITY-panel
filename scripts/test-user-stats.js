@@ -73,7 +73,7 @@ const overview = buildOverview({
     users,
     nodes,
     hourly: [
-        { userId: 'viste', node: 'n1', tx: 100, rx: 900, lastSeen: minutesAgo(3) },
+        { userId: 'viste', node: 'n1', tx: 100, rx: 900, lastSeen: minutesAgo(3), lastDelta: 5 * 1024 * 1024 },
         { userId: 'Uncle', node: 'n1', tx: 5, rx: 50, lastSeen: minutesAgo(40) },
         { userId: 'viste', node: 'gone', tx: 1, rx: 1, lastSeen: minutesAgo(1) },
     ],
@@ -88,7 +88,7 @@ assert.strictEqual(overview.period, '24h');
 assert.deepStrictEqual(overview.nodes.map(n => n.id), ['n1', 'n2']);
 assert.deepStrictEqual(overview.users.map(u => u.userId), ['viste', 'Uncle', 'idle'], 'online first, then by traffic');
 const [viste, uncle, idle] = overview.users;
-assert.deepStrictEqual(viste.online, ['n1']);
+assert.deepStrictEqual(viste.online, [{ node: 'n1', delta: 5 * 1024 * 1024, background: false }]);
 assert.deepStrictEqual(viste.traffic, { tx: 107, rx: 970 });
 assert.deepStrictEqual(viste.byNode.n2, { tx: 7, rx: 70, lastSeen: minutesAgo(200) });
 assert.strictEqual(viste.byNode.gone, undefined, 'inactive nodes are left out');
@@ -97,13 +97,31 @@ assert.strictEqual(viste.hasAppPassword, true);
 assert.strictEqual(viste.potatoAt.getTime(), minutesAgo(30).getTime(), 'the later of login and potato fetch');
 assert.strictEqual(uncle.potatoAt.getTime(), minutesAgo(90).getTime(), 'a potato fetch counts without a recorded login');
 assert.strictEqual(idle.potatoAt, null);
-assert.deepStrictEqual(uncle.online, ['n2']);
+assert.deepStrictEqual(uncle.online, [{ node: 'n2', delta: null, background: false }], 'mieru has no per-poll amount and counts as active');
 assert.deepStrictEqual(uncle.clients.map(c => c.key), ['potato-android'], 'falls back to the last user agent');
 assert.strictEqual(idle.enabled, false);
 assert.deepStrictEqual(idle.clients, []);
 assert.deepStrictEqual(overview.summary.clients, { 'potato-ios': 1, 'potato-android': 1 }, 'a client older than 30 days is not counted');
 assert.deepStrictEqual(overview.summary.onlineByNode, { n1: ['viste'], n2: ['Uncle'] });
 assert.strictEqual(overview.summary.online, 2);
+assert.strictEqual(overview.summary.connections, 2);
+assert.strictEqual(overview.summary.activeConnections, 2);
+
+// probes: a user with real traffic on one server and keep-alive checks on two more
+const probing = buildOverview({
+    users: [{ userId: 'multi', username: 'multi', enabled: true }],
+    nodes: [...nodes, { _id: 'n3', name: 'NL-Mimir', type: 'xray' }],
+    hourly: [
+        { userId: 'multi', node: 'n3', tx: 10, rx: 10, lastSeen: minutesAgo(2), lastDelta: 30 * 1024 },
+        { userId: 'multi', node: 'n1', tx: 10, rx: 10, lastSeen: minutesAgo(2), lastDelta: 40 * 1024 * 1024 },
+        { userId: 'multi', node: 'n2', tx: 10, rx: 10, lastSeen: minutesAgo(2) },
+    ],
+    rolling: [], period: '1h', now,
+});
+assert.deepStrictEqual(probing.users[0].online.map(o => [o.node, o.background]), [['n2', false], ['n1', false], ['n3', true]], 'real use first, background last');
+assert.strictEqual(probing.summary.online, 1);
+assert.strictEqual(probing.summary.connections, 3);
+assert.strictEqual(probing.summary.activeConnections, 2);
 assert.strictEqual(overview.summary.withClient, 2);
 assert.strictEqual(overview.summary.users, 3);
 
