@@ -1145,7 +1145,19 @@
     "hwidEnforceFrom": "开始强制 HWID 限制",
     "hwidEnforceFromHint": "可选。在此时间之前，新 HWID 会被记录但不会被阻止。留空 = HWID 适用时立即强制。",
     "confirmUnlinkHwid": "移除此 HWID 注册？",
-    "confirmUnlinkAllHwid": "移除此用户的所有 HWID 注册？"
+    "confirmUnlinkAllHwid": "移除此用户的所有 HWID 注册？",
+    "appTitle": "Potato 应用",
+    "appPasswordIssued": "密码签发于",
+    "appPasswordNone": "尚未签发应用登录密码。",
+    "appPasswordIssue": "签发密码",
+    "appPasswordReissue": "重新签发密码",
+    "appPasswordClear": "清除密码",
+    "appPasswordOnce": "密码仅显示一次，面板只保存其哈希。请复制并发送给用户。",
+    "appPasswordConfirmReissue": "签发新密码？旧密码将无法再用于登录。已登录的设备继续可用。",
+    "appPasswordConfirmClear": "清除密码？在签发新密码之前将无法重新登录应用。已登录的设备继续可用。",
+    "appPasswordLogin": "登录名",
+    "appPasswordPassword": "密码",
+    "appPasswordCopied": "登录名和密码已复制"
   },
   "groups": {
     "title": "服务器组",

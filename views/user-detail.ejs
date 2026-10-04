@@ -210,6 +210,36 @@
                 <button class="btn btn-sm btn-block mt-1" onclick="copySubscription()"><%= t('common.copy') %></button>
             </div>
         </div>
+
+        <div class="card mt-2" id="appPasswordCard">
+            <div class="card-header">
+                <h2><i class="ti ti-device-mobile"></i> <%= t('users.appTitle') %></h2>
+            </div>
+            <div class="card-body">
+                <p class="hint mb-1">
+                    <% if (user.appPasswordSetAt) { %>
+                        <%= t('users.appPasswordIssued') %> <%= new Date(user.appPasswordSetAt).toLocaleString(lang) %>
+                    <% } else { %>
+                        <%= t('users.appPasswordNone') %>
+                    <% } %>
+                </p>
+                <div id="appPasswordResult" style="display:none; margin-bottom:12px;">
+                    <p class="hint mb-1"><%= t('users.appPasswordOnce') %></p>
+                    <textarea readonly class="input-readonly" id="appPasswordText" rows="2" style="width:100%; resize:none; font-family:monospace;"></textarea>
+                    <button class="btn btn-sm btn-block mt-1" onclick="copyAppPassword()"><%= t('common.copy') %></button>
+                </div>
+                <div class="actions-list">
+                    <button class="btn btn-primary btn-block" onclick="issueAppPassword()">
+                        <i class="ti ti-key"></i> <%= user.appPasswordSetAt ? t('users.appPasswordReissue') : t('users.appPasswordIssue') %>
+                    </button>
+                    <% if (user.appPasswordSetAt) { %>
+                    <button class="btn btn-block" onclick="clearAppPassword()">
+                        <i class="ti ti-key-off"></i> <%= t('users.appPasswordClear') %>
+                    </button>
+                    <% } %>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -224,7 +254,55 @@ const i18n = {
     confirmUnlinkHwid: <%- JSON.stringify(t("users.confirmUnlinkHwid")) %>,
     confirmUnlinkAllHwid: <%- JSON.stringify(t("users.confirmUnlinkAllHwid")) %>,
     confirmResetTraffic: <%- JSON.stringify(t("users.confirmResetTraffic")) %>,
+    appPasswordConfirmReissue: <%- JSON.stringify(t("users.appPasswordConfirmReissue")) %>,
+    appPasswordConfirmClear: <%- JSON.stringify(t("users.appPasswordConfirmClear")) %>,
+    appPasswordLogin: <%- JSON.stringify(t("users.appPasswordLogin")) %>,
+    appPasswordPassword: <%- JSON.stringify(t("users.appPasswordPassword")) %>,
+    appPasswordCopied: <%- JSON.stringify(t("users.appPasswordCopied")) %>,
 };
+const hasAppPassword = <%- JSON.stringify(!!user.appPasswordSetAt) %>;
+
+async function issueAppPassword() {
+    if (hasAppPassword && !confirm(i18n.appPasswordConfirmReissue)) return;
+    const res = await fetch('/api/users/' + encodeURIComponent(userId) + '/app-password', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.password) {
+        alert(data.error || i18n.error);
+        return;
+    }
+    // The plaintext exists only in this response: show it without reloading the page.
+    document.getElementById('appPasswordText').value = `${i18n.appPasswordLogin}: ${data.userId}\n${i18n.appPasswordPassword}: ${data.password}`;
+    document.getElementById('appPasswordResult').style.display = 'block';
+}
+
+async function clearAppPassword() {
+    if (!confirm(i18n.appPasswordConfirmClear)) return;
+    const res = await fetch('/api/users/' + encodeURIComponent(userId) + '/app-password', {
+        method: 'DELETE',
+        credentials: 'include'
+    });
+    if (res.ok) location.reload();
+    else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || i18n.error);
+    }
+}
+
+function copyAppPassword() {
+    const field = document.getElementById('appPasswordText');
+    navigator.clipboard.writeText(field.value).then(() => {
+        alert(i18n.appPasswordCopied);
+    }).catch(() => {
+        field.select();
+        document.execCommand('copy');
+        alert(i18n.appPasswordCopied);
+    });
+}
 
 async function unlinkHwid(hwid) {
     if (!hwid || !confirm(i18n.confirmUnlinkHwid)) return;

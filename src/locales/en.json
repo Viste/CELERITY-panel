@@ -1145,7 +1145,19 @@
     "hwidEnforceFrom": "Enforce HWID limit from",
     "hwidEnforceFromHint": "Optional. Until this time, new HWIDs are recorded but not blocked. Empty = enforce when HWID applies.",
     "confirmUnlinkHwid": "Remove this HWID registration?",
-    "confirmUnlinkAllHwid": "Remove all HWID registrations for this user?"
+    "confirmUnlinkAllHwid": "Remove all HWID registrations for this user?",
+    "appTitle": "Potato app",
+    "appPasswordIssued": "Password issued",
+    "appPasswordNone": "No app password has been issued.",
+    "appPasswordIssue": "Issue password",
+    "appPasswordReissue": "Reissue password",
+    "appPasswordClear": "Clear password",
+    "appPasswordOnce": "The password is shown once; the panel stores only its hash. Copy it and send it to the user.",
+    "appPasswordConfirmReissue": "Issue a new password? The old one will stop working for sign-in. Devices that are already signed in keep working.",
+    "appPasswordConfirmClear": "Clear the password? Signing in to the app will not be possible until a new one is issued. Devices that are already signed in keep working.",
+    "appPasswordLogin": "Login",
+    "appPasswordPassword": "Password",
+    "appPasswordCopied": "Login and password copied"
   },
   "groups": {
     "title": "Server Groups",
