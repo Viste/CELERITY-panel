@@ -68,4 +68,28 @@ function buildNetStatsCommand(osFamily) {
     return `cat /proc/net/dev | grep -E '(eth|ens|enp|eno)' | head -1`;
 }
 
-module.exports = { normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildSystemStatsScript, buildNetStatsCommand };
+// journald on linux; on freebsd rc.d services run under daemon(8) -S -T <service>, so their
+// output lands in syslog under that tag.
+function buildServiceLogsCommand(osFamily, service, lines) {
+    const n = Number(lines) || 50;
+    if (osFamily === 'freebsd') {
+        // "host mita[1234]: ..." — the pid brackets are matched with dots to keep the pattern plain.
+        return `grep -E ' ${service}(.[0-9]+.)?: ' /var/log/messages 2>/dev/null | tail -n ${n}; exit 0`;
+    }
+    return `journalctl -u ${service} -n ${n} --no-pager 2>/dev/null || true`;
+}
+
+// Prints the listening socket line for the port, or nothing.
+function buildListenCheckCommand(osFamily, protocol, port) {
+    const proto = String(protocol || '').toLowerCase() === 'udp' ? 'udp' : 'tcp';
+    const p = Number(port) || 0;
+    if (osFamily === 'freebsd') {
+        return `sockstat -46l -P ${proto} -p ${p} 2>/dev/null | awk 'NR > 1' | head -1`;
+    }
+    return `ss ${proto === 'udp' ? '-uln' : '-tln'}p 2>/dev/null | grep -E ":${p}\\b" | head -1 || true`;
+}
+
+module.exports = {
+    normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildSystemStatsScript, buildNetStatsCommand,
+    buildServiceLogsCommand, buildListenCheckCommand,
+};

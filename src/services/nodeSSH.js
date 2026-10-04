@@ -28,7 +28,10 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
-const { nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand } = require('../utils/nodeOs');
+const {
+    nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand,
+    buildServiceCommand, buildServiceLogsCommand, buildListenCheckCommand,
+} = require('../utils/nodeOs');
 
 // Hard cap to keep CPU usage bounded on weak hardware (1 vCPU).
 // Each SSH handshake involves DH key-exchange which is CPU-heavy on Node.js.
@@ -431,21 +434,22 @@ class NodeSSH {
     }
 
     /**
-     * Restart the mita systemd service and verify it picks up the new config.
+     * Restart the mita service (systemd or rc.d) and verify it picks up the new config.
      */
     async restartMieru() {
         try {
-            await this.exec('systemctl restart mita 2>&1');
+            const osFamily = nodeOsFamily(this.node);
+            await this.exec(`${buildServiceCommand(osFamily, 'restart', 'mita')} 2>&1`);
             await new Promise(resolve => setTimeout(resolve, 3000));
 
-            const statusResult = await this.exec('systemctl is-active mita 2>/dev/null');
+            const statusResult = await this.exec(`${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null`);
             const isActive = statusResult.stdout.trim() === 'active';
 
             if (isActive) {
                 logger.info(`[SSH] mita restarted and running on ${this.node.name}`);
                 return true;
             }
-            const logsResult = await this.exec('journalctl -u mita -n 15 --no-pager 2>/dev/null');
+            const logsResult = await this.exec(buildServiceLogsCommand(osFamily, 'mita', 15));
             logger.error(`[SSH] mita failed to start on ${this.node.name}. Logs: ${logsResult.stdout}`);
             return false;
         } catch (error) {
@@ -461,10 +465,10 @@ class NodeSSH {
         try {
             const port = this.node.port || 443;
             const protocol = (this.node.mieru && this.node.mieru.protocol === 'UDP') ? 'udp' : 'tcp';
-            const flag = protocol === 'udp' ? '-uln' : '-tln';
+            const osFamily = nodeOsFamily(this.node);
 
-            const svc = await this.exec('systemctl is-active mita 2>/dev/null');
-            const listen = await this.exec(`ss ${flag}p | grep -E ":${port}\\s" | head -1`);
+            const svc = await this.exec(`${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null`);
+            const listen = await this.exec(buildListenCheckCommand(osFamily, protocol, port));
             return {
                 serviceActive: svc.stdout.trim() === 'active',
                 listening: listen.stdout.includes(`:${port}`),

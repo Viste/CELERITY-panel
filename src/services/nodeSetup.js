@@ -12,7 +12,9 @@ const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
 const { isServerlessNode } = require('../utils/nodeTypes');
 const { isLoopbackAddress, hasOwnTlsInbound } = require('../utils/xrayFront');
-const { normalizeOsFamily, nodeOsFamily, buildServiceCommand } = require('../utils/nodeOs');
+const {
+    normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildServiceLogsCommand, buildListenCheckCommand,
+} = require('../utils/nodeOs');
 
 /**
  * Check if a node is on the same VPS as the panel
@@ -2195,6 +2197,134 @@ fi
 }
 
 /**
+ * rc.d script for mita on FreeBSD. upstream ships only a systemd unit; this mirrors it:
+ * user mita, control socket directory recreated on every start, restart on failure.
+ */
+function buildMitaRcScript() {
+    return `#!/bin/sh
+#
+# PROVIDE: mita
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# rc.conf knobs:
+#   mita_enable="YES"
+
+. /etc/rc.subr
+
+name="mita"
+rcvar="mita_enable"
+
+load_rc_config $name
+
+: \${mita_enable:="NO"}
+# syslog stamps the lines itself
+: \${mita_env:="MITA_LOG_NO_TIMESTAMP=true"}
+
+pidfile="/var/run/mita.pid"
+command="/usr/sbin/daemon"
+# -P keeps the supervisor pid, so "service mita stop" signals daemon(8), which forwards
+# SIGTERM to mita instead of restarting it (-R 5).
+command_args="-f -S -T mita -R 5 -P \${pidfile} -u mita /usr/local/bin/mita run"
+start_precmd="mita_prestart"
+
+mita_prestart()
+{
+    # /var/run is wiped at boot; the daemon keeps its control socket there.
+    install -d -o mita -g mita -m 775 /var/run/mita
+}
+
+run_rc_command "$1"
+`;
+}
+
+/**
+ * FreeBSD counterpart of buildMitaInstallScript (POSIX sh, rc.d, pf). There is no upstream
+ * FreeBSD package, so the binary comes from the panel image (see Dockerfile).
+ * Returns '' when the url is not a plain http(s) URL.
+ */
+function buildMitaInstallScriptFreebsd(port, protocol, url) {
+    const proto = (protocol || 'TCP').toLowerCase() === 'udp' ? 'udp' : 'tcp';
+    const safePort = Number(port) || 443;
+    const safeUrl = String(url || '').trim();
+    if (!/^https?:\/\/[^\s'"\\]+$/.test(safeUrl)) return '';
+    return `set -eu
+
+PORT=${safePort}
+PROTOCOL=${proto}
+MITA_VERSION=${MITA_VERSION}
+URL='${safeUrl}'
+
+mita_version() {
+    /usr/local/bin/mita version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1
+}
+
+INSTALLED_VER=""
+[ -x /usr/local/bin/mita ] && INSTALLED_VER=$(mita_version || true)
+if [ "$INSTALLED_VER" = "$MITA_VERSION" ]; then
+    echo "OK: mita $INSTALLED_VER already installed — skipping download"
+else
+    [ -n "$INSTALLED_VER" ] && echo "mita $INSTALLED_VER installed, pinned $MITA_VERSION — upgrading"
+    echo "Downloading $URL ..."
+    # Download next to the target and rename: writing over a running binary fails with ETXTBSY.
+    TMP=/usr/local/bin/mita.new
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 180 "$URL" -o "$TMP"
+    else
+        fetch -q -o "$TMP" "$URL"
+    fi
+    [ -s "$TMP" ] || { echo "ERROR: download failed or file is empty"; exit 1; }
+    chmod 0755 "$TMP"
+    mv -f "$TMP" /usr/local/bin/mita
+    NEW_VER=$(mita_version || true)
+    [ -n "$NEW_VER" ] || { echo "ERROR: the downloaded mita does not run on this host"; exit 1; }
+    [ "$NEW_VER" = "$MITA_VERSION" ] || echo "WARN: the panel serves mita $NEW_VER, pinned $MITA_VERSION"
+    echo "OK: mita $NEW_VER installed"
+fi
+
+# --- user and directories (what the rpm/deb postinst does on linux) ---
+pw groupshow mita >/dev/null 2>&1 || pw groupadd mita
+pw usershow mita >/dev/null 2>&1 || pw useradd mita -g mita -d /nonexistent -s /usr/sbin/nologin -c "mieru proxy server"
+install -d -o mita -g mita -m 755 /etc/mita /var/lib/mita
+install -d -o mita -g mita -m 775 /var/run/mita
+
+cat > /usr/local/etc/rc.d/mita <<'CELERITY_RC_EOF'
+${buildMitaRcScript()}CELERITY_RC_EOF
+chmod 0555 /usr/local/etc/rc.d/mita
+
+# --- firewall: best-effort, never fatal ---
+if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' && [ -f /etc/pf.conf ]; then
+    if pfctl -P -s rules 2>/dev/null | grep -Eq "^pass in .*proto $PROTOCOL .* port = $PORT( |\\$)"; then
+        echo "OK: pf already allows $PORT/$PROTOCOL"
+    else
+        cp -p /etc/pf.conf /etc/pf.conf.celerity-bak
+        printf 'pass in proto %s to port %s keep state # celerity-mieru\\n' "$PROTOCOL" "$PORT" >> /etc/pf.conf
+        if pfctl -nf /etc/pf.conf >/dev/null 2>&1 && pfctl -f /etc/pf.conf >/dev/null 2>&1; then
+            echo "OK: pf opened $PORT/$PROTOCOL"
+        else
+            cp -p /etc/pf.conf.celerity-bak /etc/pf.conf
+            echo "WARN: pf rejected the new rule, /etc/pf.conf restored — open $PORT/$PROTOCOL by hand"
+        fi
+    fi
+else
+    echo "WARN: pf is not enabled — assuming $PORT/$PROTOCOL is reachable"
+fi
+
+# --- service ---
+sysrc mita_enable=YES >/dev/null
+service mita restart </dev/null >/dev/null 2>&1 || service mita start </dev/null >/dev/null 2>&1 || true
+sleep 2
+if service mita status >/dev/null 2>&1; then
+    echo "OK: mita running"
+else
+    echo "ERROR: mita failed to start"
+    ${buildServiceLogsCommand('freebsd', 'mita', 30).replace(/; exit 0$/, ' || true')}
+    exit 1
+fi
+`;
+}
+
+/**
  * Set up a mieru node end-to-end:
  *  1. SSH into the node and run the install/adopt script;
  *  2. push the current users + listener config via NodeSSH.updateMieruConfig;
@@ -2228,11 +2358,30 @@ async function setupMieruNode(node, options = {}) {
         conn = await connectSSH(node);
         log('SSH connected');
 
+        const osFamily = await detectOsFamily(conn, node);
+        log(`Detected OS family: ${osFamily}`);
+        let installScript = buildMitaInstallScript(port, protocol);
+        if (osFamily === 'freebsd') {
+            // Every script below runs as `$SHELL -c`; csh cannot parse POSIX sh.
+            const shellResult = await execSSH(conn, 'echo "$SHELL"');
+            const loginShell = String(shellResult.output || '').trim().split('\n')[0];
+            if (/csh$/.test(loginShell)) {
+                throw new Error(`Login shell on the node is ${loginShell}; set it to /bin/sh (chsh -s /bin/sh ${node.ssh?.username || 'root'}) and retry.`);
+            }
+            // The image ships the freebsd build under public/agents/ (see Dockerfile).
+            const mitaUrl = process.env.MITA_FREEBSD_URL
+                || (config.BASE_URL ? `${config.BASE_URL}/agents/mita-freebsd-amd64` : '');
+            installScript = buildMitaInstallScriptFreebsd(port, protocol, mitaUrl);
+            if (!installScript) {
+                throw new Error('MITA_FREEBSD_URL is not set (or is not an http(s) URL) — point it at a freebsd/amd64 mita binary');
+            }
+        }
+
         await runInitScript(conn, node, log, logs);
 
         if (installPackage) {
             log(`Installing/adopting mita ${MITA_VERSION} (port ${port}/${protocol})...`);
-            const installResult = await execSSH(conn, buildMitaInstallScript(port, protocol));
+            const installResult = await execSSH(conn, installScript);
             logs.push(installResult.output || '');
             if (!installResult.success) {
                 log(`ERROR: mita install failed (exit code ${installResult.code})`);
@@ -2252,7 +2401,7 @@ async function setupMieruNode(node, options = {}) {
 
         if (restartService) {
             log('Verifying mita.service status...');
-            const status = await execSSH(conn, 'systemctl is-active mita 2>/dev/null || echo inactive');
+            const status = await execSSH(conn, `${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null || echo inactive`);
             const isActive = (status.output || '').trim() === 'active';
             if (!isActive) {
                 log('WARN: mita is not active after setup');
@@ -2283,11 +2432,12 @@ async function checkMieruNodeStatus(node) {
     let conn;
     try {
         conn = await connectSSH(node);
-        const svc = await execSSH(conn, 'systemctl is-active mita 2>/dev/null || echo inactive');
+        const osFamily = nodeOsFamily(node);
+        const svc = await execSSH(conn, `${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null || echo inactive`);
         const isActive = (svc.output || '').trim() === 'active';
         const port = node.port || 443;
-        const protoFlag = (node.mieru && node.mieru.protocol === 'UDP') ? '-uln' : '-tln';
-        const listen = await execSSH(conn, `ss ${protoFlag}p 2>/dev/null | grep -E ":${port}\\b" | head -1 || true`);
+        const protocol = (node.mieru && node.mieru.protocol === 'UDP') ? 'udp' : 'tcp';
+        const listen = await execSSH(conn, buildListenCheckCommand(osFamily, protocol, port));
         const listening = (listen.output || '').includes(`:${port}`);
         return {
             online: isActive && listening,
@@ -2315,7 +2465,7 @@ async function getMieruNodeLogs(node, lines = 50) {
     let conn;
     try {
         conn = await connectSSH(node);
-        const result = await execSSH(conn, `journalctl -u mita -n ${Number(lines) || 50} --no-pager 2>/dev/null || true`);
+        const result = await execSSH(conn, buildServiceLogsCommand(nodeOsFamily(node), 'mita', lines));
         return { success: true, logs: result.output || '' };
     } catch (error) {
         return { success: false, error: error.message, logs: '' };
@@ -2350,6 +2500,9 @@ module.exports = {
     setupMieruNode,
     checkMieruNodeStatus,
     getMieruNodeLogs,
+    buildMitaInstallScript,
+    buildMitaInstallScriptFreebsd,
+    buildMitaRcScript,
     isLoopbackAddress,
     normalizeOsFamily,
     nodeOsFamily,
