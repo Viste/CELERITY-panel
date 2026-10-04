@@ -8,7 +8,7 @@ process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'test-encryption-key-
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-session-secret-32-characters-long';
 
 const { detectClient, detectClientKey, CLIENT_NAMES } = require('../src/utils/subClient');
-const { parseSize, parseMitaUsers } = require('../src/utils/mitaUsers');
+const { parseSize, parseMitaUsers, staleMitaUsers } = require('../src/utils/mitaUsers');
 
 // --- client detection -------------------------------------------------------
 assert.strictEqual(detectClient('Potato/1.0 Happ'), 'potato');
@@ -55,6 +55,16 @@ assert.deepStrictEqual(rows[1].windows.d1, { tx: 20 * 1024 ** 2, rx: Math.round(
 assert.deepStrictEqual(rows[1].windows.d30, { tx: 1024 ** 3, rx: Math.round(9.5 * 1024 ** 3) });
 assert.deepStrictEqual(parseMitaUsers(''), []);
 assert.deepStrictEqual(parseMitaUsers('mita is not running'), []);
+
+// --- users mita still has but the panel dropped -----------------------------------
+const described = JSON.stringify({ portBindings: [{ port: 25443, protocol: 'TCP' }], users: [
+    { name: 'viste', password: 'x' }, { name: '@ogr_27', password: 'x' }, { name: 'vlad', password: 'x' }, { name: "bad'; rm -rf /", password: 'x' },
+] });
+assert.deepStrictEqual(staleMitaUsers(described, ['viste', 'tintalle']), ['@ogr_27', 'vlad'], 'unsafe names never reach the shell');
+assert.deepStrictEqual(staleMitaUsers(described, ['viste', '@ogr_27', 'vlad']), []);
+assert.deepStrictEqual(staleMitaUsers(described, []), [], 'an empty wanted list never wipes a node');
+assert.deepStrictEqual(staleMitaUsers('mita is not running', ['viste']), []);
+assert.deepStrictEqual(staleMitaUsers('{}', ['viste']), []);
 
 // --- overview composition ------------------------------------------------------
 const { buildOverview, userClients } = require('../src/services/userStatsService');

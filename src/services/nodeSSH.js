@@ -28,7 +28,7 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
-const { parseMitaUsers } = require('../utils/mitaUsers');
+const { parseMitaUsers, staleMitaUsers } = require('../utils/mitaUsers');
 const {
     nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand,
     buildServiceCommand, buildServiceLogsCommand, buildListenCheckCommand,
@@ -427,11 +427,29 @@ class NodeSSH {
                 logger.error(`[SSH] mita apply config error on ${this.node.name}: ${apply.stdout} ${apply.stderr}`);
                 return false;
             }
+            await this.pruneMieruUsers(configObject);
             return await this.restartMieru();
         } catch (error) {
             logger.error(`[SSH] mita config update error: ${error.message}`);
             return false;
         }
+    }
+
+    /**
+     * `mita apply config` merges users: without this a user deleted or disabled in the panel
+     * would keep access on the node forever.
+     */
+    async pruneMieruUsers(configObject) {
+        if (!configObject || typeof configObject !== 'object' || !Array.isArray(configObject.users)) return 0;
+        const current = await this.exec('mita describe config 2>/dev/null');
+        const stale = staleMitaUsers(current.stdout, configObject.users.map(u => u.name));
+        for (const name of stale) {
+            await this.exec(`mita delete user '${name}' 2>&1`);
+        }
+        if (stale.length > 0) {
+            logger.info(`[SSH] mita on ${this.node.name}: removed ${stale.length} user(s) the panel no longer lists: ${stale.join(', ')}`);
+        }
+        return stale.length;
     }
 
     /**

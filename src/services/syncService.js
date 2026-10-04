@@ -506,6 +506,7 @@ class SyncService {
      * Add user to all active Xray nodes they belong to (fire-and-forget safe)
      */
     async addUserToAllXrayNodes(user) {
+        this.scheduleMieruUsersSync();
         const xrayNodes = await HyNode.find({ type: 'xray', active: true });
         for (const node of xrayNodes) {
             const nodeUsers = await this._getUsersForNode(node);
@@ -517,9 +518,36 @@ class SyncService {
     }
 
     /**
+     * mita takes its user list only as part of the whole config, so a user change means a config
+     * push and a restart of every mieru node. Debounced: a burst of edits becomes one push.
+     * Called from the same choke points that update the xray nodes.
+     */
+    scheduleMieruUsersSync(delayMs = 20000) {
+        if (this._mieruUsersSyncTimer) clearTimeout(this._mieruUsersSyncTimer);
+        this._mieruUsersSyncTimer = setTimeout(() => {
+            this._mieruUsersSyncTimer = null;
+            this.syncMieruUsers().catch(err => logger.error(`[Mieru Sync] users sync failed: ${err.message}`));
+        }, delayMs);
+        if (typeof this._mieruUsersSyncTimer.unref === 'function') this._mieruUsersSyncTimer.unref();
+    }
+
+    async syncMieruUsers() {
+        const nodes = await HyNode.find({ type: 'mieru', active: true });
+        for (const node of nodes) {
+            try {
+                await this.updateMieruNodeConfig(node);
+            } catch (err) {
+                logger.error(`[Mieru Sync] ${node.name}: ${err.message}`);
+            }
+        }
+        return nodes.length;
+    }
+
+    /**
      * Remove user from all active Xray nodes (fire-and-forget safe)
      */
     async removeUserFromAllXrayNodes(user) {
+        this.scheduleMieruUsersSync();
         const xrayNodes = await HyNode.find({ type: 'xray', active: true });
         for (const node of xrayNodes) {
             this.removeXrayUser(node, user).catch(() => {});

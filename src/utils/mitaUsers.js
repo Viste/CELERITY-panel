@@ -40,4 +40,20 @@ function parseMitaUsers(output) {
     return rows;
 }
 
-module.exports = { parseSize, parseMitaUsers };
+/**
+ * Users present in `mita describe config` output but absent from the wanted list.
+ * `mita apply config` only adds and updates users, so these have to be deleted one by one.
+ * Names that are not plain tokens are left alone: they go into a shell command.
+ */
+function staleMitaUsers(describeOutput, wantedNames) {
+    const wanted = new Set(wantedNames || []);
+    if (wanted.size === 0) return [];
+    let config;
+    try { config = JSON.parse(String(describeOutput || '')); } catch (_) { return []; }
+    const users = Array.isArray(config?.users) ? config.users : [];
+    return users
+        .map(u => u && u.name)
+        .filter(name => typeof name === 'string' && !wanted.has(name) && /^[A-Za-z0-9@._-]+$/.test(name));
+}
+
+module.exports = { parseSize, parseMitaUsers, staleMitaUsers };
