@@ -94,6 +94,9 @@ assert.deepStrictEqual(viste.byNode.n2, { tx: 7, rx: 70, lastSeen: minutesAgo(20
 assert.strictEqual(viste.byNode.gone, undefined, 'inactive nodes are left out');
 assert.deepStrictEqual(viste.clients.map(c => c.key), ['potato-ios', 'clash']);
 assert.strictEqual(viste.hasAppPassword, true);
+assert.strictEqual(viste.potatoAt.getTime(), minutesAgo(30).getTime(), 'the later of login and potato fetch');
+assert.strictEqual(uncle.potatoAt.getTime(), minutesAgo(90).getTime(), 'a potato fetch counts without a recorded login');
+assert.strictEqual(idle.potatoAt, null);
 assert.deepStrictEqual(uncle.online, ['n2']);
 assert.deepStrictEqual(uncle.clients.map(c => c.key), ['potato-android'], 'falls back to the last user agent');
 assert.strictEqual(idle.enabled, false);

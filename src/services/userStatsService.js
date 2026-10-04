@@ -105,6 +105,11 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
         for (const c of recent) clientTotals[c.key] = (clientTotals[c.key] || 0) + 1;
         if (recent.length > 0) withClient++;
 
+        // The app logs in once and then only refreshes the subscription, so either counts.
+        const potatoTimes = clients.filter(c => c.key.startsWith('potato')).map(c => c.at.getTime());
+        if (user.appLastLoginAt) potatoTimes.push(toTime(user.appLastLoginAt));
+        const potatoAt = potatoTimes.length ? new Date(Math.max(...potatoTimes)) : null;
+
         return {
             userId: user.userId,
             username: user.username || '',
@@ -114,6 +119,7 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
             lastFetchAt: user.lastSubFetchAt || null,
             hasAppPassword: !!user.appPasswordSetAt,
             appLoginAt: user.appLastLoginAt || null,
+            potatoAt,
             traffic: { tx, rx },
             totalTraffic: { tx: user.traffic?.tx || 0, rx: user.traffic?.rx || 0 },
             byNode,

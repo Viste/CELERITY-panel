@@ -1324,8 +1324,8 @@ function renderUsers() {
                 ? `<div class="cell-chips">${u.clients.map(c => `<span class="user-chip ${c.key.startsWith('potato') ? 'chip-potato' : ''}">${escapeHtml(CLIENT_LABELS[c.key] || c.key)} <small>${escapeHtml(timeAgo(c.at))}</small></span>`).join('')}</div>`
                 : '<span class="text-muted">—</span>';
             const fetched = u.lastFetchAt ? escapeHtml(timeAgo(u.lastFetchAt)) : `<span class="text-muted">${escapeHtml(i18n.usersNever)}</span>`;
-            const login = u.appLoginAt
-                ? escapeHtml(timeAgo(u.appLoginAt))
+            const login = u.potatoAt
+                ? escapeHtml(timeAgo(u.potatoAt))
                 : `<span class="text-muted">${escapeHtml(u.hasAppPassword ? i18n.usersNotLoggedIn : i18n.usersNoAppPassword)}</span>`;
             const traffic = (u.traffic.tx || u.traffic.rx)
                 ? `<span style="color:var(--success)">↑ ${formatBytes(u.traffic.tx)}</span> <span style="color:var(--accent)">↓ ${formatBytes(u.traffic.rx)}</span>`
