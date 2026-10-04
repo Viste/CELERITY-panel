@@ -12,6 +12,7 @@ const uaSnapshotSchema = new mongoose.Schema({
     // Map of client name -> approximate unique user count (from HLL PFCOUNT)
     clients: {
         potato:       { type: Number, default: 0 },
+        orbita:       { type: Number, default: 0 },
         happ:         { type: Number, default: 0 },
         incy:         { type: Number, default: 0 },
         hiddify:      { type: Number, default: 0 },

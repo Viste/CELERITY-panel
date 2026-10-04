@@ -6,7 +6,7 @@
 const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
 const UserNodeStat = require('../models/userNodeStatModel');
-const { detectClientKey } = require('../utils/subClient');
+const { detectClientKey, isOwnApp } = require('../utils/subClient');
 
 const HOUR_MS = 3600 * 1000;
 const PERIOD_HOURS = { '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 };
@@ -120,10 +120,16 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
         for (const c of recent) clientTotals[c.key] = (clientTotals[c.key] || 0) + 1;
         if (recent.length > 0) withClient++;
 
-        // The app logs in once and then only refreshes the subscription, so either counts.
-        const potatoTimes = clients.filter(c => c.key.startsWith('potato')).map(c => c.at.getTime());
-        if (user.appLastLoginAt) potatoTimes.push(toTime(user.appLastLoginAt));
-        const potatoAt = potatoTimes.length ? new Date(Math.max(...potatoTimes)) : null;
+        // Our apps log in once and then only refresh the subscription, so either counts.
+        const own = clients.find(c => isOwnApp(c.key)); // clients are newest first
+        let appAt = own ? own.at : null;
+        let appKey = own ? own.key : null;
+        const loginAt = toTime(user.appLastLoginAt);
+        if (loginAt && (!appAt || loginAt > appAt.getTime())) {
+            appAt = new Date(loginAt);
+            // logins recorded before the app was stored keep the app of the last fetch
+            if (isOwnApp(user.appLastLoginClient)) appKey = user.appLastLoginClient;
+        }
 
         return {
             userId: user.userId,
@@ -134,7 +140,8 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
             lastFetchAt: user.lastSubFetchAt || null,
             hasAppPassword: !!user.appPasswordSetAt,
             appLoginAt: user.appLastLoginAt || null,
-            potatoAt,
+            appAt,
+            appKey,
             traffic: { tx, rx },
             totalTraffic: { tx: user.traffic?.tx || 0, rx: user.traffic?.rx || 0 },
             byNode,
@@ -169,7 +176,7 @@ class UserStatsService {
         const since = new Date(UserNodeStat.hourOf(now).getTime() - (PERIOD_HOURS[p] - 1) * HOUR_MS);
         const [users, nodes, hourly, rolling] = await Promise.all([
             HyUser.find({})
-                .select('userId username enabled traffic lastSubFetchAt lastSubUserAgent subClients appPasswordSetAt appLastLoginAt')
+                .select('userId username enabled traffic lastSubFetchAt lastSubUserAgent subClients appPasswordSetAt appLastLoginAt appLastLoginClient')
                 .lean(),
             HyNode.find({ active: true, type: { $in: ['xray', 'mieru', 'hysteria'] } })
                 .select('name type flag rankingCoefficient')

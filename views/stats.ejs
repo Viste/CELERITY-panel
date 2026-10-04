@@ -480,7 +480,7 @@
 .user-chip b { color: var(--text-primary); font-weight: 600; }
 .user-chip small { color: var(--text-muted); font-size: 11px; }
 .user-chip.chip-online { border-color: var(--success); background: var(--success-bg); color: var(--success); }
-.user-chip.chip-potato { border-color: var(--accent); color: var(--accent-hover); }
+.user-chip.chip-own { border-color: var(--accent); color: var(--accent-hover); }
 .user-chip.chip-background { border-style: dashed; color: var(--text-muted); background: transparent; }
 .users-table td { vertical-align: middle; }
 .users-table .cell-chips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -1254,8 +1254,12 @@ async function updateTrend() {
 // ---- Users: who is where, with which app ----
 let _usersData = null;
 
+// Our own apps, Potato and Orbita, are highlighted among the clients.
+const isOwnApp = key => /^(potato|orbita)(-|$)/.test(key);
+
 const CLIENT_LABELS = {
     'potato-android': 'Potato Android', 'potato-ios': 'Potato iOS', potato: 'Potato',
+    'orbita-mac': 'Orbita Mac', 'orbita-windows': 'Orbita Windows', orbita: 'Orbita',
     happ: 'Happ', incy: 'Incy', hiddify: 'Hiddify', nekobox: 'NekoBox', singbox: 'sing-box',
     v2rayng: 'v2rayNG', shadowrocket: 'Shadowrocket', streisand: 'Streisand', clash: 'Clash',
     quantumult: 'Quantumult', other: 'other',
@@ -1305,7 +1309,7 @@ function renderUsers() {
         `<span class="user-chip" title="${escapeHtml(i18n.usersConnectionsHint)}">${escapeHtml(i18n.usersConnections)} <b>${data.summary.connections}</b> · ${escapeHtml(i18n.usersActive)} <b>${data.summary.activeConnections}</b></span>`,
     ];
     Object.entries(data.summary.clients).sort((a, b) => b[1] - a[1]).forEach(([key, count]) => {
-        chips.push(`<span class="user-chip ${key.startsWith('potato') ? 'chip-potato' : ''}">${escapeHtml(CLIENT_LABELS[key] || key)} <b>${count}</b></span>`);
+        chips.push(`<span class="user-chip ${isOwnApp(key) ? 'chip-own' : ''}">${escapeHtml(CLIENT_LABELS[key] || key)} <b>${count}</b></span>`);
     });
     const noClient = data.summary.users - data.summary.withClient;
     if (noClient > 0) chips.push(`<span class="user-chip">${escapeHtml(i18n.usersSummaryNoClient)} <b>${noClient}</b></span>`);
@@ -1331,11 +1335,11 @@ function renderUsers() {
                     : '<span class="text-muted">—</span>';
             }
             const apps = u.clients.length
-                ? `<div class="cell-chips">${u.clients.map(c => `<span class="user-chip ${c.key.startsWith('potato') ? 'chip-potato' : ''}">${escapeHtml(CLIENT_LABELS[c.key] || c.key)} <small>${escapeHtml(timeAgo(c.at))}</small></span>`).join('')}</div>`
+                ? `<div class="cell-chips">${u.clients.map(c => `<span class="user-chip ${isOwnApp(c.key) ? 'chip-own' : ''}">${escapeHtml(CLIENT_LABELS[c.key] || c.key)} <small>${escapeHtml(timeAgo(c.at))}</small></span>`).join('')}</div>`
                 : '<span class="text-muted">—</span>';
             const fetched = u.lastFetchAt ? escapeHtml(timeAgo(u.lastFetchAt)) : `<span class="text-muted">${escapeHtml(i18n.usersNever)}</span>`;
-            const login = u.potatoAt
-                ? escapeHtml(timeAgo(u.potatoAt))
+            const login = u.appAt
+                ? escapeHtml(timeAgo(u.appAt)) + (u.appKey ? ` <small class="text-muted">${escapeHtml(CLIENT_LABELS[u.appKey] || u.appKey)}</small>` : '')
                 : `<span class="text-muted">${escapeHtml(u.hasAppPassword ? i18n.usersNotLoggedIn : i18n.usersNoAppPassword)}</span>`;
             const traffic = (u.traffic.tx || u.traffic.rx)
                 ? `<span style="color:var(--success)">↑ ${formatBytes(u.traffic.tx)}</span> <span style="color:var(--accent)">↓ ${formatBytes(u.traffic.rx)}</span>`

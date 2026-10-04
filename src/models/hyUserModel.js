@@ -117,6 +117,8 @@ const hyUserSchema = new mongoose.Schema({
     // client key (utils/subClient.detectClientKey) -> last subscription fetch by that app
     subClients: { type: mongoose.Schema.Types.Mixed, default: {} },
     appLastLoginAt: { type: Date, default: null },
+    // which of our apps made that login (utils/subClient.detectClientKey)
+    appLastLoginClient: { type: String, default: '' },
 
     // Login for the mobile app (scrypt hash, see utils/appPassword.js).
     // select:false — never returned by list/get routes.

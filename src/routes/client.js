@@ -1,5 +1,5 @@
 /**
- * Mobile client API (no admin auth): username + app password → subscription.
+ * API of our own apps, Potato and Orbita (no admin auth): username + app password → subscription.
  * Mounted under /api/client behind authLimiter.
  */
 const express = require('express');
@@ -8,6 +8,7 @@ const HyUser = require('../models/hyUserModel');
 const config = require('../../config');
 const logger = require('../utils/logger');
 const { verifyPassword } = require('../utils/appPassword');
+const { detectClientKey } = require('../utils/subClient');
 
 const USER_RE = /^[A-Za-z0-9._@-]{1,64}$/;
 
@@ -34,7 +35,10 @@ router.post('/login', express.json({ limit: '4kb' }), async (req, res) => {
         }
         const base = String(config.BASE_URL || '').replace(/\/+$/, '');
         logger.info(`[Client] Login ok for ${user.userId} from ${req.ip}`);
-        HyUser.updateOne({ _id: user._id }, { $set: { appLastLoginAt: new Date() } }).catch(() => {});
+        HyUser.updateOne({ _id: user._id }, { $set: {
+            appLastLoginAt: new Date(),
+            appLastLoginClient: detectClientKey(req.headers['user-agent']),
+        } }).catch(() => {});
         return res.json({
             success: true,
             subscription: { token: user.subscriptionToken, url: `${base}/api/files/${user.subscriptionToken}` },

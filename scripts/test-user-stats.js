@@ -7,7 +7,7 @@ process.env.ACME_EMAIL = process.env.ACME_EMAIL || 'admin@example.com';
 process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'test-encryption-key-32-characters-long';
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-session-secret-32-characters-long';
 
-const { detectClient, detectClientKey, CLIENT_NAMES } = require('../src/utils/subClient');
+const { detectClient, detectClientKey, isOwnApp, CLIENT_NAMES } = require('../src/utils/subClient');
 const { parseSize, parseMitaUsers, staleMitaUsers } = require('../src/utils/mitaUsers');
 
 // --- client detection -------------------------------------------------------
@@ -26,6 +26,20 @@ assert.strictEqual(detectClientKey('Potato/1.0 Happ'), 'potato-ios');
 assert.strictEqual(detectClientKey('Potato/1.0.2 clash-verge'), 'potato-android');
 assert.strictEqual(detectClientKey('Potato/2.0'), 'potato');
 assert.strictEqual(detectClientKey('Happ/3.2.1'), 'happ');
+
+// Orbita, the desktop app, asks for the Clash format too and must not be counted as Clash
+assert.strictEqual(detectClient('Orbita/0.2.0 clash-verge'), 'orbita');
+assert.strictEqual(detectClient('Orbita/0.2.1 (windows) clash-verge'), 'orbita');
+assert.ok(CLIENT_NAMES.indexOf('orbita') < CLIENT_NAMES.indexOf('clash'), 'orbita must be matched before clash');
+assert.strictEqual(detectClientKey('Orbita/0.2.1 (macos) clash-verge'), 'orbita-mac');
+assert.strictEqual(detectClientKey('Orbita/0.2.1 (windows) clash-verge'), 'orbita-windows');
+assert.strictEqual(detectClientKey('Orbita/0.2.0 clash-verge'), 'orbita', 'builds before 0.2.1 do not name the system');
+for (const key of ['potato', 'potato-ios', 'potato-android', 'orbita', 'orbita-mac', 'orbita-windows']) {
+    assert.ok(isOwnApp(key), key);
+}
+for (const key of ['clash', 'happ', 'other', 'potatoes', '', undefined]) {
+    assert.ok(!isOwnApp(key), String(key));
+}
 assert.strictEqual(detectClientKey('Mozilla/5.0'), 'other');
 // a key is used as a mongo field name: no dots or dollars
 for (const ua of ['Potato/1.0 Happ', 'clash.meta', '$weird', '']) assert.ok(/^[a-z-]+$/.test(detectClientKey(ua)));
@@ -104,9 +118,12 @@ assert.deepStrictEqual(viste.byNode.n2, { tx: 7, rx: 70, lastSeen: minutesAgo(20
 assert.strictEqual(viste.byNode.gone, undefined, 'inactive nodes are left out');
 assert.deepStrictEqual(viste.clients.map(c => c.key), ['potato-ios', 'clash']);
 assert.strictEqual(viste.hasAppPassword, true);
-assert.strictEqual(viste.potatoAt.getTime(), minutesAgo(30).getTime(), 'the later of login and potato fetch');
-assert.strictEqual(uncle.potatoAt.getTime(), minutesAgo(90).getTime(), 'a potato fetch counts without a recorded login');
-assert.strictEqual(idle.potatoAt, null);
+assert.strictEqual(viste.appAt.getTime(), minutesAgo(30).getTime(), 'the later of login and own-app fetch');
+assert.strictEqual(viste.appKey, 'potato-ios');
+assert.strictEqual(uncle.appAt.getTime(), minutesAgo(90).getTime(), 'an own-app fetch counts without a recorded login');
+assert.strictEqual(uncle.appKey, 'potato-android');
+assert.strictEqual(idle.appAt, null);
+assert.strictEqual(idle.appKey, null);
 assert.deepStrictEqual(uncle.online, [{ node: 'n2', delta: null, background: false }], 'mieru has no per-poll amount and counts as active');
 assert.deepStrictEqual(uncle.clients.map(c => c.key), ['potato-android'], 'falls back to the last user agent');
 assert.strictEqual(idle.enabled, false);
@@ -118,6 +135,27 @@ assert.strictEqual(overview.summary.connections, 2);
 assert.strictEqual(overview.summary.activeConnections, 2);
 
 // probes: a user with real traffic on one server and keep-alive checks on two more
+// Orbita counts as an own app, and a login that is later than the last fetch names its app
+const desktop = buildOverview({
+    users: [
+        { userId: 'mac', enabled: true, subClients: { 'orbita-mac': minutesAgo(10), 'potato-ios': minutesAgo(300) } },
+        { userId: 'win', enabled: true, subClients: { 'potato-android': minutesAgo(50) }, appLastLoginAt: minutesAgo(5), appLastLoginClient: 'orbita-windows' },
+        { userId: 'old', enabled: true, subClients: { 'potato-android': minutesAgo(50) }, appLastLoginAt: minutesAgo(5) },
+    ],
+    nodes,
+    hourly: [],
+    rolling: [],
+    period: '24h',
+    now,
+});
+const desktopUsers = Object.fromEntries(desktop.users.map(u => [u.userId, u]));
+assert.strictEqual(desktopUsers.mac.appKey, 'orbita-mac');
+assert.strictEqual(desktopUsers.mac.appAt.getTime(), minutesAgo(10).getTime());
+assert.strictEqual(desktopUsers.win.appKey, 'orbita-windows');
+assert.strictEqual(desktopUsers.win.appAt.getTime(), minutesAgo(5).getTime());
+assert.strictEqual(desktopUsers.old.appKey, 'potato-android', 'a login recorded without its app keeps the app of the last fetch');
+assert.deepStrictEqual(desktop.summary.clients, { 'orbita-mac': 1, 'potato-ios': 1, 'potato-android': 2 });
+
 const probing = buildOverview({
     users: [{ userId: 'multi', username: 'multi', enabled: true }],
     nodes: [...nodes, { _id: 'n3', name: 'NL-Mimir', type: 'xray' }],
