@@ -23,6 +23,7 @@ const cache = require('../../services/cacheService');
 const cascadeService = require('../../services/cascadeService');
 const statsService = require('../../services/statsService');
 const uaStatsService = require('../../services/uaStatsService');
+const userStatsService = require('../../services/userStatsService');
 const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers');
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const { isServerlessNode, checkCascadeMembership } = require('../../utils/nodeTypes');
@@ -1716,6 +1717,15 @@ router.get('/stats/api/clients', async (req, res) => {
         const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
         const data = await uaStatsService.getAggregated(days);
         res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /panel/stats/api/users - per-user view: online nodes, traffic by node, client apps
+router.get('/stats/api/users', async (req, res) => {
+    try {
+        res.json(await userStatsService.getOverview(req.query.period || '24h'));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

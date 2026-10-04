@@ -34,6 +34,7 @@ router.post('/login', express.json({ limit: '4kb' }), async (req, res) => {
         }
         const base = String(config.BASE_URL || '').replace(/\/+$/, '');
         logger.info(`[Client] Login ok for ${user.userId} from ${req.ip}`);
+        HyUser.updateOne({ _id: user._id }, { $set: { appLastLoginAt: new Date() } }).catch(() => {});
         return res.json({
             success: true,
             subscription: { token: user.subscriptionToken, url: `${base}/api/files/${user.subscriptionToken}` },

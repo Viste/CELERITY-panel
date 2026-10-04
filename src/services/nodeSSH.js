@@ -28,6 +28,7 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
+const { parseMitaUsers } = require('../utils/mitaUsers');
 const {
     nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand,
     buildServiceCommand, buildServiceLogsCommand, buildListenCheckCommand,
@@ -469,9 +470,17 @@ class NodeSSH {
 
             const svc = await this.exec(`${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null`);
             const listen = await this.exec(buildListenCheckCommand(osFamily, protocol, port));
+            const serviceActive = svc.stdout.trim() === 'active';
+            // Per-user last activity and traffic windows, read in the session that is already open.
+            let users = [];
+            if (serviceActive) {
+                const table = await this.exec('mita get users 2>/dev/null').catch(() => null);
+                users = parseMitaUsers(table?.stdout);
+            }
             return {
-                serviceActive: svc.stdout.trim() === 'active',
+                serviceActive,
                 listening: listen.stdout.includes(`:${port}`),
+                users,
             };
         } catch (error) {
             logger.error(`[SSH] mita status check error: ${error.message}`);

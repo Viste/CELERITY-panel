@@ -2,37 +2,9 @@ const UaSnapshot = require('../models/uaSnapshotModel');
 const cache = require('./cacheService');
 const logger = require('../utils/logger');
 
-// Ordered list for consistent matching (Hiddify before Clash — its UA contains "ClashMeta")
-const CLIENT_PATTERNS = [
-    { name: 'happ',         re: /happ/i },
-    { name: 'incy',         re: /incy/i },
-    { name: 'hiddify',      re: /hiddify/i },
-    { name: 'nekobox',      re: /nekobox|nekoray/i },
-    { name: 'singbox',      re: /sing-?box|sfa|sfi|sfm|sft|karing/i },
-    { name: 'v2rayng',      re: /v2rayng|v2rayn/i },
-    { name: 'shadowrocket', re: /shadowrocket/i },
-    { name: 'streisand',    re: /streisand/i },
-    { name: 'clash',        re: /clash|stash|surge|loon/i },
-    { name: 'quantumult',   re: /quantumult/i },
-];
-
-const CLIENT_NAMES = CLIENT_PATTERNS.map(p => p.name).concat('other');
+const { CLIENT_NAMES, detectClient } = require('../utils/subClient');
 
 const CACHE_TTL_SECONDS = 60;
-
-/**
- * Detect VPN client name from User-Agent string.
- * Returns one of the CLIENT_NAMES values.
- * @param {string} ua
- * @returns {string}
- */
-function detectClient(ua) {
-    const str = ua || '';
-    for (const { name, re } of CLIENT_PATTERNS) {
-        if (re.test(str)) return name;
-    }
-    return 'other';
-}
 
 /**
  * Build the Redis HLL key for a given date string and client name.

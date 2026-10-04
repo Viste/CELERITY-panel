@@ -648,7 +648,8 @@ class StatsService {
     async cleanup() {
         try {
             const result = await StatsSnapshot.cleanup();
-            logger.info(`[Stats] Cleanup: hourly=${result.hourly}, daily=${result.daily}, monthly=${result.monthly}`);
+            result.userNode = await require('../models/userNodeStatModel').cleanup();
+            logger.info(`[Stats] Cleanup: hourly=${result.hourly}, daily=${result.daily}, monthly=${result.monthly}, userNode=${result.userNode}`);
             return result;
         } catch (error) {
             logger.error(`[Stats] Cleanup error: ${error.message}`);

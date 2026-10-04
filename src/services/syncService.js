@@ -28,6 +28,8 @@ const config = require('../../config');
 const webhook = require('./webhookService');
 const nodeSetup = require('./nodeSetup');
 const nodeSetupLock = require('../utils/nodeSetupLock');
+const UserNodeStat = require('../models/userNodeStatModel');
+const userStatsService = require('./userStatsService');
 const { nodeOsFamily, buildServiceCommand } = require('../utils/nodeOs');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 
@@ -948,6 +950,9 @@ class SyncService {
                 const result = await HyUser.bulkWrite(bulkOps, { ordered: false });
                 logger.debug(`[Agent Stats] ${node.name}: updated ${result.modifiedCount}/${bulkOps.length} users`);
                 this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
+                // Same deltas keyed by node: who is on which server.
+                UserNodeStat.recordXray(node._id, userEntries, now)
+                    .catch(err => logger.warn(`[Agent Stats] ${node.name}: per-user stats not saved: ${err.message}`));
             }
 
             // Online = users with non-zero traffic in the last poll interval.
@@ -1116,6 +1121,10 @@ class SyncService {
             await ssh.connect();
             const probe = await ssh.checkMieruStatus();
             const isAlive = !!probe.serviceActive;
+            if (isAlive && probe.users?.length) {
+                userStatsService.recordMieruUsers(node, probe.users)
+                    .catch(err => logger.warn(`[Mieru Health] ${node.name}: per-user stats not saved: ${err.message}`));
+            }
             await HyNode.updateOne({ _id: node._id }, {
                 $set: {
                     status: isAlive ? 'online' : 'offline',

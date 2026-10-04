@@ -133,6 +133,56 @@
     </div>
 </div>
 
+<!-- Users: who is where, with which app -->
+<div class="card mt-2" id="usersCard">
+    <div class="card-header">
+        <h2><i class="ti ti-users"></i> <%= t('stats.usersTitle') %></h2>
+        <div class="header-actions users-actions">
+            <label class="users-toggle"><input type="checkbox" id="usersOnlineOnly"> <%= t('stats.usersOnlineOnly') %></label>
+            <input type="search" id="usersSearch" class="users-search" placeholder="<%= t('common.search') %>">
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="text-muted users-desc"><%= t('stats.usersDesc') %></p>
+        <div class="users-chips" id="usersSummary"></div>
+    </div>
+    <div class="card-body no-padding">
+        <div class="table-wrapper">
+            <table class="table users-table">
+                <thead>
+                    <tr>
+                        <th><%= t('stats.user') %></th>
+                        <th><%= t('stats.usersOnlineNow') %></th>
+                        <th><%= t('stats.usersApps') %></th>
+                        <th><%= t('stats.usersSubFetched') %></th>
+                        <th><%= t('stats.usersAppLogin') %></th>
+                        <th class="text-right"><%= t('stats.usersTraffic') %></th>
+                    </tr>
+                </thead>
+                <tbody id="usersTableBody">
+                    <tr><td colspan="6" class="text-center text-muted"><%= t('common.loading') %></td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="card mt-2" id="usersMatrixCard">
+    <div class="card-header">
+        <h2><i class="ti ti-grid-dots"></i> <%= t('stats.usersMatrixTitle') %></h2>
+    </div>
+    <div class="card-body">
+        <p class="text-muted users-desc"><%= t('stats.usersMatrixDesc') %></p>
+    </div>
+    <div class="card-body no-padding">
+        <div class="table-wrapper users-matrix-wrap">
+            <table class="table users-matrix" id="usersMatrix">
+                <tbody><tr><td class="text-center text-muted"><%= t('common.loading') %></td></tr></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
 <!-- Server Load Section -->
 <div class="charts-grid mt-2">
     <!-- CPU + Load Chart -->
@@ -401,6 +451,58 @@
     flex-shrink: 0;
 }
 
+.users-desc { font-size: 13px; margin-bottom: 12px; }
+.users-actions { display: flex; align-items: center; gap: 12px; }
+.users-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer; }
+.users-search {
+    padding: 7px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 13px;
+    width: 180px;
+}
+.users-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.user-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 12px;
+    white-space: nowrap;
+}
+.user-chip b { color: var(--text-primary); font-weight: 600; }
+.user-chip small { color: var(--text-muted); font-size: 11px; }
+.user-chip.chip-online { border-color: var(--success); background: var(--success-bg); color: var(--success); }
+.user-chip.chip-potato { border-color: var(--accent); color: var(--accent-hover); }
+.users-table td { vertical-align: middle; }
+.users-table .cell-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.users-table .user-name { font-weight: 600; color: var(--text-primary); text-decoration: none; }
+.users-table .user-name:hover { color: var(--accent-hover); }
+.users-table .user-alias { color: var(--text-muted); font-size: 12px; margin-left: 6px; }
+.users-table tr.user-off .user-name { color: var(--text-muted); }
+.users-table .traffic-cell { white-space: nowrap; }
+.users-matrix-wrap { overflow-x: auto; }
+.users-matrix th, .users-matrix td { white-space: nowrap; text-align: right; font-size: 12.5px; padding: 8px 10px; }
+.users-matrix th:first-child, .users-matrix td:first-child {
+    text-align: left;
+    position: sticky;
+    left: 0;
+    background: var(--bg-secondary);
+    z-index: 1;
+}
+.users-matrix th small { display: block; color: var(--text-muted); font-weight: 400; }
+.users-matrix td.cell-empty { color: var(--text-muted); opacity: 0.5; }
+.users-matrix td.cell-online { box-shadow: inset 0 0 0 1px var(--success); }
+.users-matrix .dot-online { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--success); margin-right: 5px; }
+.users-matrix tfoot td { font-weight: 600; border-top: 1px solid var(--border); }
+
 @media (max-width: 768px) {
     .clients-layout {
         grid-template-columns: 1fr;
@@ -435,6 +537,17 @@ const i18n = {
     serverRpm: <%- JSON.stringify(t('stats.serverRpm')) %>,
     serverDisk: <%- JSON.stringify(t('stats.serverDisk')) %>,
     serverDiskFree: <%- JSON.stringify(t('stats.serverDiskFree')) %>,
+    usersNever: <%- JSON.stringify(t('stats.usersNever')) %>,
+    usersNoAppPassword: <%- JSON.stringify(t('stats.usersNoAppPassword')) %>,
+    usersNotLoggedIn: <%- JSON.stringify(t('stats.usersNotLoggedIn')) %>,
+    usersLastSeen: <%- JSON.stringify(t('stats.usersLastSeen')) %>,
+    usersOn: <%- JSON.stringify(t('stats.usersOn')) %>,
+    usersDisabled: <%- JSON.stringify(t('stats.usersDisabled')) %>,
+    usersSummaryOnline: <%- JSON.stringify(t('stats.usersSummaryOnline')) %>,
+    usersSummaryNoClient: <%- JSON.stringify(t('stats.usersSummaryNoClient')) %>,
+    usersNoActivity: <%- JSON.stringify(t('stats.usersNoActivity')) %>,
+    usersTotal: <%- JSON.stringify(t('stats.usersTotal')) %>,
+    user: <%- JSON.stringify(t('stats.user')) %>,
 };
 
 // Last fetched nodes data -- stored so metric toggle doesn't require a refetch
@@ -851,6 +964,7 @@ async function loadData(period) {
         updateClientsSection(clientsData);
         updateHostCharts(hostData);
         updateTrend();
+        loadUsers(period);
         
     } catch (error) {
         console.error('Failed to load stats:', error);
@@ -1131,6 +1245,139 @@ async function updateTrend() {
         console.error('Failed to update trend:', e);
     }
 }
+
+// ---- Users: who is where, with which app ----
+let _usersData = null;
+
+const CLIENT_LABELS = {
+    'potato-android': 'Potato Android', 'potato-ios': 'Potato iOS', potato: 'Potato',
+    happ: 'Happ', incy: 'Incy', hiddify: 'Hiddify', nekobox: 'NekoBox', singbox: 'sing-box',
+    v2rayng: 'v2rayNG', shadowrocket: 'Shadowrocket', streisand: 'Streisand', clash: 'Clash',
+    quantumult: 'Quantumult', other: 'other',
+};
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+const _relativeTime = new Intl.RelativeTimeFormat(document.documentElement.lang || 'en', { numeric: 'auto', style: 'short' });
+function timeAgo(value) {
+    if (!value) return '';
+    const seconds = Math.round((new Date(value).getTime() - Date.now()) / 1000);
+    const abs = Math.abs(seconds);
+    if (abs < 60) return _relativeTime.format(Math.trunc(seconds), 'second');
+    if (abs < 3600) return _relativeTime.format(Math.trunc(seconds / 60), 'minute');
+    if (abs < 86400) return _relativeTime.format(Math.trunc(seconds / 3600), 'hour');
+    return _relativeTime.format(Math.trunc(seconds / 86400), 'day');
+}
+
+async function loadUsers(period) {
+    try {
+        const data = await fetch(`/panel/stats/api/users?period=${period}`, { credentials: 'include' }).then(r => r.json());
+        if (data.error) throw new Error(data.error);
+        _usersData = data;
+        renderUsers();
+    } catch (error) {
+        console.error('Failed to load user stats:', error);
+        document.getElementById('usersTableBody').innerHTML = `<tr><td colspan="6" class="text-center text-muted">${i18n.noData}</td></tr>`;
+    }
+}
+
+function renderUsers() {
+    const data = _usersData;
+    if (!data) return;
+    const nodeById = Object.fromEntries(data.nodes.map(n => [n.id, n]));
+    const nodeLabel = id => { const n = nodeById[id]; return n ? `${n.flag ? n.flag + ' ' : ''}${n.name}` : '?'; };
+    const query = (document.getElementById('usersSearch').value || '').trim().toLowerCase();
+    const onlineOnly = document.getElementById('usersOnlineOnly').checked;
+    const users = data.users.filter(u =>
+        (!onlineOnly || u.online.length > 0)
+        && (!query || u.userId.toLowerCase().includes(query) || (u.username || '').toLowerCase().includes(query)));
+
+    // summary chips
+    const chips = [`<span class="user-chip chip-online"><b>${data.summary.online}</b> / ${data.summary.users} ${escapeHtml(i18n.usersSummaryOnline)}</span>`];
+    Object.entries(data.summary.clients).sort((a, b) => b[1] - a[1]).forEach(([key, count]) => {
+        chips.push(`<span class="user-chip ${key.startsWith('potato') ? 'chip-potato' : ''}">${escapeHtml(CLIENT_LABELS[key] || key)} <b>${count}</b></span>`);
+    });
+    const noClient = data.summary.users - data.summary.withClient;
+    if (noClient > 0) chips.push(`<span class="user-chip">${escapeHtml(i18n.usersSummaryNoClient)} <b>${noClient}</b></span>`);
+    document.getElementById('usersSummary').innerHTML = chips.join('');
+
+    // table
+    const tbody = document.getElementById('usersTableBody');
+    if (users.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted">${i18n.noData}</td></tr>`;
+    } else {
+        tbody.innerHTML = users.map(u => {
+            const alias = u.username && u.username !== u.userId ? `<span class="user-alias">${escapeHtml(u.username)}</span>` : '';
+            const off = u.enabled ? '' : ` <span class="user-chip">${escapeHtml(i18n.usersDisabled)}</span>`;
+            let where;
+            if (u.online.length > 0) {
+                where = `<div class="cell-chips">${u.online.map(id => `<span class="user-chip chip-online">${escapeHtml(nodeLabel(id))}</span>`).join('')}</div>`;
+            } else {
+                const last = Object.entries(u.byNode).filter(([, c]) => c.lastSeen).sort((a, b) => new Date(b[1].lastSeen) - new Date(a[1].lastSeen))[0];
+                where = last
+                    ? `<span class="text-muted">${escapeHtml(i18n.usersLastSeen)} ${escapeHtml(timeAgo(last[1].lastSeen))} ${escapeHtml(i18n.usersOn)} ${escapeHtml(nodeLabel(last[0]))}</span>`
+                    : '<span class="text-muted">—</span>';
+            }
+            const apps = u.clients.length
+                ? `<div class="cell-chips">${u.clients.map(c => `<span class="user-chip ${c.key.startsWith('potato') ? 'chip-potato' : ''}">${escapeHtml(CLIENT_LABELS[c.key] || c.key)} <small>${escapeHtml(timeAgo(c.at))}</small></span>`).join('')}</div>`
+                : '<span class="text-muted">—</span>';
+            const fetched = u.lastFetchAt ? escapeHtml(timeAgo(u.lastFetchAt)) : `<span class="text-muted">${escapeHtml(i18n.usersNever)}</span>`;
+            const login = u.appLoginAt
+                ? escapeHtml(timeAgo(u.appLoginAt))
+                : `<span class="text-muted">${escapeHtml(u.hasAppPassword ? i18n.usersNotLoggedIn : i18n.usersNoAppPassword)}</span>`;
+            const traffic = (u.traffic.tx || u.traffic.rx)
+                ? `<span style="color:var(--success)">↑ ${formatBytes(u.traffic.tx)}</span> <span style="color:var(--accent)">↓ ${formatBytes(u.traffic.rx)}</span>`
+                : '<span class="text-muted">—</span>';
+            return `
+                <tr class="${u.enabled ? '' : 'user-off'}">
+                    <td><a class="user-name" href="/panel/users/${encodeURIComponent(u.userId)}">${escapeHtml(u.userId)}</a>${alias}${off}</td>
+                    <td>${where}</td>
+                    <td>${apps}</td>
+                    <td>${fetched}</td>
+                    <td>${login}</td>
+                    <td class="text-right traffic-cell">${traffic}</td>
+                </tr>`;
+        }).join('');
+    }
+
+    renderUsersMatrix(data, users);
+}
+
+function renderUsersMatrix(data, users) {
+    const table = document.getElementById('usersMatrix');
+    const active = users.filter(u => Object.keys(u.byNode).length > 0);
+    if (data.nodes.length === 0 || active.length === 0) {
+        table.innerHTML = `<tbody><tr><td class="text-center text-muted">${escapeHtml(i18n.usersNoActivity)}</td></tr></tbody>`;
+        return;
+    }
+    let max = 1;
+    active.forEach(u => Object.values(u.byNode).forEach(c => { max = Math.max(max, c.tx + c.rx); }));
+    const onlineByNode = data.summary.onlineByNode || {};
+    const head = `<thead><tr><th>${escapeHtml(i18n.user)}</th>${data.nodes.map(n =>
+        `<th title="${escapeHtml(n.type)}">${escapeHtml(n.flag || '')} ${escapeHtml(n.name)}<small>${(onlineByNode[n.id] || []).length} ${escapeHtml(i18n.usersSummaryOnline)}</small></th>`).join('')}</tr></thead>`;
+    const totals = Object.fromEntries(data.nodes.map(n => [n.id, 0]));
+    const body = active.map(u => {
+        const cells = data.nodes.map(n => {
+            const c = u.byNode[n.id];
+            const total = c ? c.tx + c.rx : 0;
+            if (!c || (total === 0 && !u.online.includes(n.id))) return '<td class="cell-empty">·</td>';
+            totals[n.id] += total;
+            const online = u.online.includes(n.id);
+            // log scale: a few megabytes should still be visible next to gigabytes
+            const alpha = total > 0 ? (0.08 + 0.42 * Math.log1p(total) / Math.log1p(max)).toFixed(2) : 0;
+            const title = `↑ ${formatBytes(c.tx)}  ↓ ${formatBytes(c.rx)}${c.lastSeen ? '  ·  ' + timeAgo(c.lastSeen) : ''}`;
+            return `<td class="${online ? 'cell-online' : ''}" style="background:rgba(var(--accent-rgb), ${alpha})" title="${escapeHtml(title)}">${online ? '<span class="dot-online"></span>' : ''}${formatBytes(total)}</td>`;
+        }).join('');
+        return `<tr><td>${escapeHtml(u.userId)}</td>${cells}</tr>`;
+    }).join('');
+    const foot = `<tfoot><tr><td>${escapeHtml(i18n.usersTotal)}</td>${data.nodes.map(n => `<td>${totals[n.id] ? formatBytes(totals[n.id]) : '·'}</td>`).join('')}</tr></tfoot>`;
+    table.innerHTML = head + `<tbody>${body}</tbody>` + foot;
+}
+
+document.getElementById('usersSearch')?.addEventListener('input', renderUsers);
+document.getElementById('usersOnlineOnly')?.addEventListener('change', renderUsers);
 
 function formatBytes(bytes) {
     if (bytes === 0) return '0 B';

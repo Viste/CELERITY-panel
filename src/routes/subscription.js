@@ -21,6 +21,7 @@ const { escapeHtml, formatPageNoteHtml } = require('../utils/textSanitize');
 const { formatTraffic } = require('../utils/formatTraffic');
 const { getDateLocale, normalizeLanguage } = require('../middleware/i18n');
 const uaStats = require('../services/uaStatsService');
+const { detectClientKey } = require('../utils/subClient');
 const { extractHwidHeaders } = require('../utils/hwidHeaders');
 const hwidDeviceService = require('../services/hwidDeviceService');
 const webhookService = require('../services/webhookService');
@@ -73,9 +74,14 @@ function isBrowser(req) {
 /** Best-effort "last fetched by a client app" marker; never affects the response. */
 function trackSubscriptionFetch(user, userAgent) {
     try {
+        const now = new Date();
         const p = HyUser.updateOne(
             { _id: user._id },
-            { $set: { lastSubFetchAt: new Date(), lastSubUserAgent: String(userAgent || '').slice(0, 200) } }
+            { $set: {
+                lastSubFetchAt: now,
+                lastSubUserAgent: String(userAgent || '').slice(0, 200),
+                [`subClients.${detectClientKey(userAgent)}`]: now,
+            } }
         );
         if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch (_) { /* stubbed model or disconnected db */ }

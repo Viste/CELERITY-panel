@@ -114,6 +114,9 @@ const hyUserSchema = new mongoose.Schema({
     // operator see who has picked up a changed subscription.
     lastSubFetchAt: { type: Date, default: null },
     lastSubUserAgent: { type: String, default: '' },
+    // client key (utils/subClient.detectClientKey) -> last subscription fetch by that app
+    subClients: { type: mongoose.Schema.Types.Mixed, default: {} },
+    appLastLoginAt: { type: Date, default: null },
 
     // Login for the mobile app (scrypt hash, see utils/appPassword.js).
     // select:false — never returned by list/get routes.
