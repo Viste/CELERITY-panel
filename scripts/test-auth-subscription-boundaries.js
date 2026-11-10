@@ -1,5 +1,6 @@
 const assert = require('assert');
 const Module = require('module');
+const YAML = require('yaml');
 
 // Module paths use backslashes on Windows, so the suffix checks below have to
 // compare against a normalized form or every stub silently misses and the test
@@ -9,18 +10,25 @@ function normalizePath(p) {
 }
 
 function createQuery(result) {
+    let populated = result;
     return {
-        populate() {
+        populate(path, projection) {
+            if (path === 'nodes' && populated?.nodes && typeof projection === 'string') {
+                const fields = new Set(['_id', ...projection.split(/\s+/)]);
+                populated = { ...populated, nodes: populated.nodes.map(node => Object.fromEntries(
+                    Object.entries(node).filter(([key]) => fields.has(key))
+                )) };
+            }
             return this;
         },
         select() {
             return this;
         },
         lean() {
-            return Promise.resolve(result);
+            return Promise.resolve(populated);
         },
         then(resolve, reject) {
-            return Promise.resolve(result).then(resolve, reject);
+            return Promise.resolve(populated).then(resolve, reject);
         },
     };
 }
@@ -299,10 +307,11 @@ async function main() {
                 active: true,
                 type: 'xray',
                 status: 'online',
+                xrayVersion: '26.11.9',
                 domain: 'xhttp.example.com',
                 port: 443,
                 groups: [],
-                xray: { transport: 'xhttp', security: 'reality', realityPublicKey: 'pk', realitySni: ['www.example.com'], realityShortIds: ['ab'], xhttpPath: '/x' },
+                xray: { transport: 'xhttp', security: 'reality', fingerprint: 'firefox', realityPublicKey: 'pk', realitySni: ['www.example.com'], realityShortIds: ['ab'], xhttpPath: '/x' },
             },
         ],
     };
@@ -382,6 +391,14 @@ async function main() {
             { type: 'xhttp', path: '/x', mode: 'auto' },
             'an XHTTP node must carry the transport sing-box-lx expects'
         );
+        assert.strictEqual(byTag.get('Xhttp').tls.utls.fingerprint, 'chrome',
+            'linked-node population must preserve the core version for REALITY compatibility');
+        res = await invokeRoute(subscriptionRouter, 'get', '/files/:token', makeFilesReq('probe-token', 'clash'));
+        assert.strictEqual(res.statusCode, 200);
+        const proxy = YAML.parse(res.body).proxies.find(item => item.name.includes('Xhttp'));
+        assert(proxy, 'the linked modern node must appear in the Clash subscription');
+        assert.strictEqual(proxy['client-fingerprint'], 'chrome');
+        assert.strictEqual(proxy['reality-opts']['support-x25519mlkem768'], true);
     });
 
     await withRateLimiterStubs(async () => {

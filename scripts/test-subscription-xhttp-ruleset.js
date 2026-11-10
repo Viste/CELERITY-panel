@@ -1,5 +1,6 @@
 const assert = require('assert');
 const Module = require('module');
+const YAML = require('yaml');
 
 // Module paths use backslashes on Windows, so suffix checks compare against a
 // normalized form or every stub silently misses and the test hits the database.
@@ -47,6 +48,7 @@ const {
     getXrayPublishedInbounds,
     singboxVlessOutboundForInbound,
     clashVlessProxyForInbound,
+    v2rayOutboundsForNode,
     resolveCdnOrigins,
 } = loadSubscription();
 const { buildXrayStreamSettings } = require('../src/services/configGenerator');
@@ -390,6 +392,36 @@ function uriParams(inbound) {
     const populated = [{ _id: 'f2', type: 'cdn', name: 'Front', cdn: { originNode: { _id: 'o1' } } }];
     resolveCdnOrigins(populated, [origin(), ...populated], true);
     assert.strictEqual(populated.length, 1);
+}
+
+// A mixed-version fleet must keep older REALITY profiles usable while telling
+// mihomo to retain the hybrid key share required by a newly upgraded server.
+{
+    const user = { xrayUuid: 'UUID' };
+    const inbound = { ...xhttpInbound, fingerprint: 'firefox' };
+    for (const version of ['', '26.3.27', 'v26.9.7', '26.9.8', '26.11.9']) {
+        const modern = ['26.9.8', '26.11.9'].includes(version);
+        const server = { ...node, xrayVersion: version, xray: inbound };
+        const expected = modern ? 'chrome' : 'firefox';
+        const clash = clashVlessProxyForInbound(user, server, inbound).proxy;
+        const proxy = YAML.parse(`proxies:\n${clash}`).proxies[0];
+        assert.strictEqual(proxy['client-fingerprint'], expected);
+        assert.strictEqual(proxy['reality-opts']['support-x25519mlkem768'], modern || undefined);
+        assert.strictEqual(proxy['reality-opts']['public-key'], 'PUBKEY');
+        assert.strictEqual(proxy['reality-opts']['short-id'], 'ab12');
+        const uri = vlessURIForInbound(user, server, inbound);
+        const params = new URL(uri.replace('vless://', 'http://')).searchParams;
+        assert.strictEqual(params.get('fp'), expected);
+        assert.strictEqual(params.get('path'), '/x');
+        const singbox = singboxVlessOutboundForInbound(user, server, inbound).outbound;
+        assert.strictEqual(singbox.tls.utls.fingerprint, expected);
+        const xray = v2rayOutboundsForNode(user, server)[0].outbound;
+        assert.strictEqual(xray.streamSettings.realitySettings.fingerprint, expected);
+        // An ordinary TLS front has no REALITY key-share requirement.
+        const tls = clashVlessProxyForInbound(user, server, { ...inbound, security: 'tls' }).proxy;
+        assert.ok(tls.includes('client-fingerprint: firefox'));
+        assert.ok(!tls.includes('support-x25519mlkem768'));
+    }
 }
 
 console.log('subscription rule-set and XHTTP tests passed');

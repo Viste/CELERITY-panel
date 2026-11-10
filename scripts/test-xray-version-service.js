@@ -1,6 +1,11 @@
 'use strict';
 
 const assert = require('assert');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
 
 process.env.PANEL_DOMAIN = process.env.PANEL_DOMAIN || 'panel.example.com';
 process.env.ACME_EMAIL = process.env.ACME_EMAIL || 'admin@example.com';
@@ -59,6 +64,11 @@ const fixture = [
 ];
 
 const releases = service.normalizeReleases(fixture);
+for (const release of releases) {
+    for (const name of ['Xray-freebsd-64.zip', 'Xray-freebsd-64.zip.dgst', 'Xray-freebsd-arm64-v8a.zip', 'Xray-freebsd-arm64-v8a.zip.dgst']) {
+        release.assets.push({ name, url: `https://github.com/XTLS/Xray-core/releases/download/${release.tag}/${name}` });
+    }
+}
 assert.deepStrictEqual(releases.map(release => release.version), ['26.7.28', '26.3.27']);
 assert.strictEqual(releases[0].prerelease, true);
 assert.strictEqual(releases[1].prerelease, false);
@@ -67,6 +77,10 @@ const asset = service.selectReleaseAsset(releases[0], 'x86_64');
 assert.ok(asset);
 assert.strictEqual(asset.archiveName, 'Xray-linux-64.zip');
 assert.strictEqual(service.selectReleaseAsset(releases[0], 'unknown-arch'), null);
+assert.strictEqual(service.selectReleaseAsset(releases[0], 'amd64', 'freebsd').archiveName, 'Xray-freebsd-64.zip');
+assert.strictEqual(service.selectReleaseAsset(releases[0], 'aarch64', 'freebsd').archiveName, 'Xray-freebsd-arm64-v8a.zip');
+assert.strictEqual(service.selectReleaseAsset(releases[0], 'mips', 'freebsd'), null);
+assert.strictEqual(service.selectReleaseAsset({ ...releases[0], assets: [] }, 'amd64', 'freebsd'), null);
 
 const poisonedRelease = {
     ...releases[0],
@@ -76,6 +90,10 @@ const poisonedRelease = {
     })),
 };
 assert.strictEqual(service.selectReleaseAsset(poisonedRelease, 'x86_64'), null);
+assert.strictEqual(service.selectReleaseAsset({
+    ...releases[0],
+    assets: releases[0].assets.map(item => ({ ...item, url: `${item.url}/untrusted` })),
+}, 'amd64', 'freebsd'), null);
 
 const requestId = '123e4567-e89b-42d3-a456-426614174000';
 const script = service.buildUpdateScript({
@@ -105,7 +123,182 @@ assert.throws(() => service.buildUpdateScript({
 }), /Invalid Xray update parameters/);
 assert.throws(() => service.buildRollbackScript('../../etc'), /Invalid Xray update task id/);
 
-async function simulateVersionChange({ currentVersion, release, syncSuccess, scriptFailure = 'none' }) {
+// Execute the generated POSIX transaction in a disposable filesystem. Only the
+// FreeBSD-specific external tools are faked; no host service or binary is used.
+function decodedCommand(command) {
+    const encoded = command.match(/printf %s ([A-Za-z0-9+/=]+) \| \/usr\/bin\/base64 -d/);
+    return encoded ? Buffer.from(encoded[1], 'base64').toString('utf8') : command;
+}
+
+// One stored ZIP entry, built with Node only: the production Alpine image has
+// an unzip applet but no zip writer, and tests must not add runtime packages.
+function storedZipFixture(name, contents) {
+    const filename = Buffer.from(name);
+    const data = Buffer.from(contents);
+    let crc = 0xffffffff;
+    for (const byte of data) {
+        crc ^= byte;
+        for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+    crc = (crc ^ 0xffffffff) >>> 0;
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(33, 12); // 1980-01-01, a valid DOS date.
+    header.writeUInt32LE(crc, 14);
+    header.writeUInt32LE(data.length, 18);
+    header.writeUInt32LE(data.length, 22);
+    header.writeUInt16LE(filename.length, 26);
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50, 0);
+    directory.writeUInt16LE(0x0314, 4); // Unix creator, ZIP version2.0.
+    directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(33, 14);
+    directory.writeUInt32LE(crc, 16);
+    directory.writeUInt32LE(data.length, 20);
+    directory.writeUInt32LE(data.length, 24);
+    directory.writeUInt16LE(filename.length, 28);
+    directory.writeUInt32LE((0o100755 << 16) >>> 0, 38);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0);
+    end.writeUInt16LE(1, 8);
+    end.writeUInt16LE(1, 10);
+    end.writeUInt32LE(directory.length + filename.length, 12);
+    end.writeUInt32LE(header.length + filename.length + data.length, 16);
+    return Buffer.concat([header, filename, data, directory, filename, end]);
+}
+
+function testFreebsdTransactions(loginShell = '/bin/sh') {
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'celerity-freebsd-update-test-'));
+    const commandDir = path.join(sandbox, 'commands');
+    fs.mkdirSync(commandDir);
+    const bin = path.join(sandbox, 'xray');
+    const config = path.join(sandbox, 'config.json');
+    const backup = path.join(sandbox, 'updates', requestId);
+    const archive = path.join(sandbox, 'archive.zip');
+    const digest = path.join(sandbox, 'archive.zip.dgst');
+    const candidateBody = `#!/bin/sh
+if [ "$1" = version ]; then
+    if [ "\${FAIL_INSTALLED_VERSION:-0}" = 1 ] && [ "$0" = "$TEST_BIN" ]; then echo 'Xray 0.0.0'; else echo 'Xray 26.7.28'; fi
+elif [ "\${FAIL_CONFIG:-0}" = 1 ]; then exit 1; fi
+`;
+    fs.writeFileSync(archive, storedZipFixture('xray', candidateBody));
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+    fs.writeFileSync(digest, `SHA2-256= ${hash}\n`);
+    const fake = (name, body) => fs.writeFileSync(path.join(commandDir, name), `#!${process.execPath}\nconst fs=require('fs');const p=process.env.TEST_ROOT;const a=process.argv.slice(2);\n${body}`, { mode: 0o755 });
+    fake('curl', `fs.copyFileSync(a.includes(process.env.TEST_DIGEST_URL)?p+'/archive.zip.dgst':p+'/archive.zip',a[a.indexOf('-o')+1]);`);
+    fake('sha256', `const c=require('crypto');console.log(c.createHash('sha256').update(fs.readFileSync(a[a.length-1])).digest('hex'));`);
+    fake('service', `fs.appendFileSync(p+'/service-calls',a[1]+'\\n');if(a[1]==='status'){process.exit(fs.readFileSync(p+'/active','utf8').trim()==='1'?0:1);}fs.writeFileSync(p+'/active',a[1]==='stop'?'0':'1');`);
+    fake('pgrep', `if(process.env.TEST_LIVE_PID){console.log(process.env.TEST_LIVE_PID);}else process.exit(1);`);
+    fake('sleep', '');
+    fake('pkg', `if(a[0]==='which'){console.log('net/xray-core');}else if(a[0]==='query'){console.log(fs.readFileSync(p+'/pkg-lock','utf8').trim());}else if(a[0]==='lock'){if(process.env.FAIL_PKG_LOCK==='1')process.exit(1);fs.writeFileSync(p+'/pkg-lock','1');}else if(a[0]==='unlock'){fs.writeFileSync(p+'/pkg-lock','0');}else process.exit(1);`);
+    const freebsdAsset = service.selectReleaseAsset(releases[0], 'amd64', 'freebsd');
+    const update = service.buildUpdateScript({ release: releases[0], asset: freebsdAsset, requestId, osFamily: 'freebsd' });
+    const verify = service._test.buildVerificationScript(requestId, releases[0].version, 'freebsd');
+    const rollbackScript = service.buildRollbackScript(requestId, 'freebsd');
+    for (const script of [update, verify, rollbackScript, service._test.buildPreflightScript()]) {
+        assert.match(script, /^\/bin\/sh -c/);
+        assert.ok(!script.includes('\n'), 'login-shell command must stay on one line');
+        assert.doesNotMatch(decodedCommand(script), /systemctl|sha256sum|\/bin\/bash|trap .*ERR/);
+        assert.strictEqual(spawnSync('/bin/sh', ['-n'], { input: decodedCommand(script) }).status, 0);
+    }
+    assert.doesNotMatch(decodedCommand(update), /service xray (stop|start|restart)/);
+    const localize = script => service._test.posixCommand(decodedCommand(script)
+        .replaceAll('/usr/local/bin/xray', bin)
+        .replaceAll('/usr/local/etc/xray/config.json', config)
+        .replaceAll('/var/lib/celerity-xray-updates', path.join(sandbox, 'updates'))
+        .replaceAll('/tmp/celerity-xray-update.', path.join(sandbox, 'temp.')))
+        // FreeBSD uses /usr/bin/base64; Alpine's same decoder is /bin/base64.
+        .replace('/usr/bin/base64', 'base64');
+    const execute = (script, extra = {}) => spawnSync(loginShell, [loginShell.endsWith('/csh') ? '-fc' : '-c', localize(script)], {
+        encoding: 'utf8', timeout: 15000,
+        env: { ...process.env, PATH: `${commandDir}:${sandbox}:${process.env.PATH}`, TEST_ROOT: sandbox, TEST_BIN: bin, TEST_DIGEST_URL: freebsdAsset.digestUrl, ...extra },
+    });
+    const oldBody = '#!/bin/sh\necho "Xray 26.3.27"\n';
+    const reset = (lock = '0', active = '1') => {
+        fs.rmSync(path.dirname(backup), { recursive: true, force: true });
+        fs.writeFileSync(bin, oldBody, { mode: 0o755 });
+        fs.writeFileSync(config, '{"old":"config"}');
+        fs.writeFileSync(path.join(sandbox, 'pkg-lock'), lock);
+        fs.writeFileSync(path.join(sandbox, 'active'), active);
+        fs.writeFileSync(path.join(sandbox, 'service-calls'), '');
+        fs.writeFileSync(digest, `SHA2-256= ${hash}\n`);
+    };
+    const restored = lock => {
+        assert.strictEqual(fs.readFileSync(bin, 'utf8'), oldBody);
+        assert.strictEqual(fs.readFileSync(config, 'utf8'), '{"old":"config"}');
+        assert.strictEqual(fs.readFileSync(path.join(sandbox, 'pkg-lock'), 'utf8'), lock);
+        assert.ok(!fs.existsSync(backup));
+    };
+    try {
+        reset();
+        const preflight = execute(service._test.buildPreflightScript());
+        assert.strictEqual(preflight.status, 0, preflight.stdout + preflight.stderr);
+        assert.match(preflight.stdout, /^VERSION=26\.3\.27$/m);
+        assert.match(preflight.stdout, /^ARCH=.+$/m);
+        const discovery = execute(service._test.posixCommand(`xray version 2>/dev/null | awk 'NR==1 {print $2}'`));
+        assert.strictEqual(discovery.status, 0, discovery.stdout + discovery.stderr);
+        assert.strictEqual(discovery.stdout.trim(), '26.3.27');
+        const installed = execute(update, { TEST_LIVE_PID: String(process.pid) });
+        assert.strictEqual(installed.status, 0, installed.stdout + installed.stderr);
+        assert.strictEqual(fs.readFileSync(path.join(sandbox, 'pkg-lock'), 'utf8'), '0', 'pin must wait for verification');
+        assert.strictEqual(fs.readFileSync(path.join(backup, 'pkg-lock-state'), 'utf8').trim(), '0');
+        const verified = execute(verify);
+        assert.strictEqual(verified.status, 0, verified.stdout + verified.stderr);
+        assert.match(verified.stdout, /RESTART: activating/);
+        assert.strictEqual(fs.readFileSync(path.join(sandbox, 'pkg-lock'), 'utf8'), '1');
+        assert.strictEqual(execute(rollbackScript).status, 0);
+        restored('0');
+        assert.strictEqual(fs.readFileSync(path.join(sandbox, 'active'), 'utf8'), '1');
+
+        reset('1', '0');
+        assert.strictEqual(execute(update).status, 0);
+        assert.strictEqual(execute(verify).status, 0);
+        assert.strictEqual(execute(rollbackScript).status, 0);
+        restored('1');
+        assert.strictEqual(fs.readFileSync(path.join(sandbox, 'active'), 'utf8'), '0');
+
+        reset();
+        fs.writeFileSync(digest, `SHA2-256= ${'0'.repeat(64)}\n`);
+        const badDigest = execute(update);
+        assert.notStrictEqual(badDigest.status, 0);
+        assert.match(badDigest.stdout, /checksum mismatch/);
+        restored('0');
+
+        reset();
+        const badConfig = execute(update, { FAIL_CONFIG: '1' });
+        assert.notStrictEqual(badConfig.status, 0);
+        assert.match(badConfig.stdout, /current config is incompatible/);
+        restored('0');
+
+        reset();
+        fs.mkdirSync(backup, { recursive: true });
+        fs.writeFileSync(path.join(backup, 'keep'), 'existing backup');
+        assert.notStrictEqual(execute(update).status, 0);
+        assert.strictEqual(fs.readFileSync(path.join(backup, 'keep'), 'utf8'), 'existing backup');
+        assert.strictEqual(fs.readFileSync(bin, 'utf8'), oldBody);
+
+        reset();
+        const swappedFailure = execute(update, { FAIL_INSTALLED_VERSION: '1' });
+        assert.notStrictEqual(swappedFailure.status, 0);
+        assert.match(swappedFailure.stdout, /SWAPPED=1/);
+        assert.match(swappedFailure.stdout, /ROLLBACK: previous Xray binary restored/);
+        restored('0');
+
+        reset();
+        assert.strictEqual(execute(update).status, 0);
+        assert.notStrictEqual(execute(verify, { FAIL_PKG_LOCK: '1' }).status, 0);
+        assert.strictEqual(execute(rollbackScript).status, 0);
+        restored('0');
+    } finally {
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+}
+
+testFreebsdTransactions();
+if (fs.existsSync('/bin/csh')) testFreebsdTransactions('/bin/csh');
+
+async function simulateVersionChange({ currentVersion, release, syncSuccess, scriptFailure = 'none', osFamily = 'linux', verifyFailure = false, metadataFailure = false, serviceActive = true, status = 'online' }) {
     const HyNode = require('../src/models/hyNodeModel');
     const nodeSetup = require('../src/services/nodeSetup');
     const syncService = require('../src/services/syncService');
@@ -120,11 +313,14 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
         loggerError: logger.error,
     };
     const commands = [];
+    const updates = [];
+    let syncCalls = 0;
     const node = {
         _id: '507f1f77bcf86cd799439011',
         name: 'test-node',
         type: 'xray',
-        status: 'online',
+        osFamily,
+        status,
         cascadeRole: 'standalone',
         ssh: { password: 'encrypted' },
         xray: {},
@@ -145,15 +341,23 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
 
     try {
         HyNode.findById = async () => node;
-        HyNode.updateOne = async () => ({ acknowledged: true });
+        HyNode.updateOne = async (_query, update) => {
+            updates.push(update);
+            if (metadataFailure && update.$set?.xrayVersion === release.version) throw new Error('Metadata write failed');
+            return { acknowledged: true };
+        };
         nodeSetup.connectSSH = async () => ({ end() {} });
         nodeSetup.execSSH = async (_conn, command) => {
+            command = decodedCommand(command);
             commands.push(command);
             if (command.includes('ARCH="$(uname -m)"')) {
-                return { success: true, output: `ARCH=x86_64\nVERSION=${currentVersion}\n` };
+                return { success: true, output: `ARCH=${osFamily === 'freebsd' ? 'amd64' : 'x86_64'}\nOS=${osFamily === 'freebsd' ? 'FreeBSD' : 'Linux'}\nVERSION=${currentVersion}\nSERVICE_ACTIVE=${serviceActive ? 1 : 0}\n` };
             }
             if (command.includes('VERSION="$(xray version')) {
                 return { success: true, output: `VERSION=${release.version}\n` };
+            }
+            if (command.includes('PKG: xray-core locked against automatic replacement')) {
+                return { success: !verifyFailure, output: verifyFailure ? 'ERROR: package lock failed\n' : `VERSION=${release.version}\n` };
             }
             if (command.includes('curl -fL')) {
                 if (scriptFailure === 'before-swap') {
@@ -173,11 +377,11 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
             }
             return { success: true, output: '' };
         };
-        syncService.updateXrayNodeConfig = async () => syncSuccess;
+        syncService.updateXrayNodeConfig = async () => { syncCalls++; return syncSuccess; };
         logger.info = () => {};
         logger.error = () => {};
         await service._test.runVersionChange(task, release);
-        return { task, commands };
+        return { task, commands, updates, syncCalls };
     } finally {
         HyNode.findById = originals.findById;
         HyNode.updateOne = originals.updateOne;
@@ -237,6 +441,86 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
     assert.strictEqual(selfHealed.task.state, 'error');
     assert.strictEqual(selfHealed.task.nodeUnchanged, false);
     assert.strictEqual(selfHealed.task.rollbackSucceeded, true);
+
+    const freebsdUpgrade = await simulateVersionChange({
+        currentVersion: '26.3.27', release: releases[0], syncSuccess: true, osFamily: 'freebsd',
+    });
+    assert.strictEqual(freebsdUpgrade.task.state, 'done');
+    assert.ok(freebsdUpgrade.commands.some(command => command.includes('Xray-freebsd-64.zip')));
+    assert.ok(freebsdUpgrade.commands.some(command => command.includes('pkg lock -y xray-core')));
+    assert.ok(freebsdUpgrade.commands.every(command => !command.includes('systemctl')));
+
+    const freebsdStopped = await simulateVersionChange({
+        currentVersion: '26.3.27', release: releases[0], syncSuccess: true, osFamily: 'freebsd', serviceActive: false, status: 'offline',
+    });
+    assert.strictEqual(freebsdStopped.task.state, 'error');
+    assert.strictEqual(freebsdStopped.task.nodeUnchanged, true);
+    assert.match(freebsdStopped.task.error, /service is stopped/);
+    assert.strictEqual(freebsdStopped.commands.length, 1, 'stopped service must abort at read-only preflight');
+    assert.strictEqual(freebsdStopped.syncCalls, 0, 'sync would restart the stopped service and must never run');
+    assert.strictEqual(freebsdStopped.updates.at(-1).$set.status, 'offline');
+
+    const freebsdRollback = await simulateVersionChange({
+        currentVersion: '26.3.27', release: releases[0], syncSuccess: false, osFamily: 'freebsd',
+    });
+    assert.strictEqual(freebsdRollback.task.state, 'error');
+    assert.strictEqual(freebsdRollback.task.rollbackSucceeded, true);
+    assert.ok(freebsdRollback.commands.some(command => command.includes('service xray start')));
+
+    const freebsdPinFailure = await simulateVersionChange({
+        currentVersion: '26.3.27', release: releases[0], syncSuccess: true, osFamily: 'freebsd', verifyFailure: true,
+    });
+    assert.strictEqual(freebsdPinFailure.task.state, 'error');
+    assert.strictEqual(freebsdPinFailure.task.rollbackSucceeded, true);
+
+    const failedMetadata = await simulateVersionChange({
+        currentVersion: '26.3.27', release: releases[0], syncSuccess: true, osFamily: 'freebsd', metadataFailure: true,
+    });
+    assert.strictEqual(failedMetadata.task.state, 'error');
+    assert.strictEqual(failedMetadata.task.rollbackSucceeded, true);
+    assert.strictEqual(failedMetadata.updates.at(-1).$set.xrayVersion, '26.3.27');
+    assert.ok(failedMetadata.commands.some(command => command.includes('previous Xray version restored')));
+
+    // Observing a changed runtime version must invalidate subscription/node
+    // caches on either discovery path; unchanged observations must not flush.
+    const cache = require('../src/services/cacheService');
+    const HyNode = require('../src/models/hyNodeModel');
+    const nodeSetup = require('../src/services/nodeSetup');
+    const sync = require('../src/services/syncService');
+    const saved = {
+        updateOne: HyNode.updateOne, connectSSH: nodeSetup.connectSSH, execSSH: nodeSetup.execSSH,
+        agentRequest: sync._agentRequest, invalidateNodes: cache.invalidateNodes,
+        invalidateAllSubscriptions: cache.invalidateAllSubscriptions, invalidateDashboardCounts: cache.invalidateDashboardCounts,
+    };
+    try {
+        HyNode.updateOne = async () => ({ acknowledged: true });
+        nodeSetup.connectSSH = async () => ({ end() {} });
+        nodeSetup.execSSH = async () => ({ success: true, output: '26.11.9\n' });
+        sync._agentRequest = async () => ({ data: { xray_version: '26.11.9' } });
+        cache.invalidateAllSubscriptions = async () => {};
+        cache.invalidateDashboardCounts = async () => {};
+        for (const agent of [true, false]) {
+            for (const changed of [true, false]) {
+                let invalidated = 0;
+                cache.invalidateNodes = async () => { invalidated++; };
+                const detected = await service.detectInstalledVersion({
+                    _id: '507f1f77bcf86cd799439011', type: 'xray', name: 'version-cache-test',
+                    xrayVersion: changed ? '26.3.27' : '26.11.9',
+                    xray: agent ? { agentToken: 'fixture-token' } : {}, ssh: { password: 'fixture-encrypted' },
+                }, { forceSsh: !agent });
+                assert.strictEqual(detected, '26.11.9');
+                assert.strictEqual(invalidated, changed ? 1 : 0);
+            }
+        }
+    } finally {
+        HyNode.updateOne = saved.updateOne;
+        nodeSetup.connectSSH = saved.connectSSH;
+        nodeSetup.execSSH = saved.execSSH;
+        sync._agentRequest = saved.agentRequest;
+        cache.invalidateNodes = saved.invalidateNodes;
+        cache.invalidateAllSubscriptions = saved.invalidateAllSubscriptions;
+        cache.invalidateDashboardCounts = saved.invalidateDashboardCounts;
+    }
 
     // The version list must stay lightweight: changelog bodies are fetched
     // per release instead of being shipped with every status response.

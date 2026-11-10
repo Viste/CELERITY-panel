@@ -220,8 +220,22 @@ const ARCH_ASSETS = {
     loongarch64: 'Xray-linux-loong64.zip',
 };
 
-function selectReleaseAsset(release, architecture) {
-    const archiveName = ARCH_ASSETS[String(architecture || '').trim().toLowerCase()];
+const FREEBSD_ARCH_ASSETS = {
+    x86_64: 'Xray-freebsd-64.zip',
+    amd64: 'Xray-freebsd-64.zip',
+    i386: 'Xray-freebsd-32.zip',
+    i486: 'Xray-freebsd-32.zip',
+    i586: 'Xray-freebsd-32.zip',
+    i686: 'Xray-freebsd-32.zip',
+    aarch64: 'Xray-freebsd-arm64-v8a.zip',
+    arm64: 'Xray-freebsd-arm64-v8a.zip',
+    armv7: 'Xray-freebsd-arm32-v7a.zip',
+    armv7l: 'Xray-freebsd-arm32-v7a.zip',
+};
+
+function selectReleaseAsset(release, architecture, osFamily = 'linux') {
+    const assets = osFamily === 'freebsd' ? FREEBSD_ARCH_ASSETS : ARCH_ASSETS;
+    const archiveName = assets[String(architecture || '').trim().toLowerCase()];
     if (!archiveName) return null;
     const digestName = `${archiveName}.dgst`;
     const archive = release?.assets?.find(asset => asset.name === archiveName);
@@ -229,7 +243,7 @@ function selectReleaseAsset(release, architecture) {
     if (!archive || !digest) return null;
 
     const expectedPrefix = `${RELEASE_DOWNLOAD_PREFIX}${release.tag}/`;
-    if (!archive.url.startsWith(expectedPrefix) || !digest.url.startsWith(expectedPrefix)) {
+    if (archive.url !== `${expectedPrefix}${archiveName}` || digest.url !== `${expectedPrefix}${digestName}`) {
         return null;
     }
     return {
@@ -239,13 +253,133 @@ function selectReleaseAsset(release, architecture) {
     };
 }
 
-function buildUpdateScript({ release, asset, requestId }) {
+function posixCommand(script) {
+    // csh does not accept POSIX assignments or literal multiline quoted
+    // arguments, and handles quoted heredoc delimiters differently from sh.
+    // Keep the login-shell command on one line and decode inside explicit sh.
+    const encoded = Buffer.from(script, 'utf8').toString('base64');
+    return `/bin/sh -c ${shellQuote(`script=$(printf %s ${encoded} | /usr/bin/base64 -d) || exit $?; eval "$script"`)}`;
+}
+
+function buildPreflightScript() {
+    return posixCommand(`
+ARCH="$(uname -m)"
+OS="$(uname -s)"
+VERSION="$(xray version 2>/dev/null | awk 'NR==1 {print $2}')"
+echo "ARCH=$ARCH"
+echo "OS=$OS"
+echo "VERSION=$VERSION"
+if [ "$OS" = "FreeBSD" ]; then
+    if service xray status >/dev/null 2>&1; then echo "SERVICE_ACTIVE=1"; else echo "SERVICE_ACTIVE=0"; fi
+fi
+`);
+}
+
+function buildFreebsdUpdateScript({ release, asset, requestId }) {
+    const target = normalizeVersion(release.tag);
+    return posixCommand(`#!/bin/sh
+set -eu
+umask 077
+TARGET=${shellQuote(target)}
+ARCHIVE_URL=${shellQuote(asset.archiveUrl)}
+DIGEST_URL=${shellQuote(asset.digestUrl)}
+BIN="/usr/local/bin/xray"
+CONFIG="/usr/local/etc/xray/config.json"
+ASSET_DIR="/usr/local/share/xray-core"
+BACKUP_ROOT=${shellQuote(`/var/lib/celerity-xray-updates/${requestId}`)}
+TMP_DIR="$(mktemp -d /tmp/celerity-xray-update.XXXXXX)"
+SWAPPED=0
+OWN_BACKUP=0
+
+finish() {
+    code=$?
+    trap - EXIT HUP INT TERM
+    set +e
+    if [ "$code" -ne 0 ]; then
+        restored=1
+        if [ "$SWAPPED" = "1" ]; then
+            if install -m 0755 "$BACKUP_ROOT/xray" "$BIN.rollback" && mv -f "$BIN.rollback" "$BIN" && cp -p "$BACKUP_ROOT/config.json" "$CONFIG"; then
+                echo "ROLLBACK: previous Xray binary restored"
+            else
+                restored=0
+                echo "ROLLBACK ERROR: backup retained at $BACKUP_ROOT"
+            fi
+        fi
+        if [ "$OWN_BACKUP" = "1" ] && [ "$restored" = "1" ]; then rm -rf "$BACKUP_ROOT"; fi
+    fi
+    if [ "$OWN_BACKUP" = "1" ]; then rm -f "$BIN.new" "$BIN.rollback"; fi
+    rm -rf "$TMP_DIR"
+    exit "$code"
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for command in curl unzip sha256 service install pgrep; do
+    command -v "$command" >/dev/null 2>&1 || { echo "ERROR: required command not found: $command"; exit 1; }
+done
+[ -x "$BIN" ] || { echo "ERROR: Xray is not installed"; exit 1; }
+[ -f "$CONFIG" ] || { echo "ERROR: Xray config not found"; exit 1; }
+[ ! -e "$BACKUP_ROOT" ] || { echo "ERROR: update backup already exists"; exit 1; }
+mkdir -p "$BACKUP_ROOT"
+OWN_BACKUP=1
+cp -p "$BIN" "$BACKUP_ROOT/xray"
+cp -p "$CONFIG" "$BACKUP_ROOT/config.json"
+if service xray status >/dev/null 2>&1; then
+    touch "$BACKUP_ROOT/was-active"
+    pgrep -x xray >"$BACKUP_ROOT/previous-pids" || true
+fi
+# The pkg keeps owning this path. Pin it after verification so a later pkg
+# upgrade cannot silently replace the panel-managed official binary.
+if command -v pkg >/dev/null 2>&1 && [ "$(pkg which -qo "$BIN" 2>/dev/null || true)" = "net/xray-core" ]; then
+    PKG_LOCK="$(pkg query '%k' xray-core)"
+    case "$PKG_LOCK" in 0|1) ;; *) echo "ERROR: cannot read xray-core package lock"; exit 1 ;; esac
+    printf '%s\\n' "$PKG_LOCK" >"$BACKUP_ROOT/pkg-lock-state"
+fi
+
+curl -fL --connect-timeout 15 --max-time 300 "$ARCHIVE_URL" -o "$TMP_DIR/xray.zip"
+curl -fL --connect-timeout 15 --max-time 60 "$DIGEST_URL" -o "$TMP_DIR/xray.zip.dgst"
+EXPECTED="$(awk '/^SHA2-256=/{print $2; exit}' "$TMP_DIR/xray.zip.dgst")"
+printf '%s\\n' "$EXPECTED" | grep -Eq '^[0-9a-fA-F]{64}$' || { echo "ERROR: SHA-256 digest missing"; exit 1; }
+ACTUAL="$(sha256 -q "$TMP_DIR/xray.zip")"
+[ "$ACTUAL" = "$EXPECTED" ] || { echo "ERROR: Xray archive checksum mismatch"; exit 1; }
+echo "CHECKSUM: verified"
+mkdir -p "$TMP_DIR/unpack"
+unzip -q "$TMP_DIR/xray.zip" -d "$TMP_DIR/unpack"
+NEW_BIN="$TMP_DIR/unpack/xray"
+[ -s "$NEW_BIN" ] || { echo "ERROR: Xray binary missing from archive"; exit 1; }
+chmod 0755 "$NEW_BIN"
+NEW_VERSION="$("$NEW_BIN" version 2>/dev/null | awk 'NR==1 {print $2}')"
+NEW_VERSION="\${NEW_VERSION#v}"
+[ "$NEW_VERSION" = "$TARGET" ] || { echo "ERROR: downloaded Xray version does not match target"; exit 1; }
+if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$NEW_BIN" run -test -config "$CONFIG" >"$TMP_DIR/config-test.log" 2>&1; then
+    if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$NEW_BIN" -test -config "$CONFIG" >>"$TMP_DIR/config-test.log" 2>&1; then
+        echo "ERROR: current config is incompatible with Xray $TARGET"
+        exit 1
+    fi
+fi
+echo "CONFIG: compatible with Xray $TARGET"
+install -m 0755 "$NEW_BIN" "$BIN.new"
+mv -f "$BIN.new" "$BIN"
+SWAPPED=1
+echo "SWAPPED=1"
+INSTALLED_VERSION="$("$BIN" version 2>/dev/null | awk 'NR==1 {print $2}')"
+INSTALLED_VERSION="\${INSTALLED_VERSION#v}"
+[ "$INSTALLED_VERSION" = "$TARGET" ] || { echo "ERROR: installed version does not match target"; exit 1; }
+echo "UPDATED_VERSION=$INSTALLED_VERSION"
+echo "BACKUP_ROOT=$BACKUP_ROOT"
+`);
+}
+
+function buildUpdateScript({ release, asset, requestId, osFamily = 'linux' }) {
     if (!release || !parseVersion(release.tag) || !TASK_ID_RE.test(requestId)) {
         throw new Error('Invalid Xray update parameters');
     }
     if (!asset || !asset.archiveUrl || !asset.digestUrl) {
         throw new Error('Missing Xray release assets');
     }
+    if (osFamily === 'freebsd') return buildFreebsdUpdateScript({ release, asset, requestId });
 
     const target = normalizeVersion(release.tag);
     const archiveUrl = shellQuote(asset.archiveUrl);
@@ -354,9 +488,38 @@ echo "BACKUP_ROOT=$BACKUP_ROOT"
 `;
 }
 
-function buildRollbackScript(requestId) {
+function buildRollbackScript(requestId, osFamily = 'linux') {
     if (!TASK_ID_RE.test(requestId)) throw new Error('Invalid Xray update task id');
     const backupRoot = `/var/lib/celerity-xray-updates/${requestId}`;
+    if (osFamily === 'freebsd') {
+        return posixCommand(`#!/bin/sh
+set -eu
+BACKUP_ROOT=${shellQuote(backupRoot)}
+BIN="/usr/local/bin/xray"
+CONFIG="/usr/local/etc/xray/config.json"
+[ -x "$BACKUP_ROOT/xray" ] || { echo "ERROR: rollback binary not found"; exit 1; }
+if service xray status >/dev/null 2>&1; then
+    service xray stop </dev/null >/dev/null 2>&1
+fi
+install -m 0755 "$BACKUP_ROOT/xray" "$BIN.rollback"
+mv -f "$BIN.rollback" "$BIN"
+cp -p "$BACKUP_ROOT/config.json" "$CONFIG"
+if [ -f "$BACKUP_ROOT/pkg-lock-state" ]; then
+    case "$(cat "$BACKUP_ROOT/pkg-lock-state")" in
+        1) pkg lock -y xray-core >/dev/null ;;
+        0) pkg unlock -y xray-core >/dev/null ;;
+        *) echo "ERROR: invalid saved package lock state"; exit 1 ;;
+    esac
+fi
+if [ -f "$BACKUP_ROOT/was-active" ]; then
+    service xray start </dev/null >/dev/null 2>&1
+    sleep 2
+    service xray status >/dev/null 2>&1
+fi
+rm -rf "$BACKUP_ROOT"
+echo "ROLLBACK: previous Xray version restored"
+`);
+    }
     return `#!/bin/bash
 set -euo pipefail
 BACKUP_ROOT=${shellQuote(backupRoot)}
@@ -379,6 +542,63 @@ echo "ROLLBACK: previous Xray version restored"
 function buildCleanupScript(requestId) {
     if (!TASK_ID_RE.test(requestId)) throw new Error('Invalid Xray update task id');
     return `rm -rf ${shellQuote(`/var/lib/celerity-xray-updates/${requestId}`)}`;
+}
+
+function buildVerificationScript(requestId, version, osFamily = 'linux') {
+    if (!TASK_ID_RE.test(requestId) || !parseVersion(version)) throw new Error('Invalid Xray verification parameters');
+    const backupRoot = `/var/lib/celerity-xray-updates/${requestId}`;
+    if (osFamily === 'freebsd') {
+        return posixCommand(`#!/bin/sh
+set -eu
+BACKUP_ROOT=${shellQuote(backupRoot)}
+VERSION="$(/usr/local/bin/xray version 2>/dev/null | awk 'NR==1 {print $2}')"
+VERSION="\${VERSION#v}"
+echo "VERSION=$VERSION"
+[ "$VERSION" = ${shellQuote(normalizeVersion(version))} ]
+if [ -f "$BACKUP_ROOT/was-active" ]; then
+    NEED_RESTART=0
+    if ! service xray status >/dev/null 2>&1; then NEED_RESTART=1; fi
+    # The configuration sync normally restarts the rc.d service. If it skipped
+    # an unchanged config, a surviving old pid is still executing the old inode.
+    if [ -f "$BACKUP_ROOT/previous-pids" ]; then
+        while IFS= read -r old_pid; do
+            case "$old_pid" in ''|*[!0-9]*) continue ;; esac
+            if kill -0 "$old_pid" 2>/dev/null; then NEED_RESTART=1; fi
+        done <"$BACKUP_ROOT/previous-pids"
+    fi
+    if [ "$NEED_RESTART" = "1" ]; then
+        echo "RESTART: activating the new Xray binary"
+        service xray restart </dev/null >/dev/null 2>&1
+        sleep 2
+    fi
+    service xray status >/dev/null 2>&1
+fi
+if [ -f "$BACKUP_ROOT/pkg-lock-state" ]; then
+    pkg lock -y xray-core >/dev/null
+    [ "$(pkg query '%k' xray-core)" = "1" ]
+    echo "PKG: xray-core locked against automatic replacement"
+fi
+`);
+    }
+    return `
+VERSION="$(xray version 2>/dev/null | awk 'NR==1 {print $2}')"
+VERSION="\${VERSION#v}"
+echo "VERSION=$VERSION"
+[ "$VERSION" = ${shellQuote(normalizeVersion(version))} ]
+if [ -f ${shellQuote(`${backupRoot}/was-active`)} ]; then
+    MAIN_PID="$(systemctl show -p MainPID --value xray 2>/dev/null || echo 0)"
+    if [ -n "$MAIN_PID" ] && [ "$MAIN_PID" != "0" ]; then
+        case "$(readlink "/proc/$MAIN_PID/exe" 2>/dev/null || true)" in
+            *"(deleted)"*)
+                echo "RESTART: activating the new Xray binary"
+                systemctl restart xray
+                sleep 2
+                ;;
+        esac
+    fi
+    systemctl is-active --quiet xray
+fi
+`;
 }
 
 function appendLog(task, message) {
@@ -437,7 +657,9 @@ async function execRequired(conn, command, label) {
 function parsePreflight(output) {
     const architecture = output.match(/^ARCH=(.+)$/m)?.[1]?.trim() || '';
     const version = normalizeVersion(output.match(/^VERSION=(.+)$/m)?.[1]?.trim() || '');
-    return { architecture, version };
+    const os = output.match(/^OS=(.+)$/m)?.[1]?.trim() || '';
+    const active = output.match(/^SERVICE_ACTIVE=([01])$/m)?.[1];
+    return { architecture, version, os, serviceActive: active === undefined ? null : active === '1' };
 }
 
 async function detectInstalledVersion(node, { forceSsh = false } = {}) {
@@ -451,6 +673,7 @@ async function detectInstalledVersion(node, { forceSsh = false } = {}) {
             const version = normalizeVersion(response?.data?.xray_version);
             if (version) {
                 await HyNode.updateOne({ _id: node._id }, { $set: { xrayVersion: version } });
+                if (version !== storedVersion) await invalidateNodesCache();
                 return version;
             }
         } catch (error) {
@@ -466,12 +689,13 @@ async function detectInstalledVersion(node, { forceSsh = false } = {}) {
         conn = await nodeSetup.connectSSH(node);
         const output = await execRequired(
             conn,
-            `xray version 2>/dev/null | awk 'NR==1 {print $2}'`,
+            posixCommand(`xray version 2>/dev/null | awk 'NR==1 {print $2}'`),
             'Xray version detection'
         );
         const version = normalizeVersion(output.trim());
         if (version) {
             await HyNode.updateOne({ _id: node._id }, { $set: { xrayVersion: version } });
+            if (version !== storedVersion) await invalidateNodesCache();
             return version;
         }
     } catch (error) {
@@ -496,14 +720,15 @@ async function runVersionChange(task, release) {
     let conn = null;
     let changed = false;
     let rollbackSucceeded = false;
+    let osFamily = 'linux';
+    let originalStatus = null;
     try {
         task.step = 'preflight';
         const node = await HyNode.findById(task.nodeId);
         if (!node) throw new Error('Node not found');
+        originalStatus = node.status;
         if (node.type !== 'xray') throw new Error('Node is not an Xray node');
-        if (nodeOsFamily(node) === 'freebsd') {
-            throw new Error('Xray version changes are not supported on FreeBSD nodes — upgrade xray-core with pkg on the host');
-        }
+        osFamily = nodeOsFamily(node);
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error('SSH credentials are required');
         }
@@ -511,20 +736,19 @@ async function runVersionChange(task, release) {
         conn = await nodeSetup.connectSSH(node);
         // A missing core is reported below instead of failing the script, so
         // the operator gets a reason rather than "Xray preflight failed".
-        const preflightOutput = await execRequired(conn, `
-ARCH="$(uname -m)"
-VERSION="$(xray version 2>/dev/null | awk 'NR==1 {print $2}')"
-echo "ARCH=$ARCH"
-echo "VERSION=$VERSION"
-`, 'Xray preflight');
+        const preflightOutput = await execRequired(conn, buildPreflightScript(), 'Xray preflight');
         const preflight = parsePreflight(preflightOutput);
+        if (preflight.os) osFamily = /^freebsd$/i.test(preflight.os) ? 'freebsd' : 'linux';
         if (!preflight.version) {
             throw new Error('Xray is not installed on this node — run the initial setup first');
         }
         task.currentVersion = preflight.version;
         appendLog(task, `Current Xray version: ${preflight.version}`);
+        if (osFamily === 'freebsd' && preflight.serviceActive === false) {
+            throw new Error('Xray service is stopped; start it explicitly before changing versions');
+        }
 
-        const asset = selectReleaseAsset(release, preflight.architecture);
+        const asset = selectReleaseAsset(release, preflight.architecture, osFamily);
         if (!asset) {
             throw new Error(`Release ${release.tag} has no verified asset for ${preflight.architecture || 'this architecture'}`);
         }
@@ -533,7 +757,7 @@ echo "VERSION=$VERSION"
         appendLog(task, `Installing Xray ${release.tag} for ${preflight.architecture}`);
         const updateOutput = await execRequired(
             conn,
-            buildUpdateScript({ release, asset, requestId: task.id }),
+            buildUpdateScript({ release, asset, requestId: task.id, osFamily }),
             'Xray version change'
         );
         changed = true;
@@ -552,29 +776,12 @@ echo "VERSION=$VERSION"
         // configuration sync above is what activates the new binary. If that
         // restart silently failed, /proc/<pid>/exe still points at the deleted
         // file and the service is restarted here as a fallback.
-        const verifyOutput = await execRequired(conn, `
-VERSION="$(xray version 2>/dev/null | awk 'NR==1 {print $2}')"
-VERSION="\${VERSION#v}"
-echo "VERSION=$VERSION"
-[ "$VERSION" = ${shellQuote(release.version)} ]
-if [ -f ${shellQuote(`/var/lib/celerity-xray-updates/${task.id}/was-active`)} ]; then
-    MAIN_PID="$(systemctl show -p MainPID --value xray 2>/dev/null || echo 0)"
-    if [ -n "$MAIN_PID" ] && [ "$MAIN_PID" != "0" ]; then
-        case "$(readlink "/proc/$MAIN_PID/exe" 2>/dev/null || true)" in
-            *"(deleted)"*)
-                echo "RESTART: activating the new Xray binary"
-                systemctl restart xray
-                sleep 2
-                ;;
-        esac
-    fi
-    systemctl is-active --quiet xray
-fi
-`, 'Xray verification');
+        const verifyOutput = await execRequired(
+            conn,
+            buildVerificationScript(task.id, release.version, osFamily),
+            'Xray verification'
+        );
         appendLog(task, verifyOutput);
-        await execRequired(conn, buildCleanupScript(task.id), 'Xray backup cleanup');
-        conn.end();
-        conn = null;
 
         await HyNode.updateOne(
             { _id: task.nodeId },
@@ -589,6 +796,15 @@ fi
             }
         );
         await invalidateNodesCache();
+        // Keep rollback files until metadata/cache writes have succeeded too.
+        // Cleanup failure leaves a reviewable backup, not a broken deployment.
+        try {
+            await execRequired(conn, buildCleanupScript(task.id), 'Xray backup cleanup');
+        } catch (cleanupError) {
+            appendLog(task, `WARNING: ${cleanupError.message}; update backup retained`);
+        }
+        conn.end();
+        conn = null;
 
         task.state = 'done';
         task.step = 'done';
@@ -618,7 +834,7 @@ fi
                 }
                 const rollbackOutput = await execRequired(
                     conn,
-                    buildRollbackScript(task.id),
+                    buildRollbackScript(task.id, osFamily),
                     'Xray rollback'
                 );
                 appendLog(task, rollbackOutput);
@@ -635,7 +851,7 @@ fi
         task.rollbackSucceeded = rollbackSucceeded;
         task.nodeUnchanged = nodeUnchanged;
 
-        const status = (nodeUnchanged || rollbackSucceeded) ? 'online' : 'error';
+        const status = (nodeUnchanged || rollbackSucceeded) ? (originalStatus || 'online') : 'error';
         let lastError;
         if (nodeUnchanged) {
             lastError = `Xray version change aborted before the node was modified: ${error.message}`;
@@ -646,7 +862,10 @@ fi
         }
         await HyNode.updateOne(
             { _id: task.nodeId },
-            { $set: { status, lastError, healthFailures: 0 } }
+            { $set: {
+                status, lastError, healthFailures: 0,
+                ...(rollbackSucceeded && task.currentVersion ? { xrayVersion: task.currentVersion } : {}),
+            } }
         ).catch(() => {});
         await invalidateNodesCache().catch(() => {});
         logger.error(`[Xray Update] Node ${task.nodeId}: ${lastError}`);
@@ -714,5 +933,8 @@ module.exports = {
     startVersionChange,
     _test: {
         runVersionChange,
+        buildVerificationScript,
+        buildPreflightScript,
+        posixCommand,
     },
 };

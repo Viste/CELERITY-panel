@@ -368,12 +368,13 @@ class SyncService {
         try {
             const response = await this._agentRequest(node, 'GET', '/info');
             const data = response.data || {};
+            const xrayVersion = data.xray_version || '';
 
             const prevNode = await HyNode.findOneAndUpdate(
                 { _id: node._id },
                 {
                     $set: {
-                        xrayVersion: data.xray_version || '',
+                        xrayVersion,
                         agentVersion: data.agent_version || '',
                         agentStatus: 'online',
                         agentLastSeen: new Date(),
@@ -383,7 +384,8 @@ class SyncService {
                 }
             );
 
-            if (prevNode && prevNode.status !== 'online') {
+            if (prevNode && (prevNode.status !== 'online'
+                || (prevNode.xrayVersion || '') !== xrayVersion)) {
                 await invalidateNodesCache();
             }
 
@@ -1022,6 +1024,7 @@ class SyncService {
         try {
             const response = await this._agentRequest(node, 'GET', '/info');
             const data = response.data || {};
+            const xrayVersion = data.xray_version || '';
 
             const prevNode = await HyNode.findOneAndUpdate(
                 { _id: node._id },
@@ -1029,7 +1032,7 @@ class SyncService {
                     $set: {
                         status: 'online',
                         healthFailures: 0,
-                        xrayVersion: data.xray_version || '',
+                        xrayVersion,
                         agentVersion: data.agent_version || '',
                         agentStatus: 'online',
                         agentLastSeen: new Date(),
@@ -1037,8 +1040,11 @@ class SyncService {
                 }
             );
 
-            if (prevNode && prevNode.status !== 'online') {
+            if (prevNode && (prevNode.status !== 'online'
+                || (prevNode.xrayVersion || '') !== xrayVersion)) {
                 await invalidateNodesCache();
+            }
+            if (prevNode && prevNode.status !== 'online') {
                 webhook.emit(webhook.EVENTS.NODE_ONLINE, { nodeId: node._id, name: node.name });
             }
 

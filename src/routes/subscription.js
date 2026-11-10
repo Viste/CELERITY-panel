@@ -28,6 +28,7 @@ const webhookService = require('../services/webhookService');
 const { isServerlessNode } = require('../utils/nodeTypes');
 const { isValidXhttpRange, isAllZeroRange } = require('../utils/xhttpOptions');
 const { distributeFingerprints, pickFingerprint } = require('../utils/fingerprints');
+const { realityClientPolicy } = require('../utils/realityClientPolicy');
 const {
     isInboundFronted,
     isFrontActive,
@@ -89,7 +90,7 @@ function trackSubscriptionFetch(user, userAgent) {
 
 async function getUserByToken(token) {
     const user = await HyUser.findOne({ $or: [{ subscriptionToken: token }, { legacyTokens: token }] })
-        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray cascadeRole groups virtual cdn')
+        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray xrayVersion cascadeRole groups virtual cdn')
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
     return user;
@@ -150,7 +151,7 @@ async function getActiveNodesWithCache() {
 
     // Include type, xray, obfs, and cascadeRole fields needed for URI generation and filtering
     const nodes = await HyNode.find({ active: true })
-        .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray cascadeRole virtual cdn')
+        .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray xrayVersion cascadeRole virtual cdn')
         .lean();
     await cache.setActiveNodes(nodes);
     return nodes;
@@ -854,7 +855,7 @@ function generateVlessURIForInbound(user, node, inbound, dedupeLabel = _passthro
     const port = inbound.port || node.port || 443;
     const transport = inbound.transport || 'tcp';
     const security = inbound.security || 'reality';
-    const fingerprint = inbound.fingerprint || 'chrome';
+    const fingerprint = realityClientPolicy(node, inbound).fingerprint;
 
     const params = new URLSearchParams();
     // Modern Xray-core clients (HAPP, NekoBox, v2rayN, Streisand) expect
@@ -1475,7 +1476,8 @@ function _buildClashVlessProxyForInbound(user, node, inbound, dedupeLabel = _pas
     const host = inbound.address || node.domain || node.ip;
     const transport = inbound.transport || 'tcp';
     const security = inbound.security || 'reality';
-    const fingerprint = inbound.fingerprint || 'chrome';
+    const clientPolicy = realityClientPolicy(node, inbound);
+    const fingerprint = clientPolicy.fingerprint;
     const name = dedupeLabel(_xrayInboundName(node, inbound));
 
     let proxy = `  - name: ${_yamlString(name)}
@@ -1492,7 +1494,7 @@ function _buildClashVlessProxyForInbound(user, node, inbound, dedupeLabel = _pas
     tls: true
     reality-opts:
       public-key: "${inbound.realityPublicKey || ''}"
-      short-id: "${(inbound.realityShortIds || ['']).find(id => id && id.length > 0) || ''}"
+      short-id: "${(inbound.realityShortIds || ['']).find(id => id && id.length > 0) || ''}"${clientPolicy.supportX25519MLKEM768 ? '\n      support-x25519mlkem768: true' : ''}
     servername: ${sni}
     client-fingerprint: ${fingerprint}`;
         if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
@@ -1700,7 +1702,7 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
     const host = inbound.address || node.domain || node.ip;
     const transport = inbound.transport || 'tcp';
     const security = inbound.security || 'reality';
-    const fingerprint = inbound.fingerprint || 'chrome';
+    const fingerprint = realityClientPolicy(node, inbound).fingerprint;
     const tag = _xrayInboundName(node, inbound);
 
     const outbound = {
@@ -1835,7 +1837,7 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride, dedupeLabel = _pas
                 const sid = shortIds.find(id => id && id.length > 0) || shortIds[0] || '';
                 streamSettings.security = 'reality';
                 streamSettings.realitySettings = {
-                    fingerprint: inbound.fingerprint || 'chrome',
+                    fingerprint: realityClientPolicy(node, inbound).fingerprint,
                     serverName: sni,
                     publicKey: inbound.realityPublicKey || '',
                     shortId: sid,
