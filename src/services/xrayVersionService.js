@@ -332,10 +332,14 @@ if service xray status >/dev/null 2>&1; then
 fi
 # The pkg keeps owning this path. Pin it after verification so a later pkg
 # upgrade cannot silently replace the panel-managed official binary.
-if command -v pkg >/dev/null 2>&1 && [ "$(pkg which -qo "$BIN" 2>/dev/null || true)" = "net/xray-core" ]; then
-    PKG_LOCK="$(pkg query '%k' xray-core)"
-    case "$PKG_LOCK" in 0|1) ;; *) echo "ERROR: cannot read xray-core package lock"; exit 1 ;; esac
-    printf '%s\\n' "$PKG_LOCK" >"$BACKUP_ROOT/pkg-lock-state"
+if command -v pkg >/dev/null 2>&1; then
+    case "$(pkg which -qo "$BIN" 2>/dev/null || true)" in
+        security/xray-core|net/xray-core)
+            PKG_LOCK="$(pkg query '%k' xray-core)"
+            case "$PKG_LOCK" in 0|1) ;; *) echo "ERROR: cannot read xray-core package lock"; exit 1 ;; esac
+            printf '%s\\n' "$PKG_LOCK" >"$BACKUP_ROOT/pkg-lock-state"
+            ;;
+    esac
 fi
 
 curl -fL --connect-timeout 15 --max-time 300 "$ARCHIVE_URL" -o "$TMP_DIR/xray.zip"

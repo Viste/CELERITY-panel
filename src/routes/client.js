@@ -9,6 +9,7 @@ const config = require('../../config');
 const logger = require('../utils/logger');
 const { verifyPassword } = require('../utils/appPassword');
 const { detectClientKey } = require('../utils/subClient');
+const { clientCompatibility, sendClientUpgradeRequired } = require('../utils/clientCompatibility');
 
 const USER_RE = /^[A-Za-z0-9._@-]{1,64}$/;
 
@@ -33,6 +34,8 @@ router.post('/login', express.json({ limit: '4kb' }), async (req, res) => {
         if (user.expireAt && new Date(user.expireAt) < new Date()) {
             return res.status(403).json({ success: false, error: 'subscription expired' });
         }
+        const compatibility = clientCompatibility(req.headers['user-agent']);
+        if (!compatibility.allowed) return sendClientUpgradeRequired(res, compatibility, logger);
         const base = String(config.BASE_URL || '').replace(/\/+$/, '');
         logger.info(`[Client] Login ok for ${user.userId} from ${req.ip}`);
         HyUser.updateOne({ _id: user._id }, { $set: {

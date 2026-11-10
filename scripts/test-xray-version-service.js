@@ -168,7 +168,7 @@ function storedZipFixture(name, contents) {
     return Buffer.concat([header, filename, data, directory, filename, end]);
 }
 
-function testFreebsdTransactions(loginShell = '/bin/sh') {
+function testFreebsdTransactions(loginShell = '/bin/sh', pkgOrigin = 'security/xray-core') {
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'celerity-freebsd-update-test-'));
     const commandDir = path.join(sandbox, 'commands');
     fs.mkdirSync(commandDir);
@@ -191,7 +191,7 @@ elif [ "\${FAIL_CONFIG:-0}" = 1 ]; then exit 1; fi
     fake('service', `fs.appendFileSync(p+'/service-calls',a[1]+'\\n');if(a[1]==='status'){process.exit(fs.readFileSync(p+'/active','utf8').trim()==='1'?0:1);}fs.writeFileSync(p+'/active',a[1]==='stop'?'0':'1');`);
     fake('pgrep', `if(process.env.TEST_LIVE_PID){console.log(process.env.TEST_LIVE_PID);}else process.exit(1);`);
     fake('sleep', '');
-    fake('pkg', `if(a[0]==='which'){console.log('net/xray-core');}else if(a[0]==='query'){console.log(fs.readFileSync(p+'/pkg-lock','utf8').trim());}else if(a[0]==='lock'){if(process.env.FAIL_PKG_LOCK==='1')process.exit(1);fs.writeFileSync(p+'/pkg-lock','1');}else if(a[0]==='unlock'){fs.writeFileSync(p+'/pkg-lock','0');}else process.exit(1);`);
+    fake('pkg', `if(a[0]==='which'){console.log(process.env.TEST_PKG_ORIGIN);}else if(a[0]==='query'){console.log(fs.readFileSync(p+'/pkg-lock','utf8').trim());}else if(a[0]==='lock'){if(process.env.FAIL_PKG_LOCK==='1')process.exit(1);fs.writeFileSync(p+'/pkg-lock','1');}else if(a[0]==='unlock'){fs.writeFileSync(p+'/pkg-lock','0');}else process.exit(1);`);
     const freebsdAsset = service.selectReleaseAsset(releases[0], 'amd64', 'freebsd');
     const update = service.buildUpdateScript({ release: releases[0], asset: freebsdAsset, requestId, osFamily: 'freebsd' });
     const verify = service._test.buildVerificationScript(requestId, releases[0].version, 'freebsd');
@@ -212,7 +212,7 @@ elif [ "\${FAIL_CONFIG:-0}" = 1 ]; then exit 1; fi
         .replace('/usr/bin/base64', 'base64');
     const execute = (script, extra = {}) => spawnSync(loginShell, [loginShell.endsWith('/csh') ? '-fc' : '-c', localize(script)], {
         encoding: 'utf8', timeout: 15000,
-        env: { ...process.env, PATH: `${commandDir}:${sandbox}:${process.env.PATH}`, TEST_ROOT: sandbox, TEST_BIN: bin, TEST_DIGEST_URL: freebsdAsset.digestUrl, ...extra },
+        env: { ...process.env, PATH: `${commandDir}:${sandbox}:${process.env.PATH}`, TEST_ROOT: sandbox, TEST_BIN: bin, TEST_DIGEST_URL: freebsdAsset.digestUrl, TEST_PKG_ORIGIN: pkgOrigin, ...extra },
     });
     const oldBody = '#!/bin/sh\necho "Xray 26.3.27"\n';
     const reset = (lock = '0', active = '1') => {
@@ -296,6 +296,7 @@ elif [ "\${FAIL_CONFIG:-0}" = 1 ]; then exit 1; fi
 }
 
 testFreebsdTransactions();
+testFreebsdTransactions('/bin/sh', 'net/xray-core');
 if (fs.existsSync('/bin/csh')) testFreebsdTransactions('/bin/csh');
 
 async function simulateVersionChange({ currentVersion, release, syncSuccess, scriptFailure = 'none', osFamily = 'linux', verifyFailure = false, metadataFailure = false, serviceActive = true, status = 'online' }) {

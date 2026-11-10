@@ -29,6 +29,7 @@ const { isServerlessNode } = require('../utils/nodeTypes');
 const { isValidXhttpRange, isAllZeroRange } = require('../utils/xhttpOptions');
 const { distributeFingerprints, pickFingerprint } = require('../utils/fingerprints');
 const { realityClientPolicy } = require('../utils/realityClientPolicy');
+const { clientCompatibility, sendClientUpgradeRequired } = require('../utils/clientCompatibility');
 const {
     isInboundFronted,
     isFrontActive,
@@ -3485,6 +3486,8 @@ async function runHwidSubscriptionGate(req, res, user, settings, format) {
 async function serveSubscription(req, res, ctx) {
     const { user, cacheToken, baseUrl } = ctx;
     const userAgent = req.headers['user-agent'] || 'unknown';
+    const compatibility = clientCompatibility(userAgent);
+    if (!compatibility.allowed) return sendClientUpgradeRequired(res, compatibility, logger);
 
     let format = req.query.format;
     const browser = isBrowser(req);
