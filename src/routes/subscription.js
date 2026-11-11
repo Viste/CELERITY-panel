@@ -3486,7 +3486,7 @@ async function runHwidSubscriptionGate(req, res, user, settings, format) {
 async function serveSubscription(req, res, ctx) {
     const { user, cacheToken, baseUrl } = ctx;
     const userAgent = req.headers['user-agent'] || 'unknown';
-    const compatibility = clientCompatibility(userAgent);
+    const compatibility = clientCompatibility(userAgent, req.headers['x-device-os']);
     if (!compatibility.allowed) return sendClientUpgradeRequired(res, compatibility, logger);
 
     let format = req.query.format;

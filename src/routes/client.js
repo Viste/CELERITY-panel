@@ -34,7 +34,7 @@ router.post('/login', express.json({ limit: '4kb' }), async (req, res) => {
         if (user.expireAt && new Date(user.expireAt) < new Date()) {
             return res.status(403).json({ success: false, error: 'subscription expired' });
         }
-        const compatibility = clientCompatibility(req.headers['user-agent']);
+        const compatibility = clientCompatibility(req.headers['user-agent'], req.headers['x-device-os']);
         if (!compatibility.allowed) return sendClientUpgradeRequired(res, compatibility, logger);
         const base = String(config.BASE_URL || '').replace(/\/+$/, '');
         logger.info(`[Client] Login ok for ${user.userId} from ${req.ip}`);
