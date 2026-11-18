@@ -25,7 +25,7 @@ const subscriptionModule = require('./subscription');
 
 const { matchPath: matchLegacyPath, CLIENT_TO_FORMAT } = require('../utils/remnawaveToken');
 
-const POPULATE_NODES = 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray xrayVersion cascadeRole groups virtual cdn';
+const POPULATE_NODES = 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval subscriptionVariants portConfigs obfs flag xray xrayVersion cascadeRole groups virtual cdn tlsCertSha256';
 const POPULATE_GROUPS = '_id name subscriptionTitle maxDevices';
 
 let _loaded = false;

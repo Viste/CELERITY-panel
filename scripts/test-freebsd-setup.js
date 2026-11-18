@@ -75,25 +75,23 @@ const install = nodeSetup.XRAY_INSTALL_SCRIPT_FREEBSD;
 assertPosixNoSystemd(install, 'freebsd install script');
 assert.ok(install.includes('pkg install -y xray-core curl'));
 assert.ok(install.includes('mkdir -p /usr/local/etc/xray'));
-assert.ok(install.includes('XRAY_VERSION') && install.includes('ignored on FreeBSD'));
+assert.ok(install.includes('pkg install -y xray-core curl unzip'));
 assert.ok(!install.startsWith('#!/bin/bash'));
 assert.ok(nodeSetup.XRAY_INSTALL_SCRIPT.startsWith('#!/bin/bash'), 'linux install script unchanged');
 
 const start = nodeSetup.buildFreebsdXrayStartScript([443, 8443]);
 assertPosixNoSystemd(start, 'freebsd xray start script');
 assert.ok(start.includes('sysrc xray_enable=YES'));
-assert.ok(start.includes('sysrc xray_config=/usr/local/etc/xray\n'));
-assert.ok(start.includes('net.inet.ip.portrange.reservedhigh=0'));
+assert.ok(start.includes('sysrc xray_config=/usr/local/etc/xray'));
+assert.ok(!start.includes('sysctl.conf'));
+assert.ok(nodeSetup.xrayPermsSnippet('freebsd').includes('id -gn v2ray'));
+assert.ok(nodeSetup.xrayPermsSnippet('freebsd').includes('chmod 640'));
 assert.ok(start.indexOf('sysrc xray_enable=YES') < start.indexOf('service xray restart'));
 assert.ok(start.includes('service xray status'));
 assert.ok(start.includes('for p in 443 8443; do'));
-assert.ok(start.includes('sockstat -46l -P tcp -p "$p"'));
+assert.ok(start.includes('sockstat -46l -p "$p"'));
 assert.ok(start.includes('listening on 443, 8443'));
 assert.ok(!nodeSetup.buildFreebsdXrayStartScript([]).includes('listening on'));
-
-const busy = nodeSetup.buildFreebsdBusyPortsScript([443]);
-assertPosixNoSystemd(busy, 'freebsd busy-port script');
-assert.ok(busy.includes('sockstat -46l -P tcp -p "$p"') && busy.includes('$2 != "xray"'));
 
 // --- ACME: linux output keeps ss/systemctl, freebsd swaps them --------------
 const acmeArgs = { domain: 'node.example.com', email: 'a@b.c', nodeIp: '203.0.113.5' };
@@ -105,7 +103,7 @@ assert.ok(acmeLinux.includes('apt-get update && apt-get install -y curl'));
 const acmeBsd = nodeSetup.buildAcmeSetupScript({ ...acmeArgs, osFamily: 'freebsd' });
 assertPosixNoSystemd(acmeBsd.replace(/^#!\/bin\/bash\n/, ''), 'freebsd acme script');
 assert.ok(acmeBsd.includes('sockstat -46l -P tcp -p 80'));
-assert.ok(acmeBsd.includes('service xray restart >/dev/null 2>&1 || true'));
+assert.ok(acmeBsd.includes('service xray restart </dev/null >/dev/null 2>&1 || true'));
 assert.ok(acmeBsd.includes('pkg install -y curl'));
 
 // --- cc-agent on FreeBSD ----------------------------------------------------
@@ -116,9 +114,9 @@ assert.strictEqual(nodeSetup.buildFreebsdAgentDownloadScript("https://host/x' ; 
 const dl = nodeSetup.buildFreebsdAgentDownloadScript(' https://releases.example.com/cc-agent-freebsd-amd64 ');
 assertPosixNoSystemd(dl, 'freebsd agent download script');
 assert.ok(dl.includes("URL='https://releases.example.com/cc-agent-freebsd-amd64'"));
-assert.ok(dl.includes('curl -fsSL --max-time 120 "$URL" -o /usr/local/bin/cc-agent'));
-assert.ok(dl.includes('fetch -q -o /usr/local/bin/cc-agent "$URL"'));
-assert.ok(dl.includes('chmod +x /usr/local/bin/cc-agent'));
+assert.ok(dl.includes('--max-time 120 "$URL" -o "$tmp"'));
+assert.ok(dl.includes('fetch -q -o "$tmp" "$URL"'));
+assert.ok(dl.includes('mv -f "$tmp" /usr/local/bin/cc-agent'));
 
 const rc = nodeSetup.buildCcAgentRcScript();
 assertPosixNoSystemd(rc, 'cc_agent rc.d script');
@@ -132,48 +130,6 @@ assert.ok(rc.includes('/usr/local/bin/cc-agent -config ${cc_agent_config}'));
 assert.ok(rc.includes('-P ${pidfile}'));
 assert.ok(rc.includes('run_rc_command "$1"'));
 assert.ok(!rc.includes('\\$'), 'rc.d script must not carry JS escape backslashes');
-
-// --- mieru (mita) on freebsd -------------------------------------------------
-const mitaRc = nodeSetup.buildMitaRcScript();
-assertPosixNoSystemd(mitaRc, 'mita rc.d script');
-assert.ok(mitaRc.startsWith('#!/bin/sh\n'));
-assert.ok(mitaRc.includes('# PROVIDE: mita'));
-assert.ok(mitaRc.includes('rcvar="mita_enable"'));
-assert.ok(mitaRc.includes('-P ${pidfile} -u mita /usr/local/bin/mita run'));
-assert.ok(mitaRc.includes('install -d -o mita -g mita -m 775 /var/run/mita'));
-assert.ok(!mitaRc.includes('\\$'), 'mita rc.d script must not carry JS escape backslashes');
-assert.ok(!mitaRc.includes('`'), 'mita rc.d script must not contain backticks');
-
-const mitaBsd = nodeSetup.buildMitaInstallScriptFreebsd(25443, 'TCP', 'https://panel.example.com/agents/mita-freebsd-amd64');
-assertPosixNoSystemd(mitaBsd, 'freebsd mita install script');
-assert.ok(mitaBsd.startsWith('set -eu\n'));
-assert.ok(mitaBsd.includes('PORT=25443\nPROTOCOL=tcp\n'));
-assert.ok(mitaBsd.includes("URL='https://panel.example.com/agents/mita-freebsd-amd64'"));
-assert.ok(mitaBsd.includes("grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'"), 'version regex must reach the shell with single backslashes');
-assert.ok(mitaBsd.includes('pw useradd mita -g mita'));
-assert.ok(mitaBsd.includes("cat > /usr/local/etc/rc.d/mita <<'CELERITY_RC_EOF'\n#!/bin/sh\n"));
-assert.ok(mitaBsd.includes('run_rc_command "$1"\nCELERITY_RC_EOF\n'));
-assert.ok(mitaBsd.includes('port = $PORT( |\\$)"'), 'pf rule lookup must keep the escaped end anchor');
-assert.ok(mitaBsd.includes("celerity-mieru\\n' \"$PROTOCOL\" \"$PORT\" >> /etc/pf.conf"), 'printf newline must stay escaped');
-assert.ok(mitaBsd.includes('service mita restart </dev/null >/dev/null 2>&1'), 'rc.d verbs must detach stdio');
-assert.ok(mitaBsd.includes('sysrc mita_enable=YES'));
-assert.strictEqual(nodeSetup.buildMitaInstallScriptFreebsd(25443, 'UDP', 'https://p/x').includes('PROTOCOL=udp\n'), true);
-for (const bad of ['', 'ftp://x/mita', "https://x/'; rm -rf /", 'https://x/a b']) {
-    assert.strictEqual(nodeSetup.buildMitaInstallScriptFreebsd(25443, 'TCP', bad), '', `url ${JSON.stringify(bad)} must be rejected`);
-}
-// the linux installer is untouched
-const mitaLinux = nodeSetup.buildMitaInstallScript(25443, 'TCP');
-assert.ok(mitaLinux.startsWith('#!/bin/bash\n'));
-assert.ok(mitaLinux.includes('systemctl restart mita'));
-
-const nodeOs = require('../src/utils/nodeOs');
-assert.strictEqual(nodeOs.buildServiceLogsCommand('linux', 'mita', 15), 'journalctl -u mita -n 15 --no-pager 2>/dev/null || true');
-assert.strictEqual(
-    nodeOs.buildServiceLogsCommand('freebsd', 'mita', 15),
-    "grep -E ' mita(.[0-9]+.)?: ' /var/log/messages 2>/dev/null | tail -n 15; exit 0"
-);
-assert.strictEqual(nodeOs.buildListenCheckCommand('freebsd', 'TCP', 25443), "sockstat -46l -P tcp -p 25443 2>/dev/null | awk 'NR > 1' | head -1");
-assert.strictEqual(nodeOs.buildListenCheckCommand('linux', 'UDP', 25443), 'ss -ulnp 2>/dev/null | grep -E ":25443\\b" | head -1 || true');
 
 console.log('freebsd setup tests passed');
 

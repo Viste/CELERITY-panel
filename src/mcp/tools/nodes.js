@@ -12,6 +12,7 @@ const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const logger = require('../../utils/logger');
 const { isServerlessNode, checkCascadeMembership } = require('../../utils/nodeTypes');
+const { OBSERVATORY_HTTP_METHODS, normalizeVirtualObservatory } = require('../../utils/virtualObservatory');
 const nodeSetupLock = require('../../utils/nodeSetupLock');
 const {
     mergeCdnConfig,
@@ -30,9 +31,11 @@ const {
 } = require('../../utils/xhttpOptions');
 const {
     FRONT_HIDDEN_SELECT,
+    frontUpdatePaths,
     applyFrontPatch,
     captureFrontRollbackState,
 } = require('../../services/edgeFront/frontConfig');
+const vlessEncryption = require('../../utils/vlessEncryption');
 
 async function invalidateNodesCache() {
     await cache.invalidateNodes();
@@ -48,7 +51,7 @@ function getSyncService() {
 const sshSessions = new Map();
 
 // Fields excluded from all node queries returned to MCP clients
-const NODE_SAFE_SELECT = '-ssh.password -ssh.privateKey -xray.realityPrivateKey -statsSecret';
+const NODE_SAFE_SELECT = `-ssh.password -ssh.privateKey -xray.realityPrivateKey -statsSecret ${vlessEncryption.PRIVATE_KEY_EXCLUDE}`;
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
 
@@ -116,6 +119,12 @@ const xrayInboundCommonZ = {
     xhttpSeqPlacement: z.enum(XHTTP_PLACEMENT_VALUES).optional(),
     xhttpSeqKey: z.string().max(64).optional(),
     fallbackDest: z.string().optional().describe('VLESS fallbacks[].dest — emitted only on tcp+tls'),
+    // Keys are panel-generated and never accepted from callers.
+    vlessEncryption: z.boolean().optional().describe('VLESS Encryption (mlkem768x25519plus); requires Xray >= 25.9.5 and no fallbackDest. sing-box subscriptions skip encrypted inbounds unless settings.subscription.singboxVlessEncryption is on'),
+    vlessEncryptionAuth: z.enum(['x25519', 'mlkem768']).optional().describe('Server key type: x25519 (default, short client key) or mlkem768 (post-quantum auth, ~1.6 KB client key)'),
+    vlessEncryptionMode: z.enum(['native', 'xorpub', 'random']).optional().describe('Wire appearance (default native)'),
+    vlessEncryptionTicket: z.string().max(32).optional().describe('0-RTT ticket lifetime: "600s" (default), "300-600s", or "0s" to disable 0-RTT'),
+    vlessEncryptionRegenerate: z.boolean().optional().describe('Generate a new key; clients must refresh the subscription'),
 };
 
 const xrayExtraInboundZ = z.object({
@@ -134,7 +143,8 @@ const xrayExtraInboundZ = z.object({
 const xrayFrontZ = z.object({
     enabled: z.boolean().optional(),
     publicPort: z.number().int().min(1).max(65535).optional().describe('Port clients connect to; Caddy listens here instead of the inbounds (default 443)'),
-    siteMode: z.enum(['nginx', 'custom']).optional().describe('Decoy site on /: built-in nginx welcome page, or HTML uploaded via the panel'),
+    siteMode: z.enum(['nginx', 'custom']).optional().describe('Decoy site on /: built-in nginx welcome page, or HTML uploaded via the panel. Omit to keep the current mode; "nginx" keeps the uploaded page stored'),
+    logLevel: z.enum(['WARN', 'ERROR']).optional().describe('Caddy log level (default WARN). ERROR silences per-request warnings from CDN cancellations but hides other warnings too'),
     inboundIds: z.array(z.string()).optional().describe('"main" for the main inbound, otherwise extraInbounds[].id'),
 });
 
@@ -145,12 +155,13 @@ const xrayConfigZ = z.object({
     manualCert: z.string().optional(),
     manualKey: z.string().optional(),
     apiPort: z.number().optional(),
+    connIdle: z.number().int().min(10).max(86400).optional().describe('Xray policy connIdle in seconds (default 300). Lower frees stale sessions sooner but drops long quiet connections'),
     inboundTag: z.string().optional(),
     agentPort: z.number().optional(),
     agentToken: z.string().optional(),
     agentTls: z.boolean().optional(),
     extraInbounds: z.array(xrayExtraInboundZ).optional(),
-    front: xrayFrontZ.optional(),
+    front: xrayFrontZ.optional().describe('Caddy front patch: on update, omitted fields keep their stored values. The custom decoy page is uploaded through the panel only and is never changed or removed here'),
 });
 
 const manageNodeSchema = z.object({
@@ -163,7 +174,8 @@ const manageNodeSchema = z.object({
         sni: z.string().optional(),
         port: z.number().optional(),
         portRange: z.string().optional(),
-        type: z.enum(['hysteria', 'xray', 'virtual', 'cdn', 'mieru']).optional().describe('Node type. "virtual" is a client-side load balancer; "cdn" publishes one Xray inbound through a domain and optional pinned edge addresses'),
+        subscriptionVariants: z.enum(['both', 'tls', 'hopping']).optional().describe('Hysteria entries published in subscriptions: TLS and Hopping (default), only TLS, or only Hopping. Hopping-only without portRange falls back to TLS'),
+        type: z.enum(['hysteria', 'xray', 'virtual', 'cdn']).optional().describe('Node type. "virtual" is a client-side load balancer; "cdn" publishes one Xray inbound through a domain and optional pinned edge addresses'),
         groups: z.array(z.string()).optional(),
         active: z.boolean().optional(),
         country: z.string().optional(),
@@ -185,6 +197,7 @@ const manageNodeSchema = z.object({
                 interval: z.string().optional().describe('Probe interval, e.g. "1m", "30s" (min "10s")'),
                 timeout: z.string().optional().describe('Probe timeout, e.g. "5s"'),
                 sampling: z.number().int().min(1).max(50).optional().describe('Burst Observatory sample window — recent probe results to keep'),
+                httpMethod: z.enum(OBSERVATORY_HTTP_METHODS).optional().describe('leastLoad (burstObservatory) only: HEAD (default) fetches headers; GET downloads the whole response body on every probe, including the connectivity check. Ignored by sing-box/Mihomo and by leastPing'),
             }).optional(),
         }).optional(),
         cdn: z.object({
@@ -316,7 +329,7 @@ const manageNodeSchema = z.object({
 });
 
 const scanSniSchema = z.object({
-    ip: z.string().describe('Target IPv4 address. The whole /24 around it is scanned'),
+    ip: z.string().max(253).describe('Target public IPv4 address or hostname (resolved to IPv4). The whole /24 around it is scanned'),
     port: z.number().int().min(1).max(65535).default(443).describe('TLS port to probe'),
     threads: z.number().int().min(1).max(200).default(50).describe('Concurrent probes'),
     timeout: z.number().int().min(2).max(30).default(5).describe('Per-host timeout in seconds'),
@@ -363,7 +376,7 @@ async function queryNodes(args) {
         const node = await HyNode.findById(parsed.id).select(NODE_SAFE_SELECT).populate('groups', 'name color');
         if (!node) return { error: `Node '${parsed.id}' not found`, code: 404 };
 
-        const result = { ...node.toObject() };
+        const result = vlessEncryption.redactNode(node);
 
         if (parsed.includeUsers) {
             result.users = await HyUser.find({ nodes: node._id, enabled: true, isProbe: { $ne: true } })
@@ -378,7 +391,7 @@ async function queryNodes(args) {
                 const config = require('../../../config');
                 const baseUrl = process.env.BASE_URL || `http://localhost:${config.PORT}`;
                 result.config = node.type === 'xray'
-                    ? configGenerator.generateXrayConfig(node, [])
+                    ? configGenerator.generateXrayConfig(node, [], { redactSecrets: true })
                     : configGenerator.generateNodeConfig(node, `${baseUrl}/api/auth`);
             }
         }
@@ -411,6 +424,7 @@ async function manageNode(args, emit) {
 
             // Validate virtual-specific fields up-front so the caller gets a
             // clear 400 instead of a generic ValidationError 500 from save().
+            let virtualObservatory = null;
             if (nodeType === 'virtual') {
                 const v = data.virtual || {};
                 const selectMode = v.selectMode === 'group' ? 'group' : 'manual';
@@ -420,6 +434,8 @@ async function manageNode(args, emit) {
                 if (selectMode === 'manual' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
                     return { error: 'Virtual node (manual): at least one source required', code: 400 };
                 }
+                virtualObservatory = normalizeVirtualObservatory(v.observatory);
+                if (virtualObservatory.error) return { error: virtualObservatory.error, code: 400 };
             } else if (nodeType === 'cdn') {
                 const normalized = normalizeCdnConfig(data.cdn);
                 if (normalized.error) return { error: normalized.error, code: 400 };
@@ -436,6 +452,11 @@ async function manageNode(args, emit) {
                         const frontError = applyFrontPatch(data.xray, frontNode, null);
                         if (frontError) return { error: frontError, code: 400 };
                         data.port = frontNode.port;
+                    }
+                    if (data.xray) {
+                        vlessEncryption.takeRegenerateIds(data.xray);
+                        const encryptionError = await vlessEncryption.applyVlessEncryptionToXray(data.xray, null);
+                        if (encryptionError) return { error: encryptionError, code: 400 };
                     }
                 }
                 const existing = await HyNode.findOne({ ip: data.ip, type: nodeType });
@@ -494,20 +515,14 @@ async function manageNode(args, emit) {
                         : 50,
                     idleTimeout: (v.idleTimeout || '').trim(),
                     interruptExistConnections: v.interruptExistConnections !== false,
-                    observatory: {
-                        destination: (v.observatory?.destination || '').trim() || 'http://www.gstatic.com/generate_204',
-                        connectivity: (v.observatory?.connectivity || '').trim(),
-                        interval: (v.observatory?.interval || '').trim() || '1m',
-                        timeout: (v.observatory?.timeout || '').trim() || '5s',
-                        sampling: parseInt(v.observatory?.sampling, 10) || 3,
-                    },
+                    observatory: virtualObservatory.value,
                 };
             } else if (nodeType === 'cdn') {
                 nodeData.cdn = data.cdn;
             }
 
             const hy2Keys = [
-                'hopInterval', 'acme', 'masquerade', 'bandwidth',
+                'hopInterval', 'subscriptionVariants', 'acme', 'masquerade', 'bandwidth',
                 'ignoreClientBandwidth', 'speedTest', 'disableUDP',
                 'udpIdleTimeout', 'sniff', 'quic', 'resolver', 'acl', 'aclRules', 'useTlsFiles',
             ];
@@ -528,7 +543,7 @@ async function manageNode(args, emit) {
             getSyncService().maybePushCdnOrigins(null, node);
             await invalidateNodesCache();
             logger.info(`[MCP] Created ${nodeType} node ${data.name} (${isServerlessNode(nodeType) ? nodeType : data.ip})`);
-            return { success: true, node };
+            return { success: true, node: vlessEncryption.redactNode(node) };
         }
 
         case 'update': {
@@ -537,7 +552,7 @@ async function manageNode(args, emit) {
                 'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'groups', 'ssh', 'paths',
                 'settings', 'active', 'rankingCoefficient', 'country', 'comment', 'cascadeRole', 'type',
                 'virtual', 'cdn',
-                'hopInterval', 'acme', 'masquerade', 'bandwidth',
+                'hopInterval', 'subscriptionVariants', 'acme', 'masquerade', 'bandwidth',
                 'ignoreClientBandwidth', 'speedTest', 'disableUDP',
                 'udpIdleTimeout', 'sniff', 'quic', 'resolver', 'acl', 'aclRules', 'useTlsFiles',
                 'initScript',
@@ -556,6 +571,7 @@ async function manageNode(args, emit) {
 
             // Xray: partial update via dot-paths so unsent secrets (realityPrivateKey,
             // realityPublicKey, manualKey) are preserved instead of wiped by a full $set.
+            const regenerateIds = vlessEncryption.takeRegenerateIds(data.xray);
             if (data.xray && typeof data.xray === 'object') {
                 for (const [k, v] of Object.entries(data.xray)) {
                     // front is owned by the xray branch below: it merges the
@@ -567,12 +583,27 @@ async function manageNode(args, emit) {
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
-            // The front subdocument is written whole, so the decoy page has to be
-            // carried over instead of being dropped by the $set.
+            // The pending rollback baseline is hidden; the decoy page is not loaded
+            // because the front is written by dot-paths that never include it.
             const existing = await HyNode.findById(id)
                 .select(FRONT_HIDDEN_SELECT)
                 .lean();
             if (!existing) return { error: `Node '${id}' not found`, code: 404 };
+
+            if (data.xray && typeof data.xray === 'object') {
+                const merged = { ...(existing.xray || {}), ...data.xray };
+                const encryptionError = await vlessEncryption.applyVlessEncryptionToXray(
+                    merged,
+                    existing.xray,
+                    regenerateIds
+                ) || vlessEncryption.versionError(merged, existing.xrayVersion, existing.name);
+                if (encryptionError) return { error: encryptionError, code: 400 };
+                // Main-inbound keys live on `merged`; extras were settled in place.
+                for (const key of vlessEncryption.FIELDS) {
+                    data.xray[key] = merged[key];
+                    updates[`xray.${key}`] = merged[key];
+                }
+            }
 
             // Renames only — pre-existing duplicates stay editable (see panel route).
             if (updates.name !== undefined
@@ -600,6 +631,11 @@ async function manageNode(args, emit) {
                 }
                 if (v.selectMode !== 'group' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
                     return { error: 'Virtual node (manual): at least one source required', code: 400 };
+                }
+                if (updates.virtual && typeof updates.virtual === 'object') {
+                    const observatory = normalizeVirtualObservatory(updates.virtual.observatory);
+                    if (observatory.error) return { error: observatory.error, code: 400 };
+                    updates.virtual = { ...updates.virtual, observatory: observatory.value };
                 }
                 updates.ip = null;
                 updates.domain = '';
@@ -649,9 +685,10 @@ async function manageNode(args, emit) {
                     if (frontError) return { error: frontError, code: 400 };
                     // Persist pending state and everything the layout can rewrite.
                     updates.port = frontNode.port;
-                    for (const key of ['front', 'listen', 'security', 'extraInbounds']) {
+                    for (const key of ['listen', 'security', 'extraInbounds']) {
                         if (nextXray[key] !== undefined) updates[`xray.${key}`] = nextXray[key];
                     }
+                    Object.assign(updates, frontUpdatePaths(nextXray.front));
                 }
             }
 
@@ -687,7 +724,7 @@ async function manageNode(args, emit) {
             getSyncService().maybePushCdnOrigins(existing, node);
 
             logger.info(`[MCP] Updated node ${node.name}`);
-            return { success: true, node };
+            return { success: true, node: vlessEncryption.redactNode(node) };
         }
 
         case 'delete': {
@@ -839,13 +876,15 @@ async function scanSni(args, emit) {
     const parsed = scanSniSchema.parse(args);
     const sniScanner = require('../../services/sniScanner');
 
-    if (!sniScanner.isValidIpv4(parsed.ip)) {
-        return { error: 'Invalid IPv4 address', code: 400 };
+    const resolved = await sniScanner.resolveScanIp(parsed.ip);
+    if (resolved.error) {
+        return { error: resolved.error, code: 400 };
     }
+    const ip = resolved.ip;
 
     const controller = new AbortController();
     const results = await sniScanner.scanRange({
-        ip: parsed.ip,
+        ip,
         port: parsed.port,
         threads: parsed.threads,
         timeout: parsed.timeout,
@@ -854,7 +893,7 @@ async function scanSni(args, emit) {
         onProgress: (done, total) => emit('progress', { done, total }),
     });
 
-    return { success: true, ip: parsed.ip, port: parsed.port, count: results.length, results };
+    return { success: true, ip, port: parsed.port, count: results.length, results };
 }
 
 async function executeSsh(args, emit) {

@@ -135,8 +135,6 @@ function nodeMetaFor(node) {
                                     <img src="/img/xray.svg" alt="Xray" title="Xray VLESS" style="width:16px;height:16px;vertical-align:middle;margin-left:6px;opacity:0.7;">
                                     <% } else if (node.type === 'virtual') { %>
                                     <i class="ti ti-route" title="Virtual / Balancer" style="font-size:16px;vertical-align:middle;margin-left:6px;opacity:0.7;"></i>
-                                    <% } else if (node.type === 'mieru') { %>
-                                    <i class="ti ti-shield-bolt" title="Mieru / mita" style="font-size:16px;vertical-align:middle;margin-left:6px;opacity:0.7;"></i>
                                     <% } else if (node.type === 'cdn') { %>
                                     <i class="ti ti-cloud-network" title="CDN" style="font-size:16px;vertical-align:middle;margin-left:6px;opacity:0.7;"></i>
                                     <% } else { %>
@@ -257,6 +255,18 @@ function nodeMetaFor(node) {
                                 <span class="node-info-badge badge-agent-<%= node.agentStatus || 'unknown' %>" title="<%= t('nodes.agentStatus') %>">
                                     <i class="ti ti-cpu"></i> <%= node.agentStatus || 'unknown' %>
                                 </span>
+                                <% const rgState = node.xray?.realityGuard?.status; %>
+                                <% if (node.xray?.realityGuard?.mode !== 'off' && (rgState === 'dead' || rgState === 'no_candidate')) { %>
+                                <span class="node-info-badge badge-agent-offline"
+                                      title="<%= t(rgState === 'dead' ? 'nodes.realityGuardStatusDead' : 'nodes.realityGuardStatusNoCandidate') %><%= node.xray.realityGuard.lastError ? ': ' + node.xray.realityGuard.lastError : '' %>">
+                                    <i class="ti ti-alert-triangle"></i> <%= t('nodes.realityGuardBadge') %>
+                                </span>
+                                <% } else if (node.xray?.realityGuard?.mode !== 'off' && node.xray?.realityGuard?.warning) { %>
+                                <span class="node-info-badge badge-agent-unknown"
+                                      title="<%= t('nodes.realityGuardWarningTitle') %>: <%= t('nodes.realityGuardWarningNoH2') %>">
+                                    <i class="ti ti-alert-circle"></i> <%= t('nodes.realityGuardWarningBadge') %>
+                                </span>
+                                <% } %>
                             <% } else { %>
                                 <span class="text-muted">—</span>
                             <% } %>
@@ -318,8 +328,6 @@ function nodeMetaFor(node) {
                             <img src="/img/xray.svg" alt="Xray" title="Xray VLESS" style="width:14px;height:14px;vertical-align:middle;opacity:0.7;">
                             <% } else if (node.type === 'virtual') { %>
                             <i class="ti ti-route" title="Virtual / Balancer" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
-                            <% } else if (node.type === 'mieru') { %>
-                            <i class="ti ti-shield-bolt" title="Mieru / mita" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
                             <% } else if (node.type === 'cdn') { %>
                             <i class="ti ti-cloud-network" title="CDN" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
                             <% } else { %>
@@ -511,6 +519,7 @@ function nodeMetaFor(node) {
                             <option value="vless">VLESS</option>
                             <option value="vmess">VMess</option>
                         </select>
+                        <div class="form-hint" style="margin-top:3px"><%= t('network.tunnelProtocolHint') %></div>
                     </div>
                 </div>
                 <div class="form-row">
@@ -520,7 +529,8 @@ function nodeMetaFor(node) {
                             <option value="tcp">TCP</option>
                             <option value="ws">WebSocket</option>
                             <option value="grpc">gRPC</option>
-                            <option value="splithttp">SplitHTTP</option>
+                            <option value="xhttp">XHTTP (SplitHTTP)</option>
+                            <option value="kcp">mKCP (UDP)</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -530,6 +540,7 @@ function nodeMetaFor(node) {
                             <option value="tls">TLS</option>
                             <option value="reality">REALITY</option>
                         </select>
+                        <div class="form-hint" style="margin-top:3px"><%= t('network.tunnelSecurityHint') %></div>
                     </div>
                 </div>
 
@@ -574,6 +585,42 @@ function nodeMetaFor(node) {
                     </div>
                 </div>
 
+                <!-- mKCP Settings (hidden by default) -->
+                <div class="form-section" id="kcpSection" style="display:none">
+                    <div class="form-section-title"><i class="ti ti-bolt"></i> mKCP (UDP)</div>
+                    <div class="form-hint" style="margin-bottom:8px"><%= t('network.kcpHint') %></div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label><%= t('network.kcpUplinkCapacity') %></label>
+                            <input type="number" name="kcpUplinkCapacity" class="form-input" value="100" min="1" max="1000">
+                        </div>
+                        <div class="form-group">
+                            <label><%= t('network.kcpDownlinkCapacity') %></label>
+                            <input type="number" name="kcpDownlinkCapacity" class="form-input" value="100" min="1" max="1000">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>MTU</label>
+                            <input type="number" name="kcpMtu" class="form-input" value="1350" min="576" max="1460">
+                        </div>
+                        <div class="form-group">
+                            <label>TTI (ms)</label>
+                            <input type="number" name="kcpTti" class="form-input" value="20" min="10" max="100">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label><%= t('network.kcpHeader') %></label>
+                        <select name="kcpHeader" class="form-input">
+                            <option value="none"><%= t('network.kcpHeaderNone') %></option>
+                            <option value="wechat">WeChat Video</option>
+                            <option value="srtp">SRTP</option>
+                            <option value="dtls">DTLS 1.2</option>
+                            <option value="wireguard">WireGuard</option>
+                        </select>
+                    </div>
+                </div>
+
                 <!-- Advanced Options -->
                 <details class="form-details">
                     <summary><%= t('network.advancedOptions') %></summary>
@@ -585,6 +632,7 @@ function nodeMetaFor(node) {
                                 <input type="checkbox" name="muxEnabled" id="muxEnabledCheck">
                                 <span><%= t('network.muxEnabled') %></span>
                             </label>
+                            <div class="form-hint" style="margin-top:3px"><%= t('network.muxForwardHint') %></div>
                         </div>
                         <div class="form-group">
                             <label><%= t('network.muxConcurrency') %></label>
@@ -617,13 +665,6 @@ function nodeMetaFor(node) {
                         <div class="form-group">
                             <label><%= t('network.priority') %></label>
                             <input type="number" name="priority" class="form-input" value="100" min="1" max="999">
-                        </div>
-                        <div class="form-group">
-                            <!-- Tunnel domain (reverse only) -->
-                            <div id="tunnelDomainGroup">
-                                <label><%= t('network.tunnelDomain') %></label>
-                                <input type="text" name="tunnelDomain" class="form-input" value="reverse.tunnel.internal">
-                            </div>
                         </div>
                     </div>
                 </details>

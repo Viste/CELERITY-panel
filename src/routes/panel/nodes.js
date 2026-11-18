@@ -15,18 +15,18 @@ const configGenerator = require('../../services/configGenerator');
 const { discoverCdnAddresses } = require('../../services/cdnDiscoveryService');
 const nodeSetup = require('../../services/nodeSetup');
 const xrayVersionService = require('../../services/xrayVersionService');
-const totpService = require('../../services/totpService');
 const { isSameVpsAsPanel } = nodeSetup;
 const NodeSSH = require('../../services/nodeSSH');
 const sshKeyService = require('../../services/sshKeyService');
 const cache = require('../../services/cacheService');
 const cascadeService = require('../../services/cascadeService');
 const statsService = require('../../services/statsService');
-const uaStatsService = require('../../services/uaStatsService');
 const userStatsService = require('../../services/userStatsService');
-const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers');
+const uaStatsService = require('../../services/uaStatsService');
+const { getActiveGroups, invalidateNodesCache, normalizeSubscriptionVariants } = require('../../utils/helpers');
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const { isServerlessNode, checkCascadeMembership } = require('../../utils/nodeTypes');
+const { normalizeVirtualObservatory } = require('../../utils/virtualObservatory');
 const nodeSetupLock = require('../../utils/nodeSetupLock');
 const { nodeOsFamily, buildServiceCommand } = require('../../utils/nodeOs');
 const {
@@ -45,10 +45,13 @@ const frontProvisionService = require('../../services/edgeFront/provisionService
 const { MAX_CUSTOM_BYTES, validateCustomHtml } = require('../../utils/decoyPage');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
+const vlessEncryption = require('../../utils/vlessEncryption');
 
 const {
     render,
     parseXrayFormFields,
+    parseVlessEncryptionRegenerateIds,
+    mergeRealityGuard,
     validateXrayFormFields,
     ensureExtraInboundRealityKeys,
     resolveManualKeyPlaceholder,
@@ -64,6 +67,7 @@ const {
     generateSshKeyLimiter,
     sniScanLimiter,
     buildClonedNodePrefill,
+    reauthenticateXrayVersionChange,
 } = require('./helpers');
 
 const sniScanner = require('../../services/sniScanner');
@@ -75,11 +79,31 @@ const xrayVersionCheckLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// The UI parses every response as JSON, so a plain-text 429 would surface as
+// a cryptic parse error instead of the actual reason.
+const sendTooManyRequests = (req, res) => {
+    res.status(429).json({ error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.' });
+};
+
+// Version changes require password/TOTP re-authentication, so the admin-wide
+// cap also bounds guessing; the per-node bucket keeps one failing node from
+// locking out every other node.
+const xrayVersionApplyGlobalLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 15,
+    keyGenerator: req => `admin:${req.session?.adminUsername || req.ip}`,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: sendTooManyRequests,
+});
+
 const xrayVersionApplyLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     max: 3,
+    keyGenerator: req => `node:${req.session?.adminUsername || req.ip}:${req.params.id}`,
     standardHeaders: true,
     legacyHeaders: false,
+    handler: sendTooManyRequests,
 });
 
 const frontApplyLimiter = rateLimit({
@@ -108,28 +132,6 @@ const cdnResolveLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
 });
-
-async function reauthenticateXrayVersionChange(req, res) {
-    const password = String(req.body?.currentPassword || '');
-    const token = String(req.body?.totpToken || '');
-    const admin = await Admin.verifyPassword(req.session.adminUsername, password);
-    if (!admin) {
-        res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentPassword') || 'Invalid current password' });
-        return false;
-    }
-    if (!admin.twoFactor?.enabled) return true;
-
-    const secret = totpService.decryptSecret(admin.twoFactor.secretEncrypted);
-    if (!secret) {
-        res.status(500).json({ error: res.locals.t?.('auth.totpConfigError') || 'TOTP configuration error' });
-        return false;
-    }
-    if (!(await totpService.verifyToken({ secret, token }))) {
-        res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentTotp') || 'Invalid current TOTP code' });
-        return false;
-    }
-    return true;
-}
 
 /**
  * Parse virtual-node form fields and apply them to nodeData.
@@ -162,6 +164,16 @@ function applyVirtualFormFields(nodeData, body) {
         ? Math.min(Math.max(toleranceRaw, 0), 5000)
         : 50;
 
+    const observatory = normalizeVirtualObservatory({
+        destination: body['virtual.observatory.destination'],
+        connectivity: body['virtual.observatory.connectivity'],
+        interval: body['virtual.observatory.interval'],
+        timeout: body['virtual.observatory.timeout'],
+        sampling: body['virtual.observatory.sampling'],
+        httpMethod: body['virtual.observatory.httpMethod'],
+    });
+    if (observatory.error) return observatory.error;
+
     nodeData.virtual = {
         selectMode,
         sources,
@@ -171,13 +183,7 @@ function applyVirtualFormFields(nodeData, body) {
         tolerance,
         idleTimeout: (body['virtual.idleTimeout'] || '').trim(),
         interruptExistConnections: body['virtual.interruptExistConnections'] === 'on',
-        observatory: {
-            destination: (body['virtual.observatory.destination'] || '').trim() || 'http://www.gstatic.com/generate_204',
-            connectivity: (body['virtual.observatory.connectivity'] || '').trim(),
-            interval: (body['virtual.observatory.interval'] || '').trim() || '1m',
-            timeout: (body['virtual.observatory.timeout'] || '').trim() || '5s',
-            sampling: parseInt(body['virtual.observatory.sampling'], 10) || 3,
-        },
+        observatory: observatory.value,
     };
     return null;
 }
@@ -529,7 +535,10 @@ function sendNodeFormResult(req, res, redirect, error = '', status = error ? 400
 router.post('/nodes', async (req, res) => {
     try {
         const { name } = req.body;
-        const nodeType = ['xray', 'virtual', 'cdn', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
+        const nodeType = req.body.type || 'hysteria';
+        if (!['hysteria', 'xray', 'virtual', 'cdn'].includes(nodeType)) {
+            return sendNodeFormResult(req, res, '/panel/nodes/add', 'Unsupported node type');
+        }
         const ip = req.body.ip || '';
 
         if (!name) {
@@ -599,6 +608,7 @@ router.post('/nodes', async (req, res) => {
             flag: req.body.flag || '',
             port: parseInt(req.body.port) || 443,
             portRange: req.body.portRange || '20000-50000',
+            subscriptionVariants: normalizeSubscriptionVariants(req.body.subscriptionVariants),
             statsPort: parseInt(req.body.statsPort) || 9999,
             statsSecret,
             groups,
@@ -623,7 +633,8 @@ router.post('/nodes', async (req, res) => {
         if (nodeType === 'xray') {
             nodeData.xray = parseXrayFormFields(req.body);
             applyFrontLayout(nodeData.xray, nodeData, null);
-            const xrayError = validateXrayFormFields(nodeData.xray, nodeData);
+            const xrayError = validateXrayFormFields(nodeData.xray, nodeData)
+                || await vlessEncryption.applyVlessEncryptionToXray(nodeData.xray, null);
             if (xrayError) {
                 return sendNodeFormResult(req, res, '/panel/nodes/add', xrayError);
             }
@@ -646,15 +657,6 @@ router.post('/nodes', async (req, res) => {
             if (cdnError) {
                 return sendNodeFormResult(req, res, '/panel/nodes/add', cdnError);
             }
-        } else if (nodeType === 'mieru') {
-            const m = req.body.mieru || {};
-            nodeData.mieru = {
-                protocol: m.protocol === 'UDP' ? 'UDP' : 'TCP',
-                mtu: parseInt(m.mtu, 10) > 0 ? parseInt(m.mtu, 10) : 1400,
-                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(m.loggingLevel) ? m.loggingLevel : 'INFO',
-                multiplexing: m.multiplexing || '',
-                muxUserHintMandatory: !!m.muxUserHintMandatory,
-            };
         } else {
             const hyFields = parseHysteriaFormFields(req.body);
             const hyValidationError = validateHysteriaFormFields(hyFields);
@@ -679,14 +681,17 @@ router.post('/nodes', async (req, res) => {
 
 // POST /panel/nodes/scan-sni - Stream TLS 1.3+H2 scan results as SSE
 router.post('/nodes/scan-sni', sniScanLimiter, async (req, res) => {
-    const ip      = String(req.body.ip      || '').trim();
+    const target  = String(req.body.ip      || '').trim().slice(0, 253);
     const port    = Math.min(65535, Math.max(1,   parseInt(req.body.port,    10) || 443));
     const threads = Math.min(200,   Math.max(1,   parseInt(req.body.threads, 10) || 50));
     const timeout = Math.min(30,    Math.max(2,   parseInt(req.body.timeout, 10) || 5));
 
-    if (!sniScanner.isValidIpv4(ip)) {
-        return res.status(400).json({ error: 'Invalid IPv4 address' });
+    // Accepts an IPv4 or a hostname (the node address field may hold either).
+    const resolved = await sniScanner.resolveScanIp(target);
+    if (resolved.error) {
+        return res.status(400).json({ error: resolved.error });
     }
+    const ip = resolved.ip;
 
     res.setHeader('Content-Type',      'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control',     'no-cache');
@@ -707,6 +712,7 @@ router.post('/nodes/scan-sni', sniScanLimiter, async (req, res) => {
     };
 
     try {
+        send('start', { ip });
         await sniScanner.scanRange({
             ip,
             port,
@@ -729,8 +735,7 @@ router.post('/nodes/scan-sni', sniScanLimiter, async (req, res) => {
 // POST /panel/nodes/preview-config - Generate config preview from current form values
 router.post('/nodes/preview-config', async (req, res) => {
     try {
-        const nodeType = req.body.type === 'xray' ? 'xray' : 'hysteria';
-        if (nodeType !== 'hysteria') {
+        if (req.body.type && req.body.type !== 'hysteria') {
             return res.status(400).json({ success: false, error: 'Preview config supports only Hysteria nodes' });
         }
 
@@ -858,7 +863,7 @@ router.get('/nodes/:id/xray-version-task', async (req, res) => {
     return res.json(xrayVersionService.getTask(req.params.id));
 });
 
-router.post('/nodes/:id/xray-version', xrayVersionApplyLimiter, async (req, res) => {
+router.post('/nodes/:id/xray-version', xrayVersionApplyGlobalLimiter, xrayVersionApplyLimiter, async (req, res) => {
     try {
         if (!mongoose.isValidObjectId(req.params.id)) {
             return res.status(400).json({ error: 'Invalid node id' });
@@ -1060,7 +1065,10 @@ router.post('/nodes/:id', async (req, res) => {
         const previousIp = existingNode.ip;
 
         const { name } = req.body;
-        const nodeType = ['xray', 'virtual', 'cdn', 'mieru'].includes(req.body.type) ? req.body.type : 'hysteria';
+        const nodeType = req.body.type || 'hysteria';
+        if (!['hysteria', 'xray', 'virtual', 'cdn'].includes(nodeType)) {
+            return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, 'Unsupported node type');
+        }
         const ip = req.body.ip || '';
 
         if (!name) {
@@ -1129,6 +1137,9 @@ router.post('/nodes/:id', async (req, res) => {
         if (req.body.statsSecret) {
             updates.statsSecret = req.body.statsSecret;
         }
+        if (req.body.subscriptionVariants !== undefined) {
+            updates.subscriptionVariants = normalizeSubscriptionVariants(req.body.subscriptionVariants);
+        }
 
         if (nodeType === 'xray') {
             const existingXray = (existingNode.xray && typeof existingNode.xray.toObject === 'function')
@@ -1146,6 +1157,7 @@ router.post('/nodes/:id', async (req, res) => {
                 // The form posts only the operator-editable part of the front.
                 updates.xray.front = { ...existingXray.front, ...parsedXray.front };
             }
+            updates.xray.realityGuard = mergeRealityGuard(existingXray, updates.xray);
             const nodeForValidate = {
                 port: parseInt(req.body.port, 10) || existingNode.port,
                 domain: String(req.body.domain || '').trim(),
@@ -1155,7 +1167,13 @@ router.post('/nodes/:id', async (req, res) => {
             attachFrontRollbackState(updates.xray, frontRollbackState, existingXray.front);
             // The front takes over the public port, so the inbound moves.
             updates.port = nodeForValidate.port;
-            const xrayError = validateXrayFormFields(updates.xray, nodeForValidate);
+            const xrayError = validateXrayFormFields(updates.xray, nodeForValidate)
+                || await vlessEncryption.applyVlessEncryptionToXray(
+                    updates.xray,
+                    existingXray,
+                    parseVlessEncryptionRegenerateIds(req.body)
+                )
+                || vlessEncryption.versionError(updates.xray, existingNode.xrayVersion, existingNode.name);
             if (xrayError) {
                 return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, xrayError);
             }
@@ -1178,15 +1196,6 @@ router.post('/nodes/:id', async (req, res) => {
             if (cdnError) {
                 return sendNodeFormResult(req, res, `/panel/nodes/${nodeId}`, cdnError);
             }
-        } else if (nodeType === 'mieru') {
-            const m = req.body.mieru || {};
-            updates.mieru = {
-                protocol: m.protocol === 'UDP' ? 'UDP' : 'TCP',
-                mtu: parseInt(m.mtu, 10) > 0 ? parseInt(m.mtu, 10) : 1400,
-                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(m.loggingLevel) ? m.loggingLevel : 'INFO',
-                multiplexing: m.multiplexing || '',
-                muxUserHintMandatory: !!m.muxUserHintMandatory,
-            };
         } else {
             const hyFields = parseHysteriaFormFields(req.body);
             const hyValidationError = validateHysteriaFormFields(hyFields);
@@ -1529,14 +1538,9 @@ router.get('/nodes/:id/logs', async (req, res) => {
         }
 
         logger.debug(`[Panel] Getting logs for node ${node.name} (type: ${node.type})`);
-        let result;
-        if (node.type === 'xray') {
-            result = await nodeSetup.getXrayNodeLogs(node, 100);
-        } else if (node.type === 'mieru') {
-            result = await nodeSetup.getMieruNodeLogs(node, 100);
-        } else {
-            result = await nodeSetup.getNodeLogs(node, 100);
-        }
+        const result = node.type === 'xray'
+            ? await nodeSetup.getXrayNodeLogs(node, 100)
+            : await nodeSetup.getNodeLogs(node, 100);
         res.json(result);
     } catch (error) {
         logger.error(`[Panel] Get logs error for node ${req.params.id}: ${error.message}`);
@@ -1774,7 +1778,7 @@ router.post('/nodes/:id/restart', async (req, res) => {
         const result = await nodeSetup.execSSH(conn, `${buildServiceCommand(osFamily, 'restart', serviceName)} && sleep 2 && ${buildServiceCommand(osFamily, 'is-active', serviceName)}`);
         conn.end();
 
-        const isActive = result.output.trim().includes('active');
+        const isActive = result.success && result.output.trim().split(/\s+/).pop() === 'active';
 
         await HyNode.findByIdAndUpdate(req.params.id, {
             $set: { status: isActive ? 'online' : 'error', lastSync: new Date() }

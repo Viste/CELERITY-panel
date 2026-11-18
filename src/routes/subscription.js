@@ -30,6 +30,7 @@ const { isValidXhttpRange, isAllZeroRange } = require('../utils/xhttpOptions');
 const { distributeFingerprints, pickFingerprint } = require('../utils/fingerprints');
 const { realityClientPolicy } = require('../utils/realityClientPolicy');
 const { clientCompatibility, sendClientUpgradeRequired } = require('../utils/clientCompatibility');
+const { buildClientEncryption } = require('../utils/vlessEncryption');
 const {
     isInboundFronted,
     isFrontActive,
@@ -91,7 +92,7 @@ function trackSubscriptionFetch(user, userAgent) {
 
 async function getUserByToken(token) {
     const user = await HyUser.findOne({ $or: [{ subscriptionToken: token }, { legacyTokens: token }] })
-        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray xrayVersion cascadeRole groups virtual cdn')
+        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval subscriptionVariants portConfigs obfs flag xray xrayVersion cascadeRole groups virtual cdn tlsCertSha256')
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
     return user;
@@ -152,7 +153,7 @@ async function getActiveNodesWithCache() {
 
     // Include type, xray, obfs, and cascadeRole fields needed for URI generation and filtering
     const nodes = await HyNode.find({ active: true })
-        .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray xrayVersion cascadeRole virtual cdn')
+        .select('name type flag ip domain sni port portRange hopInterval subscriptionVariants portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray xrayVersion cascadeRole virtual cdn tlsCertSha256')
         .lean();
     await cache.setActiveNodes(nodes);
     return nodes;
@@ -164,9 +165,9 @@ async function getActiveNodes(user) {
     let allNodesForResolution = null;
     
     // Check if user has linked nodes
-    if (user.nodes && user.nodes.length > 0) {
+    if (user.nodes?.length || user.populated?.('nodes')?.length) {
         // User has linked nodes - only need settings
-        nodes = user.nodes.filter(n => n && n.active);
+        nodes = (user.nodes || []).filter(n => n && n.active);
         const needsCdnOrigins = nodes.some(n => n.type === 'cdn');
         [settings, allNodesForResolution] = await Promise.all([
             getSettings(),
@@ -399,11 +400,15 @@ function getNodeConfigs(node) {
             });
         });
     } else {
-        configs.push({ name: 'TLS', host, port: node.port || 443, portRange: '', hopInterval, sni, hasCert, obfs, obfsPassword });
+        const variants = node.subscriptionVariants || 'both';
+        const tls = { name: 'TLS', host, port: node.port || 443, portRange: '', hopInterval, sni, hasCert, obfs, obfsPassword };
+        if (variants !== 'hopping') configs.push(tls);
         // Port 80 removed (used for ACME)
-        if (node.portRange) {
+        if (node.portRange && variants !== 'tls') {
             configs.push({ name: 'Hopping', host, port: node.port || 443, portRange: node.portRange, hopInterval, sni, hasCert, obfs, obfsPassword });
         }
+        // Hopping-only without a range would drop the node from subscriptions.
+        if (configs.length === 0) configs.push(tls);
     }
     
     return configs;
@@ -543,10 +548,15 @@ function getXrayPublishedInbounds(node) {
         xhttpSessionIDLength: xray.xhttpSessionIDLength,
         xhttpSeqPlacement: xray.xhttpSeqPlacement,
         xhttpSeqKey: xray.xhttpSeqKey,
+        // Client `encryption` string or null; CDN and front copies inherit it.
+        vlessEncryption: buildClientEncryption(xray),
     };
 
+    // An encrypted inbound without a usable client key is withheld: publishing
+    // it as plain VLESS would hand out links the server rejects.
+    const encryptionUsable = (inbound, encryption) => inbound.vlessEncryption !== true || !!encryption;
     const extras = (Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [])
-        .filter(i => i && i.port)
+        .filter(i => i && i.port && encryptionUsable(i, buildClientEncryption(i)))
         .map(i => ({
             address: node.domain || node.ip,
             port: i.port,
@@ -599,10 +609,11 @@ function getXrayPublishedInbounds(node) {
             xhttpSessionIDLength: i.xhttpSessionIDLength,
             xhttpSeqPlacement: i.xhttpSeqPlacement,
             xhttpSeqKey: i.xhttpSeqKey,
+            vlessEncryption: buildClientEncryption(i),
         }));
 
     const frontActive = isFrontActive(xray);
-    return [main, ...extras]
+    return [...(encryptionUsable(xray, main.vlessEncryption) ? [main] : []), ...extras]
         // Desired front settings are saved before the remote cutover. Do not
         // leak their loopback ports, nor advertise Caddy before smoke tests
         // have promoted the front to active.
@@ -809,12 +820,13 @@ function _xhttpTuning(inbound) {
  *   panel       → masquerade under PANEL_DOMAIN; panel's LE cert inlined.
  *   acme        → cert on node (acme.sh); SNI=node.domain (same as manual).
  *   manual      → operator-supplied node.domain; PEM inlined.
- *   self-signed → node.domain || node.sni; allowInsecure=true.
+ *   self-signed → node.domain || node.sni; allowInsecure=true, plus the
+ *                 certificate hash for clients that pin it.
  *
- * Returns { sni, host, allowInsecure } where any value may be empty.
+ * Returns { sni, host, allowInsecure, pinnedPeerCertSha256 } where any value may be empty.
  *
  * @param {Object} node
- * @returns {{ sni: string, host: string, allowInsecure: boolean, source: string }}
+ * @returns {{ sni: string, host: string, allowInsecure: boolean, pinnedPeerCertSha256: string, source: string }}
  */
 function _resolveXrayTlsClientHints(node) {
     if (node?.type === 'cdn') {
@@ -841,7 +853,13 @@ function _resolveXrayTlsClientHints(node) {
         return { sni: dom, host: dom, allowInsecure: false, source: tlsSource };
     }
     // self-signed
-    return { sni: fallbackSni, host: fallbackSni, allowInsecure: true, source: 'self-signed' };
+    return {
+        sni: fallbackSni,
+        host: fallbackSni,
+        allowInsecure: true,
+        pinnedPeerCertSha256: node?.tlsCertSha256 || '',
+        source: 'self-signed',
+    };
 }
 
 /**
@@ -863,7 +881,7 @@ function generateVlessURIForInbound(user, node, inbound, dedupeLabel = _passthro
     // `type=xhttp`. The legacy `splithttp` keyword is rejected by some
     // clients and silently falls back to tcp, breaking the connection.
     params.set('type', transport);
-    params.set('encryption', 'none');
+    params.set('encryption', inbound.vlessEncryption || 'none');
     params.set('security', security);
 
     if (security === 'reality') {
@@ -886,6 +904,7 @@ function generateVlessURIForInbound(user, node, inbound, dedupeLabel = _passthro
             params.set('alpn', inbound.alpn.join(','));
         }
         if (tls.allowInsecure) params.set('allowInsecure', '1');
+        if (tls.pinnedPeerCertSha256) params.set('pcs', tls.pinnedPeerCertSha256);
     }
 
     if (transport === 'ws') {
@@ -1265,7 +1284,7 @@ function buildClashRules(rules) {
         if (!r.enabled) continue;
         const target = r.action === 'block' ? 'REJECT' : 'DIRECT';
         switch (r.type) {
-            case 'domain_suffix':  result.push(`DOMAIN-SUFFIX,${r.value},${target}`); break;
+            case 'domain_suffix':  result.push(`DOMAIN-SUFFIX,${r.value.replace(/^\+?\./, '')},${target}`); break;
             case 'domain_keyword': result.push(`DOMAIN-KEYWORD,${r.value},${target}`); break;
             case 'domain':         result.push(`DOMAIN,${r.value},${target}`); break;
             case 'geosite':        result.push(`GEOSITE,${r.value},${target}`); break;
@@ -1365,7 +1384,7 @@ function buildClashDns(rules, dns) {
     const policy = {};
     for (const r of (rules || [])) {
         if (!r.enabled || r.action !== 'direct') continue;
-        if (r.type === 'domain_suffix') policy[`+${r.value}`]    = domestic;
+        if (r.type === 'domain_suffix') policy[`+.${r.value.replace(/^\+?\./, '')}`] = domestic;
         if (r.type === 'geosite')       policy[`geosite:${r.value}`] = domestic;
     }
 
@@ -1380,82 +1399,18 @@ function buildClashDns(rules, dns) {
 
 // ==================== FORMAT GENERATORS ====================
 
-// Build a single mieru "simple sharing link" — the mierus:// scheme accepted
-// by Shadowrocket 2.2.81+ and the mieru CLI. Layout per enfein/mieru/pkg/appctl/url.go:
-//   mierus://USER:PASS@HOST?profile=NAME&mtu=N&multiplexing=LEVEL&port=N&protocol=TCP|UDP#REMARK
-function _buildMieruSimpleURI(user, node, dedupeLabel = _passthroughLabel) {
-    const uname = user.username || user.userId;
-    if (!uname || !user.password) return null;
-    const host = node.domain || node.ip;
-    if (!host) return null;
-    const port = node.port || 443;
-    const protocol = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
-    const profile = node.name || 'default';
-    const params = new URLSearchParams();
-    params.append('profile', profile);
-    const mtu = node.mieru && node.mieru.mtu;
-    if (Number.isFinite(mtu) && mtu > 0) params.append('mtu', String(mtu));
-    if (node.mieru && node.mieru.multiplexing) params.append('multiplexing', node.mieru.multiplexing);
-    params.append('port', String(port));
-    params.append('protocol', protocol);
-    const u = encodeURIComponent(uname);
-    const p = encodeURIComponent(user.password);
-    const remark = encodeURIComponent(dedupeLabel(`${node.flag || ''} ${node.name}`.trim()));
-    return `mierus://${u}:${p}@${host}?${params.toString()}#${remark}`;
-}
-
-/**
- * Format for the Potato mobile apps: Xray profiles (same shape as xray-json)
- * plus mieru client profiles the app runs with the embedded mieru client.
- */
+// Keep the Potato v1 envelope readable by installed clients.
 function generatePotatoJSON(user, nodes, routing) {
-    const dedupeLabel = _createLabelDeduplicator();
-    const uname = user.username || user.userId;
-    const mieru = [];
-    for (const node of nodes) {
-        if (node.type !== 'mieru') continue;
-        const server = node.domain || node.ip;
-        if (!server || !uname || !user.password) continue;
-        const mtu = node.mieru && node.mieru.mtu;
-        mieru.push({
-            name: dedupeLabel(`${node.flag || ''} ${node.name}`.trim()),
-            server,
-            port: node.port || 443,
-            protocol: (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP',
-            username: uname,
-            password: user.password,
-            mtu: (Number.isFinite(mtu) && mtu > 0) ? mtu : 1400,
-            multiplexing: (node.mieru && node.mieru.multiplexing) || '',
-            handshakeMode: '',
-        });
-    }
-    return {
-        version: 1,
-        xray: generateXrayJSON(user, nodes.filter(n => n.type !== 'mieru'), routing),
-        mieru,
-    };
+    return { version: 1, xray: generateXrayJSON(user, nodes, routing), mieru: [] };
 }
 
-function generateURIList(user, nodes, userAgent = '') {
+function generateURIList(user, nodes) {
     const uris = [];
     const dedupeLabel = _createLabelDeduplicator();
-    const skipMieru = isXrayProfileClient(userAgent);
     nodes.forEach(node => {
         if (node.type === 'virtual') {
             // URI list cannot represent a balancer; clients that hit this format
             // will see only real nodes and fall back to manual selection.
-            return;
-        }
-        if (node.type === 'mieru') {
-            // Xray-core clients (HAPP, Incy) have no mieru outbound; keep the
-            // unknown scheme out of their list.
-            if (skipMieru) return;
-            // Shadowrocket 2.2.81+ and the mieru CLI accept the simple mierus://
-            // URI; older clients on the URI-list path (Happ, Streisand) will skip
-            // the unknown scheme. Clash / sing-box subscribers get the node via
-            // the dedicated generators below.
-            const uri = _buildMieruSimpleURI(user, node, dedupeLabel);
-            if (uri) uris.push(uri);
             return;
         }
         if (node.type === 'xray' || node.type === 'cdn') {
@@ -1487,6 +1442,11 @@ function _buildClashVlessProxyForInbound(user, node, inbound, dedupeLabel = _pas
     port: ${inbound.port || node.port || 443}
     uuid: "${user.xrayUuid}"
     udp: true`;
+    // Mihomo >= 1.19.13; older cores ignore the key and fail to connect.
+    if (inbound.vlessEncryption) {
+        proxy += `
+    encryption: "${inbound.vlessEncryption}"`;
+    }
 
     if (security === 'reality') {
         const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : host;
@@ -1603,16 +1563,6 @@ function generateClashYAML(user, nodes, routing) {
                 proxyNames.push(name);
                 proxies.push(proxy);
             });
-        } else if (node.type === 'mieru') {
-            const name = dedupeLabel(`${node.flag || ''} ${node.name}`.trim());
-            const server = node.domain || node.ip;
-            const uname = user.username || user.userId;
-            if (!server || !uname || !user.password) return;
-            const transport = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
-            proxyNames.push(name);
-            proxies.push(
-                `  - name: "${name}"\n    type: mieru\n    server: ${server}\n    port: ${node.port || 443}\n    transport: ${transport}\n    username: "${uname}"\n    password: "${user.password}"`
-            );
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const name = dedupeLabel(`${node.flag || ''} ${node.name} ${cfg.name}`.trim());
@@ -1699,12 +1649,23 @@ function generateClashYAML(user, nodes, routing) {
     return yaml;
 }
 
-function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
+/**
+ * @param {Object} [opts]
+ * @param {boolean} [opts.vlessEncryption] - publish encrypted inbounds with
+ *   `encryption` (settings.subscription.singboxVlessEncryption). Upstream
+ *   sing-box rejects the whole config on that key, so they are skipped by default.
+ */
+function _buildSingboxVlessOutboundForInbound(user, node, inbound, opts = {}) {
     const host = inbound.address || node.domain || node.ip;
     const transport = inbound.transport || 'tcp';
     const security = inbound.security || 'reality';
     const fingerprint = realityClientPolicy(node, inbound).fingerprint;
     const tag = _xrayInboundName(node, inbound);
+
+    if (inbound.vlessEncryption && !opts.vlessEncryption) {
+        logger.debug(`[Sub] sing-box: skipped "${node.name}" inbound — VLESS Encryption is off for sing-box in settings`);
+        return { tag, outbound: null };
+    }
 
     const outbound = {
         type: 'vless',
@@ -1713,6 +1674,9 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
         server_port: inbound.port || node.port || 443,
         uuid: user.xrayUuid,
     };
+    if (inbound.vlessEncryption) {
+        outbound.encryption = inbound.vlessEncryption;
+    }
 
     if (transport === 'tcp' && (security === 'reality' || security === 'tls')) {
         outbound.flow = inbound.flow || 'xtls-rprx-vision';
@@ -1794,9 +1758,9 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
 /**
  * Build sing-box outbounds for every published inbound of an Xray node.
  */
-function _buildSingboxVlessOutbounds(user, node) {
+function _buildSingboxVlessOutbounds(user, node, opts = {}) {
     return getXrayPublishedInbounds(node)
-        .map(inbound => _buildSingboxVlessOutboundForInbound(user, node, inbound));
+        .map(inbound => _buildSingboxVlessOutboundForInbound(user, node, inbound, opts));
 }
 
 /**
@@ -1815,9 +1779,6 @@ function _buildSingboxVlessOutbounds(user, node) {
  */
 function _buildV2rayOutboundsForNode(user, node, tagOverride, dedupeLabel = _passthroughLabel) {
     if (node.type === 'virtual') return [];
-    // mieru is not an Xray/V2Ray-core protocol — clients consuming the
-    // v2ray-json / xray-json shapes can't speak it, so we drop the node.
-    if (node.type === 'mieru') return [];
     const auth = `${user.userId}:${user.password}`;
     const built = [];
 
@@ -1850,8 +1811,11 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride, dedupeLabel = _pas
                 streamSettings.tlsSettings = {
                     serverName: tls.sni || host,
                     fingerprint: inbound.fingerprint || 'chrome',
-                    allowInsecure: tls.allowInsecure,
                 };
+                // Xray 26.2.6+ refuses the whole config when allowInsecure is set.
+                if (tls.pinnedPeerCertSha256) {
+                    streamSettings.tlsSettings.pinnedPeerCertSha256 = tls.pinnedPeerCertSha256;
+                }
                 if (inbound.alpn && inbound.alpn.length > 0) {
                     streamSettings.tlsSettings.alpn = inbound.alpn;
                 }
@@ -1893,7 +1857,7 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride, dedupeLabel = _pas
                 }
             }
 
-            const vnextUser = { id: user.xrayUuid, encryption: 'none' };
+            const vnextUser = { id: user.xrayUuid, encryption: inbound.vlessEncryption || 'none' };
             if (transport === 'tcp' && (security === 'reality' || security === 'tls') && inbound.flow) {
                 vnextUser.flow = inbound.flow;
             }
@@ -1933,10 +1897,13 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride, dedupeLabel = _pas
             security: 'tls',
             tlsSettings: {
                 serverName: cfg.sni || cfg.host,
-                allowInsecure: !cfg.hasCert,
                 alpn: ['h3'],
             },
         };
+        // Xray 26.2.6+ refuses the whole config when allowInsecure is set.
+        if (!cfg.hasCert && node.tlsCertSha256) {
+            streamSettings.tlsSettings.pinnedPeerCertSha256 = node.tlsCertSha256;
+        }
 
         if (cfg.obfs && cfg.obfsPassword) {
             streamSettings.udpmasks = [{ type: cfg.obfs, settings: { password: cfg.obfsPassword } }];
@@ -2157,6 +2124,8 @@ function generateXrayJSON(user, nodes, routing) {
                     sampling: obs.sampling || 3,
                 };
                 if (obs.connectivity) pingConfig.connectivity = obs.connectivity;
+                // Omitted means HEAD in Xray, so the default output stays unchanged.
+                if (obs.httpMethod === 'GET') pingConfig.httpMethod = 'GET';
                 extras.burstObservatory = { subjectSelector: balancerSelector, pingConfig };
             }
 
@@ -2176,7 +2145,10 @@ function generateXrayJSON(user, nodes, routing) {
     return profiles;
 }
 
-function generateSingboxJSON(user, nodes, routing) {
+/**
+ * @param {Object} [opts] - forwarded to _buildSingboxVlessOutboundForInbound
+ */
+function generateSingboxJSON(user, nodes, routing, opts = {}) {
     const auth = `${user.userId}:${user.password}`;
     const proxyOutbounds = [];
     const tags = [];
@@ -2193,27 +2165,12 @@ function generateSingboxJSON(user, nodes, routing) {
         const beforeIdx = tags.length;
         if (node.type === 'xray' || node.type === 'cdn') {
             if (!user.xrayUuid) return;
-            _buildSingboxVlessOutbounds(user, node).forEach(({ tag, outbound }) => {
+            _buildSingboxVlessOutbounds(user, node, opts).forEach(({ tag, outbound }) => {
                 if (!outbound) return;
                 const uniqueTag = dedupeLabel(tag);
                 outbound.tag = uniqueTag;
                 tags.push(uniqueTag);
                 proxyOutbounds.push(outbound);
-            });
-        } else if (node.type === 'mieru') {
-            const tag = dedupeLabel(`${node.flag || ''} ${node.name}`.trim());
-            const server = node.domain || node.ip;
-            const uname = user.username || user.userId;
-            if (!server || !uname || !user.password) return;
-            tags.push(tag);
-            proxyOutbounds.push({
-                type: 'mieru',
-                tag,
-                server,
-                server_port: node.port || 443,
-                transport: (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP',
-                username: uname,
-                password: user.password,
             });
         } else {
             getNodeConfigs(node).forEach(cfg => {
@@ -2477,18 +2434,6 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', 
         // page entirely. They still appear (always pinned to the top) inside
         // the actual subscription payloads served to clients via ?format=…
         if (node.type === 'virtual') return;
-        if (node.type === 'mieru') {
-            const uri = _buildMieruSimpleURI(user, node);
-            if (uri) {
-                allConfigs.push({
-                    location: node.name,
-                    flag: node.flag || '🌐',
-                    name: 'Mieru',
-                    uri,
-                });
-            }
-            return;
-        }
         if (node.type === 'xray' || node.type === 'cdn') {
             // Render one card per published inbound (main + extras).
             const inbounds = getXrayPublishedInbounds(node);
@@ -3544,7 +3489,9 @@ async function serveSubscription(req, res, ctx) {
 
     logger.debug(`[Sub] Serving ${nodes.length} nodes to user ${user.userId}`);
 
-    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', settings?.routing);
+    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', settings?.routing, {
+        singboxVlessEncryption: settings?.subscription?.singboxVlessEncryption === true,
+    });
     await cache.setSubscription(cacheToken, cacheFormat, subscriptionData);
     return sendCachedSubscription(res, subscriptionData, format, userAgent, settings, hwidHeaders);
 }
@@ -3598,7 +3545,7 @@ router.get('/files/:token', async (req, res) => {
 /**
  * Generate subscription data for caching
  */
-function generateSubscriptionData(user, nodes, format, userAgent, happProviderId = '', routing = null) {
+function generateSubscriptionData(user, nodes, format, userAgent, happProviderId = '', routing = null, opts = {}) {
     let content;
     let needsBase64 = false;
     // Effective format may differ from requested when we transparently upgrade
@@ -3618,7 +3565,9 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
             break;
         case 'singbox':
         case 'json':
-            content = JSON.stringify(generateSingboxJSON(user, nodes, routing), null, 2);
+            content = JSON.stringify(generateSingboxJSON(user, nodes, routing, {
+                vlessEncryption: opts.singboxVlessEncryption === true,
+            }), null, 2);
             break;
         case 'v2ray-json':
             content = JSON.stringify(generateV2rayJSON(user, nodes, routing), null, 2);
@@ -3640,7 +3589,7 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
                 effectiveFormat = 'xray-json';
                 break;
             }
-            content = generateURIList(user, nodes, userAgent);
+            content = generateURIList(user, nodes);
             // HAPP reads #providerid from body as fallback (in case headers are stripped by a proxy)
             if (happProviderId) {
                 content = `#providerid ${happProviderId}\n${content}`;
@@ -3816,4 +3765,7 @@ module.exports.vlessURIForInbound = generateVlessURIForInbound;
 module.exports.singboxVlessOutboundForInbound = _buildSingboxVlessOutboundForInbound;
 module.exports.clashVlessProxyForInbound = _buildClashVlessProxyForInbound;
 module.exports.v2rayOutboundsForNode = _buildV2rayOutboundsForNode;
+module.exports.singboxJSON = generateSingboxJSON;
+module.exports.xrayJSON = generateXrayJSON;
+module.exports.clashYAML = generateClashYAML;
 module.exports.resolveCdnOrigins = resolveCdnOrigins;

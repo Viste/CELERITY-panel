@@ -15,7 +15,7 @@
     const railSaved = !!node?._id;
 %>
 <div class="nf-rail" role="tablist" aria-label="<%= node?._id ? t('nodes.editNode') : t('nodes.newNode') %>">
-    <button type="button" class="nf-tab is-active" role="tab" data-pane="main" data-types="hysteria xray virtual cdn mieru">
+    <button type="button" class="nf-tab is-active" role="tab" data-pane="main" data-types="hysteria xray virtual cdn">
         <span class="nf-tab__ico"><i class="ti ti-id"></i></span>
         <span class="nf-tab__label"><%= t('nodes.paneMain') %></span>
         <span class="nf-tab__badge"></span>
@@ -67,13 +67,7 @@
         <span class="nf-tab__badge" data-badge="edges"><%= railEdges || '' %></span>
     </button>
 
-    <button type="button" class="nf-tab" role="tab" data-pane="mi-settings" data-types="mieru">
-        <span class="nf-tab__ico"><i class="ti ti-shield-lock"></i></span>
-        <span class="nf-tab__label">Mieru</span>
-        <span class="nf-tab__badge"></span>
-    </button>
-
-    <button type="button" class="nf-tab" role="tab" data-pane="access" data-types="hysteria xray mieru">
+    <button type="button" class="nf-tab" role="tab" data-pane="access" data-types="hysteria xray">
         <span class="nf-tab__ico"><i class="ti ti-terminal-2"></i></span>
         <span class="nf-tab__label"><%= t('nodes.paneAccess') %></span>
         <span class="nf-tab__badge <%= railSsh ? 'is-on' : '' %>" data-badge="ssh"></span>
@@ -81,7 +75,7 @@
 
     <div class="nf-rail__sep"></div>
 
-    <button type="button" class="nf-tab" role="tab" data-pane="limits" data-types="hysteria xray virtual cdn mieru">
+    <button type="button" class="nf-tab" role="tab" data-pane="limits" data-types="hysteria xray virtual cdn">
         <span class="nf-tab__ico"><i class="ti ti-gauge"></i></span>
         <span class="nf-tab__label"><%= t('nodes.paneLimits') %></span>
         <span class="nf-tab__badge"></span>

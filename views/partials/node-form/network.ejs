@@ -11,7 +11,7 @@
         <div class="nf-group__title"><%= t('nodes.groupPorts') %></div>
         <div class="form-row">
             <div id="portSlotHysteria">
-                <% if (!netIsXray && node?.type !== 'mieru') { %><%- include('field-port') %><% } %>
+                <% if (!netIsXray) { %><%- include('field-port') %><% } %>
             </div>
             <div class="form-group" id="portRangeGroup">
                 <div class="nf-label-row">
@@ -29,6 +29,18 @@
             </div>
             <input type="text" id="hopInterval" name="hopInterval" value="<%= node?.hopInterval || '' %>" placeholder="30s">
             <small><%- renderDocsIcon('portHopping') %><%= t('nodes.hopIntervalHint') %></small>
+        </div>
+        <% const subVariants = node?.subscriptionVariants || 'both'; %>
+        <div class="form-group" id="subscriptionVariantsGroup" style="max-width:320px;">
+            <div class="nf-label-row">
+                <label for="subscriptionVariants"><%= t('nodes.subscriptionVariants') %></label>
+                <%- include('field-help', { textKey: 'nodes.subscriptionVariantsHint', scope: 'client', t }) %>
+            </div>
+            <select id="subscriptionVariants" name="subscriptionVariants">
+                <option value="both" <%= subVariants === 'both' ? 'selected' : '' %>><%= t('nodes.subscriptionVariantsBoth') %></option>
+                <option value="tls" <%= subVariants === 'tls' ? 'selected' : '' %>><%= t('nodes.subscriptionVariantsTls') %></option>
+                <option value="hopping" <%= subVariants === 'hopping' ? 'selected' : '' %>><%= t('nodes.subscriptionVariantsHopping') %></option>
+            </select>
         </div>
     </div>
 

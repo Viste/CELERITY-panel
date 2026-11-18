@@ -10,8 +10,6 @@ const { detectClientKey, isOwnApp } = require('../utils/subClient');
 
 const HOUR_MS = 3600 * 1000;
 const PERIOD_HOURS = { '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 };
-// mita only reports rolling 1/7/30-day windows, so shorter periods fall back to one day.
-const PERIOD_WINDOW = { '1h': 'd1', '6h': 'd1', '24h': 'd1', '7d': 'd7', '30d': 'd30' };
 // The poll runs every 5 minutes: "online" means traffic in one of the last two polls.
 const ONLINE_WINDOW_MS = 11 * 60 * 1000;
 // Clients probe every server of the subscription in the background. Less than this in the last
@@ -47,11 +45,9 @@ function userClients(user) {
 /**
  * Pure composition, kept separate from the queries for tests.
  * @param hourly  [{ userId, node, tx, rx, lastSeen }] — xray buckets already summed over the period
- * @param rolling [{ userId, node, windows, lastSeen }] — mieru rolling documents
  */
-function buildOverview({ users, nodes, hourly, rolling, period, now = new Date() }) {
+function buildOverview({ users, nodes, hourly, period, now = new Date() }) {
     const p = normalizePeriod(period);
-    const windowKey = PERIOD_WINDOW[p];
     const nowMs = now.getTime();
     const knownNodes = new Set(nodes.map(n => String(n._id)));
 
@@ -73,16 +69,6 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
             c.lastDelta = row.lastDelta ?? null;
         }
     }
-    for (const row of rolling) {
-        const nodeId = String(row.node);
-        if (!knownNodes.has(nodeId)) continue;
-        const w = row.windows?.[windowKey] || {};
-        const c = cell(row.userId, nodeId);
-        c.tx += w.tx || 0;
-        c.rx += w.rx || 0;
-        if (toTime(row.lastSeen) > toTime(c.lastSeen)) c.lastSeen = row.lastSeen;
-    }
-
     const clientTotals = {};
     const onlineByNode = {};
     const clientCutoff = nowMs - CLIENT_ACTIVE_DAYS * 24 * HOUR_MS;
@@ -90,7 +76,6 @@ function buildOverview({ users, nodes, hourly, rolling, period, now = new Date()
     let withClient = 0;
     let connections = 0;
     let activeConnections = 0;
-    // mita reports no per-poll amount (lastDelta is null there): such a connection counts as active.
     const isBackground = c => c.lastDelta != null && c.lastDelta < BACKGROUND_BYTES;
 
     const outUsers = users.map(user => {
@@ -174,11 +159,11 @@ class UserStatsService {
     async getOverview(period = '24h', now = new Date()) {
         const p = normalizePeriod(period);
         const since = new Date(UserNodeStat.hourOf(now).getTime() - (PERIOD_HOURS[p] - 1) * HOUR_MS);
-        const [users, nodes, hourly, rolling] = await Promise.all([
+        const [users, nodes, hourly] = await Promise.all([
             HyUser.find({})
                 .select('userId username enabled traffic lastSubFetchAt lastSubUserAgent subClients appPasswordSetAt appLastLoginAt appLastLoginClient')
                 .lean(),
-            HyNode.find({ active: true, type: { $in: ['xray', 'mieru', 'hysteria'] } })
+            HyNode.find({ active: true, type: { $in: ['xray', 'hysteria'] } })
                 .select('name type flag rankingCoefficient')
                 .sort({ rankingCoefficient: 1, name: 1 })
                 .lean(),
@@ -187,35 +172,16 @@ class UserStatsService {
                 { $sort: { lastSeen: 1 } },
                 { $group: { _id: { userId: '$userId', node: '$node' }, tx: { $sum: '$tx' }, rx: { $sum: '$rx' }, lastSeen: { $max: '$lastSeen' }, lastDelta: { $last: '$lastDelta' } } },
             ]),
-            UserNodeStat.find({ hour: null }).select('userId node windows lastSeen').lean(),
         ]);
         return buildOverview({
             users,
             nodes,
             hourly: hourly.map(r => ({ userId: r._id.userId, node: r._id.node, tx: r.tx, rx: r.rx, lastSeen: r.lastSeen, lastDelta: r.lastDelta })),
-            rolling,
             period: p,
             now,
         });
     }
 
-    /** rows from parseMitaUsers; mita knows users by the panel's username. */
-    async recordMieruUsers(node, rows) {
-        const active = rows.filter(r => r.lastActive);
-        if (active.length === 0) return 0;
-        const names = active.map(r => r.name);
-        const users = await HyUser.find({ $or: [{ username: { $in: names } }, { userId: { $in: names } }] })
-            .select('userId username').lean();
-        const idByName = new Map();
-        for (const u of users) {
-            idByName.set(u.userId, u.userId);
-            if (u.username) idByName.set(u.username, u.userId);
-        }
-        const mapped = active
-            .map(r => ({ userId: idByName.get(r.name), lastActive: r.lastActive, windows: r.windows }))
-            .filter(r => r.userId);
-        return UserNodeStat.recordMieru(node._id, mapped);
-    }
 }
 
 module.exports = new UserStatsService();

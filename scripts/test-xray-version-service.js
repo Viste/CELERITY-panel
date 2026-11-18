@@ -104,6 +104,10 @@ const script = service.buildUpdateScript({
 assert.match(script, /SHA2-256/);
 assert.match(script, /checksum mismatch/);
 assert.match(script, /run -test -config/);
+assert.match(script, /test_config "\$BACKUP_ROOT\/candidate-config\.json" "generated config"/);
+assert.match(script, /test_config "\$BACKUP_ROOT\/candidate-bridge\.json"/);
+// A running xray-bridge with no candidate still gets its config checked.
+assert.match(script, /systemctl is-active --quiet xray-bridge && \[ -f "\$BRIDGE_CONFIG" \]/);
 assert.match(script, /ROLLBACK: previous Xray binary restored/);
 assert.match(script, /mv -f "\$BIN\.new" "\$BIN"/);
 assert.match(script, /^echo "SWAPPED=1"$/m);
@@ -268,7 +272,7 @@ elif [ "\${FAIL_CONFIG:-0}" = 1 ]; then exit 1; fi
         reset();
         const badConfig = execute(update, { FAIL_CONFIG: '1' });
         assert.notStrictEqual(badConfig.status, 0);
-        assert.match(badConfig.stdout, /current config is incompatible/);
+        assert.match(badConfig.stdout, /selected config is incompatible/);
         restored('0');
 
         reset();
@@ -299,23 +303,41 @@ testFreebsdTransactions();
 testFreebsdTransactions('/bin/sh', 'net/xray-core');
 if (fs.existsSync('/bin/csh')) testFreebsdTransactions('/bin/csh');
 
-async function simulateVersionChange({ currentVersion, release, syncSuccess, scriptFailure = 'none', osFamily = 'linux', verifyFailure = false, metadataFailure = false, serviceActive = true, status = 'online' }) {
+async function simulateVersionChange({
+    currentVersion,
+    release,
+    syncSuccess,
+    scriptFailure = 'none',
+    syncFailureReason = null,
+    osFamily = 'linux',
+    verifyFailure = false,
+    metadataFailure = false,
+    serviceActive = true,
+    status = 'online',
+    onFinish = null,
+}) {
     const HyNode = require('../src/models/hyNodeModel');
     const nodeSetup = require('../src/services/nodeSetup');
     const syncService = require('../src/services/syncService');
+    const cascadeService = require('../src/services/cascadeService');
     const logger = require('../src/utils/logger');
     const originals = {
         findById: HyNode.findById,
         updateOne: HyNode.updateOne,
         connectSSH: nodeSetup.connectSSH,
         execSSH: nodeSetup.execSSH,
+        uploadFile: nodeSetup.uploadFile,
         updateXrayNodeConfig: syncService.updateXrayNodeConfig,
+        buildXrayConfigCandidate: syncService.buildXrayConfigCandidate,
+        buildBridgeServiceConfig: cascadeService.buildBridgeServiceConfig,
         loggerInfo: logger.info,
         loggerError: logger.error,
     };
     const commands = [];
     const updates = [];
     let syncCalls = 0;
+    const uploads = [];
+    const versionWrites = [];
     const node = {
         _id: '507f1f77bcf86cd799439011',
         name: 'test-node',
@@ -338,6 +360,7 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
         logs: [],
         startedAt: new Date().toISOString(),
         finishedAt: null,
+        onFinish,
     };
 
     try {
@@ -345,9 +368,15 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
         HyNode.updateOne = async (_query, update) => {
             updates.push(update);
             if (metadataFailure && update.$set?.xrayVersion === release.version) throw new Error('Metadata write failed');
+            if (update?.$set && Object.keys(update.$set).length === 1 && update.$set.xrayVersion) {
+                versionWrites.push(update.$set.xrayVersion);
+            }
             return { acknowledged: true };
         };
         nodeSetup.connectSSH = async () => ({ end() {} });
+        nodeSetup.uploadFile = async (_conn, _content, remotePath) => { uploads.push(remotePath); };
+        syncService.buildXrayConfigCandidate = async () => '{}';
+        cascadeService.buildBridgeServiceConfig = async () => null;
         nodeSetup.execSSH = async (_conn, command) => {
             command = decodedCommand(command);
             commands.push(command);
@@ -378,17 +407,24 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
             }
             return { success: true, output: '' };
         };
-        syncService.updateXrayNodeConfig = async () => { syncCalls++; return syncSuccess; };
+        syncService.updateXrayNodeConfig = async (_node, { report } = {}) => {
+            syncCalls++;
+            if (!syncSuccess && report && syncFailureReason) report.error = syncFailureReason;
+            return syncSuccess;
+        };
         logger.info = () => {};
         logger.error = () => {};
         await service._test.runVersionChange(task, release);
-        return { task, commands, updates, syncCalls };
+        return { task, commands, updates, syncCalls, uploads, versionWrites };
     } finally {
         HyNode.findById = originals.findById;
         HyNode.updateOne = originals.updateOne;
         nodeSetup.connectSSH = originals.connectSSH;
         nodeSetup.execSSH = originals.execSSH;
+        nodeSetup.uploadFile = originals.uploadFile;
         syncService.updateXrayNodeConfig = originals.updateXrayNodeConfig;
+        syncService.buildXrayConfigCandidate = originals.buildXrayConfigCandidate;
+        cascadeService.buildBridgeServiceConfig = originals.buildBridgeServiceConfig;
         logger.info = originals.loggerInfo;
         logger.error = originals.loggerError;
     }
@@ -402,6 +438,12 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
     });
     assert.strictEqual(upgraded.task.state, 'done');
     assert.strictEqual(upgraded.task.currentVersion, '1.8.24');
+    // The config the sync will push is what gets tested on the new core.
+    assert.deepStrictEqual(upgraded.uploads, [
+        '/var/lib/celerity-xray-updates/123e4567-e89b-42d3-a456-426614174000/candidate-config.json',
+    ]);
+    assert.ok(upgraded.commands.some(c => /mkdir -p -m 700 '\/var\/lib\/celerity-xray-updates\//.test(c)));
+    assert.deepStrictEqual(upgraded.versionWrites, [releases[1].version], 'stored version moves before the sync');
 
     const reinstalled = await simulateVersionChange({
         currentVersion: '26.3.27',
@@ -419,6 +461,20 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
     assert.strictEqual(rolledBack.task.rollbackSucceeded, true);
     assert.strictEqual(rolledBack.task.nodeUnchanged, false);
     assert.ok(rolledBack.commands.some(command => command.includes('previous Xray version restored')));
+    assert.match(rolledBack.task.error, /synchronization failed: unknown reason$/);
+    assert.deepStrictEqual(rolledBack.versionWrites, [releases[1].version, '26.7.28'], 'rollback restores the stored version');
+
+    // The sync's own reason must reach the task instead of a generic message.
+    const restartReason = 'Xray restart failed: connect ECONNREFUSED 10.0.0.1:62080; rollback succeeded';
+    const reasoned = await simulateVersionChange({
+        currentVersion: '26.7.28',
+        release: releases[1],
+        syncSuccess: false,
+        syncFailureReason: restartReason,
+    });
+    assert.strictEqual(reasoned.task.state, 'error');
+    assert.ok(reasoned.task.error.endsWith(restartReason));
+    assert.ok(reasoned.task.logs.some(line => line.includes(restartReason)));
 
     // Failing before the swap must not be reported as a failed rollback: the
     // remote script never touched the binary.
@@ -521,6 +577,77 @@ async function simulateVersionChange({ currentVersion, release, syncSuccess, scr
         cache.invalidateNodes = saved.invalidateNodes;
         cache.invalidateAllSubscriptions = saved.invalidateAllSubscriptions;
         cache.invalidateDashboardCounts = saved.invalidateDashboardCounts;
+    }
+
+    // Bulk runs wait on onFinish, so it must fire exactly once on both outcomes,
+    // after the node lock is released, and a throwing callback must not leak.
+    const nodeSetupLock = require('../src/utils/nodeSetupLock');
+    const finished = [];
+    const recordFinish = (snapshot) => {
+        finished.push({ state: snapshot.state, lockFree: !nodeSetupLock.holder(snapshot.nodeId), logs: snapshot.logs });
+    };
+    await simulateVersionChange({ currentVersion: '1.8.24', release: releases[1], syncSuccess: true, onFinish: recordFinish });
+    await simulateVersionChange({ currentVersion: '26.7.28', release: releases[1], syncSuccess: false, onFinish: recordFinish });
+    assert.deepStrictEqual(finished.map(item => item.state), ['done', 'error']);
+    assert.ok(finished.every(item => item.lockFree));
+    assert.ok(finished.every(item => Array.isArray(item.logs)));
+    const throwing = await simulateVersionChange({
+        currentVersion: '1.8.24',
+        release: releases[1],
+        syncSuccess: true,
+        onFinish: () => { throw new Error('callback boom'); },
+    });
+    assert.strictEqual(throwing.task.state, 'done');
+
+    assert.deepStrictEqual(service.getTaskProgress('507f1f77bcf86cd799439099'), { state: 'idle', step: null });
+
+    // Bulk preview decides from stored data only: no SSH, one verdict per node.
+    const lockedId = '507f1f77bcf86cd7994390a5';
+    assert.ok(nodeSetupLock.acquire(lockedId, 'Node setup'));
+    try {
+        const ssh = { password: 'encrypted' };
+        const verdicts = service.bulkPreview([
+            { _id: '507f1f77bcf86cd7994390a1', name: 'ok', type: 'xray', status: 'online', xrayVersion: '26.3.27', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390a2', name: 'hy', type: 'hysteria', status: 'online', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390a3', name: 'nossh', type: 'xray', status: 'online', ssh: {}, xray: {} },
+            { _id: '507f1f77bcf86cd7994390a4', name: 'same', type: 'xray', status: 'online', xrayVersion: '26.7.28', ssh, xray: {} },
+            { _id: lockedId, name: 'busy', type: 'xray', status: 'online', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390a6', name: 'off', type: 'xray', status: 'offline', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390a7', name: 'warn', type: 'xray', status: 'error', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390a8', name: 'bridge', type: 'xray', status: 'offline', cascadeRole: 'bridge', xrayVersion: '26.3.27', ssh, xray: {} },
+        ], releases[0]);
+        const byName = Object.fromEntries(verdicts.map((v, i) => [['ok', 'hy', 'nossh', 'same', 'busy', 'off', 'warn', 'bridge'][i], v]));
+        assert.strictEqual(byName.ok.ready, true);
+        assert.deepStrictEqual(byName.ok.warnings, []);
+        assert.match(byName.hy.reason, /Not an Xray node/);
+        assert.match(byName.nossh.reason, /SSH credentials/);
+        assert.match(byName.same.reason, /Already on 26\.7\.28/);
+        assert.match(byName.busy.reason, /Node is busy: Node setup/);
+        assert.match(byName.off.reason, /offline/);
+        assert.strictEqual(byName.bridge.ready, true, 'bridges are offline by design');
+        assert.strictEqual(byName.warn.ready, true);
+        assert.strictEqual(byName.warn.warnings.length, 2);
+
+        const downgrade = { ...releases[1], version: '25.1.1' };
+        const encrypted = service.bulkPreview([
+            { _id: '507f1f77bcf86cd7994390b1', name: 'enc', type: 'xray', status: 'online', xrayVersion: '26.3.27', ssh, xray: { vlessEncryption: true } },
+            { _id: '507f1f77bcf86cd7994390b2', name: 'kcp', type: 'xray', status: 'online', xrayVersion: '26.7.28', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390b3', name: 'plain', type: 'xray', status: 'online', xrayVersion: '26.7.28', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390b4', name: 'rev', type: 'xray', status: 'online', xrayVersion: '26.7.28', ssh, xray: {} },
+            { _id: '507f1f77bcf86cd7994390b5', name: 'fwd', type: 'xray', status: 'online', xrayVersion: '26.7.28', ssh, xray: {} },
+        ], downgrade, new Map([
+            ['507f1f77bcf86cd7994390b2', [{ mode: 'forward', tunnelTransport: 'kcp', tunnelSecurity: 'tls' }]],
+            ['507f1f77bcf86cd7994390b4', [{ mode: 'reverse', tunnelTransport: 'tcp', tunnelSecurity: 'reality' }]],
+            ['507f1f77bcf86cd7994390b5', [{ mode: 'forward', tunnelTransport: 'tcp', tunnelSecurity: 'reality' }]],
+        ]));
+        assert.match(encrypted[0].reason, /VLESS Encryption requires/);
+        assert.match(encrypted[1].reason, /mKCP requires/);
+        assert.strictEqual(encrypted[2].ready, true);
+        assert.deepStrictEqual(encrypted[2].warnings, ['Downgrade from 26.7.28']);
+        assert.match(encrypted[3].reason, /VLESS Reverse Proxy requires Xray >= 25\.9\.11, rev runs 25\.1\.1/);
+        assert.strictEqual(encrypted[4].ready, true, 'forward REALITY has no core floor');
+    } finally {
+        nodeSetupLock.release(lockedId);
     }
 
     // The version list must stay lightweight: changelog bodies are fetched

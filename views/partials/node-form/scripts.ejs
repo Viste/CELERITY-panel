@@ -573,6 +573,10 @@ const i18n = {
     resettingStatus: <%- JSON.stringify(t("nodes.resettingStatus")) %>,
     statusReset: <%- JSON.stringify(t("nodes.statusReset")) %>,
     autoSetup: <%- JSON.stringify(t("nodes.autoSetup")) %>,
+    createAndSetupNeedsSsh: <%- JSON.stringify(t("nodes.createAndSetupNeedsSsh")) %>,
+    createAndSetupSkipped: <%- JSON.stringify(t("nodes.createAndSetupSkipped")) %>,
+    siblingExistsHint: <%- JSON.stringify(t("nodes.siblingExistsHint")) %>,
+    siblingExistsNoSshHint: <%- JSON.stringify(t("nodes.siblingExistsNoSshHint")) %>,
     restart: <%- JSON.stringify(t("nodes.restart")) %>,
     restartSuccess: <%- JSON.stringify(t("nodes.restartSuccess")) %>,
     restartFailed: <%- JSON.stringify(t("nodes.restartFailed")) %>,
@@ -606,7 +610,10 @@ const i18n = {
     frontSiteUploadFailed: <%- JSON.stringify(t("nodes.frontSiteUploadFailed")) %>,
     frontLockedTransport: <%- JSON.stringify(t("nodes.frontLockedTransport")) %>,
     xrayExtraInbound: <%- JSON.stringify(t("nodes.xrayExtraInbound")) %>,
-    xrayRemoveInboundConfirm: <%- JSON.stringify(t("nodes.xrayRemoveInboundConfirm")) %>
+    xrayRemoveInboundConfirm: <%- JSON.stringify(t("nodes.xrayRemoveInboundConfirm")) %>,
+    xrayVlessEncFallbackConfirm: <%- JSON.stringify(t("nodes.xrayVlessEncFallbackConfirm")) %>,
+    xrayVlessEncRegenerateConfirm: <%- JSON.stringify(t("nodes.xrayVlessEncRegenerateConfirm")) %>,
+    xrayVlessEncRegeneratePending: <%- JSON.stringify(t("nodes.xrayVlessEncRegeneratePending")) %>
 };
 const i18nConfig = {
     copied: <%- JSON.stringify(t("common.copied")) %>,
@@ -682,7 +689,6 @@ const PROTO_LABEL_IDS = {
     xray: 'protoXrayLabel',
     virtual: 'protoVirtualLabel',
     cdn: 'protoCdnLabel',
-    mieru: 'protoMieruLabel',
 };
 
 function nfCurrentType() {
@@ -704,6 +710,13 @@ function nfAvailable(el) {
 function applyTypeVisibility(type) {
     const root = document.getElementById('nfTabbed');
     if (root) root.dataset.nodeType = type;
+    // The save bar sits outside #nfTabbed, so the CSS type filter misses it.
+    const createAndSetup = document.getElementById('btnCreateAndSetup');
+    if (createAndSetup) {
+        const canSetup = nfBelongsTo(createAndSetup, type);
+        createAndSetup.style.display = canSetup ? '' : 'none';
+        document.getElementById('btnCreateNode')?.classList.toggle('btn-primary', !canSetup);
+    }
 }
 
 // The `port` input is rendered once and moved between panes: Hysteria shows it
@@ -711,7 +724,7 @@ function applyTypeVisibility(type) {
 // node keeps values and listeners intact across protocol switches.
 function moveSharedFields(type) {
     const pairs = [
-        ['portGroup', type === 'xray' ? 'portSlotXray' : (type === 'mieru' ? 'portSlotMieru' : 'portSlotHysteria')],
+        ['portGroup', type === 'xray' ? 'portSlotXray' : 'portSlotHysteria'],
     ];
     for (const [fieldId, slotId] of pairs) {
         const field = document.getElementById(fieldId);
@@ -865,13 +878,90 @@ function onCascadeRoleChange() {
 
 // ==================== Xray UI ====================
 
-// VLESS fallbacks: tcp+tls only.
+// VLESS fallbacks: tcp+tls only, and never together with VLESS Encryption.
 function _refreshMainFallbackVisibility() {
     const fb = document.getElementById('xrayFallbackGroup');
     if (!fb) return;
     const transport = document.getElementById('xrayTransport')?.value || 'tcp';
     const security = document.getElementById('xraySecurity')?.value || 'reality';
-    fb.style.display = (transport === 'tcp' && security === 'tls') ? '' : 'none';
+    const encrypted = !!document.querySelector('#xrayVlessEncryption .vless-enc-toggle')?.checked;
+    fb.style.display = (transport === 'tcp' && security === 'tls' && !encrypted) ? '' : 'none';
+}
+
+// ==================== VLESS Encryption ====================
+
+function _vlessEncScope(el) {
+    const card = _findExtraCard(el);
+    return {
+        card,
+        module: el.closest('.vless-enc-module'),
+        fallback: card
+            ? card.querySelector('input[name="xray_extra_fallbackDest"]')
+            : document.getElementById('xrayFallbackDest'),
+    };
+}
+
+function updateVlessEncryptionUI(cb, userAction) {
+    const scope = _vlessEncScope(cb);
+    if (userAction && cb.checked && scope.fallback && scope.fallback.value.trim()) {
+        if (!confirm(i18n.xrayVlessEncFallbackConfirm)) {
+            cb.checked = false;
+            return;
+        }
+        scope.fallback.value = '';
+    }
+    const fields = scope.module?.querySelector('.vless-enc-fields');
+    if (fields) fields.style.display = cb.checked ? '' : 'none';
+    if (scope.card) _refreshExtraFallbackVisibility(scope.card);
+    else _refreshMainFallbackVisibility();
+}
+
+// The server generates a new key when the type changes; hide the stale one.
+function updateVlessEncryptionAuth(select) {
+    const module = select.closest('.vless-enc-module');
+    const pub = module?.querySelector('.vless-enc-pub');
+    const regenerate = module?.querySelector('.vless-enc-regenerate');
+    if (pub) pub.value = (select.value === select.dataset.saved && !regenerate?.value) ? (pub.dataset.saved || '') : '';
+    const note = module?.querySelector('.vless-enc-mlkem-note');
+    if (note) note.style.display = select.value === 'mlkem768' ? '' : 'none';
+}
+
+function validateVlessEncryptionTicket(input) {
+    const value = input.value.trim().toLowerCase();
+    const match = /^(\d{1,5})(?:-(\d{1,5}))?s$/.exec(value);
+    let valid = value === '' || !!match;
+    if (match) {
+        const from = Number(match[1]);
+        const to = match[2] === undefined ? null : Number(match[2]);
+        valid = to === null ? from <= 86400 : (from >= 1 && to >= from && to <= 86400);
+    }
+    const error = input.parentElement.querySelector('.vless-enc-ticket-error');
+    if (error) error.style.display = valid ? 'none' : '';
+}
+
+async function copyVlessEncryptionKey(btn) {
+    const pub = btn.closest('.vless-enc-module')?.querySelector('.vless-enc-pub');
+    if (!pub || !pub.value) return;
+    try {
+        await navigator.clipboard.writeText(pub.value);
+    } catch (_) {
+        pub.select();
+        document.execCommand('copy');
+    }
+}
+
+function regenerateVlessEncryptionKey(btn) {
+    if (!confirm(i18n.xrayVlessEncRegenerateConfirm)) return;
+    const module = btn.closest('.vless-enc-module');
+    const flag = module?.querySelector('.vless-enc-regenerate');
+    if (!flag) return;
+    const card = _findExtraCard(btn);
+    flag.value = card ? (card.querySelector('input[name="xray_extra_id"]')?.value || '') : '1';
+    const pub = module.querySelector('.vless-enc-pub');
+    if (pub) {
+        pub.value = '';
+        pub.placeholder = i18n.xrayVlessEncRegeneratePending;
+    }
 }
 
 function updateXrayTransportUI() {
@@ -894,6 +984,22 @@ function _anyXrayTlsInboundActive() {
         if (el.value === 'tls') return true;
     }
     return false;
+}
+
+// The Reality dest watchdog covers every inbound, so it stays visible while
+// the main or any extra inbound uses Reality.
+function _refreshRealityGuardVisibility() {
+    const group = document.getElementById('xrayRealityGuardGroup');
+    if (!group) return;
+    const main = document.getElementById('xraySecurity')?.value || 'reality';
+    let any = main === 'reality';
+    if (!any) {
+        for (const el of document.querySelectorAll('select[name="xray_extra_security"]')) {
+            if (el.closest('template')) continue;
+            if ((el.value || 'reality') === 'reality') { any = true; break; }
+        }
+    }
+    group.style.display = any ? '' : 'none';
 }
 
 // A shared picker is used by regular Xray and CDN client settings.
@@ -936,6 +1042,7 @@ function updateXraySecurityUI() {
     _refreshMainFallbackVisibility();
     updateXrayTlsSourceUI();
     refreshExtraInboundsEmpty();
+    _refreshRealityGuardVisibility();
 }
 
 // The empty-state note is shown only while no extra inbound exists.
@@ -1126,6 +1233,11 @@ function addExtraInbound() {
         paddingObfsCb.value = id;
         paddingObfsCb.checked = false;
     }
+    const vlessEncCb = root.querySelector('input[name="xray_extra_vlessEncryption"]');
+    if (vlessEncCb) {
+        vlessEncCb.value = id;
+        vlessEncCb.checked = false;
+    }
 
     const titleSpan = root.querySelector('.extra-inbound-title');
     if (titleSpan) titleSpan.textContent = (i18n.xrayExtraInbound || 'Extra inbound') + ' #' + (container.children.length + 1);
@@ -1159,7 +1271,8 @@ function _refreshExtraFallbackVisibility(card) {
     if (!fb) return;
     const transport = card.querySelector('select[name="xray_extra_transport"]')?.value || 'tcp';
     const security = card.querySelector('select[name="xray_extra_security"]')?.value || 'reality';
-    fb.style.display = (transport === 'tcp' && security === 'tls') ? '' : 'none';
+    const encrypted = !!card.querySelector('.vless-enc-toggle')?.checked;
+    fb.style.display = (transport === 'tcp' && security === 'tls' && !encrypted) ? '' : 'none';
 }
 
 function updateExtraXrayTransportUI(selectEl) {
@@ -1813,9 +1926,9 @@ function clearLogs() {
     document.getElementById('logsOutput').innerHTML = '';
 }
 
-async function setupNode() {
+async function setupNode({ skipConfirm = false } = {}) {
     const confirmMsg = nodeType === 'xray' ? i18n.autoSetupConfirmXray : i18n.autoSetupConfirm;
-    if (!confirm(confirmMsg)) return;
+    if (!skipConfirm && !confirm(confirmMsg)) return;
     const btn = document.getElementById('btnSetup');
     btn.disabled = true;
     btn.innerHTML = '<span class="action-icon"><i class="ti ti-loader-2"></i></span><span>...</span>';
@@ -1836,6 +1949,22 @@ async function setupNode() {
         btn.innerHTML = '<span class="action-icon"><i class="ti ti-settings"></i></span><span>' + i18n.autoSetup + '</span>';
     }
 }
+
+<% if (node._id) { %>
+// "Create and set up" lands here with ?setup=1; that click was the consent, so
+// no second confirm. The flag is dropped first so a reload does not rerun it.
+(function() {
+    const params = new URLSearchParams(location.search);
+    if (params.get('setup') !== '1') return;
+    params.delete('setup');
+    const query = params.toString();
+    history.replaceState(null, '', location.pathname + (query ? '?' + query : '') + location.hash);
+    const btn = document.getElementById('btnSetup');
+    if (!btn || btn.disabled) return;
+    document.getElementById('setupResult').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setupNode({ skipConfirm: true });
+})();
+<% } %>
 
 async function getNodeLogs() {
     document.getElementById('setupResult').innerHTML = '<div class="alert">' + i18n.loadingLogs + '</div>';
@@ -2697,9 +2826,9 @@ function nodeFormBody(form) {
     return body;
 }
 
-function finishNodeSave(form, submit, message) {
+function finishNodeSave(form, submits, message) {
     delete form.dataset.saving;
-    if (submit) submit.disabled = false;
+    submits.forEach(button => { button.disabled = false; });
     if (form.dataset.wasDirty === '1') {
         const dirty = document.getElementById('nodeFormDirty');
         if (dirty) dirty.style.display = '';
@@ -2723,8 +2852,9 @@ document.getElementById('nodeForm')?.addEventListener('submit', async function(e
     this.dataset.saving = '1';
     hideNodeFormError();
 
-    const submit = this.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+    const submits = this.querySelectorAll('button[type="submit"]');
+    submits.forEach(button => { button.disabled = true; });
+    const autoSetup = event.submitter?.id === 'btnCreateAndSetup';
     const type = document.querySelector('input[name="type"]:checked')?.value;
     const state = document.getElementById('cdnConnectionState');
     if (type === 'cdn' && state) {
@@ -2771,16 +2901,20 @@ document.getElementById('nodeForm')?.addEventListener('submit', async function(e
             try {
                 await sendFrontSite(nodeId, frontStagedSite);
             } catch (uploadError) {
-                const message = i18n.frontSiteUploadFailed.replace('{error}', uploadError.message);
+                // Setup now would publish the stock page in place of the decoy.
+                const message = i18n.frontSiteUploadFailed.replace('{error}', uploadError.message)
+                    + (autoSetup ? ' ' + i18n.createAndSetupSkipped : '');
                 const withError = panelNodeRedirect(redirect.split('?')[0] + '?error=' + encodeURIComponent(message));
                 if (!withError) throw new Error(message);
                 window.location.assign(withError);
                 return;
             }
         }
-        window.location.assign(redirect);
+        window.location.assign(autoSetup
+            ? redirect + (redirect.includes('?') ? '&' : '?') + 'setup=1'
+            : redirect);
     } catch (error) {
-        finishNodeSave(this, submit, error.message || i18n.error);
+        finishNodeSave(this, submits, error.message || i18n.error);
     }
 });
 
@@ -2868,6 +3002,13 @@ document.getElementById('generateSshKeyBtn')?.addEventListener('click', async fu
 <% if (!node?._id) { %>
 (function () {
     let siblingCheckTimer = null;
+    // Answer for one ip+type pair; anything else on screen may be stale.
+    let siblingState = { key: '', hasSsh: false };
+
+    function siblingKey() {
+        const ip = document.getElementById('ip')?.value.trim() || '';
+        return nfCurrentType() + '|' + ip;
+    }
 
     async function checkSiblingNode() {
         const ipInput = document.getElementById('ip');
@@ -2876,24 +3017,26 @@ document.getElementById('generateSshKeyBtn')?.addEventListener('click', async fu
         if (!ipInput || !hint || !hintText) return;
 
         const ip = ipInput.value.trim();
-        const type = document.querySelector('input[name="type"]:checked')?.value || 'hysteria';
+        const type = nfCurrentType();
+        const key = siblingKey();
         if (!ip) { hint.style.display = 'none'; return; }
 
         try {
             const res = await fetch('/api/nodes/check-ip?ip=' + encodeURIComponent(ip), { credentials: 'same-origin' });
-            if (!res.ok) { hint.style.display = 'none'; return; }
-            const data = await res.json();
-            const sibling = (data.nodes || []).find(n => n.type !== type);
+            const data = res.ok ? await res.json() : null;
+            if (key !== siblingKey()) return;
+            const sibling = (data?.nodes || []).find(n => n.type !== type);
+            siblingState = { key: data ? key : '', hasSsh: !!sibling?.hasSsh };
             if (sibling) {
                 const protoLabel = sibling.type === 'xray' ? 'Xray VLESS' : 'Hysteria 2';
-                var siblingMsg = '<%= typeof t !== "undefined" ? t("nodes.siblingExistsHint") : "{protocol} node already exists at this IP — SSH credentials will be synced automatically." %>';
+                const siblingMsg = sibling.hasSsh ? i18n.siblingExistsHint : i18n.siblingExistsNoSshHint;
                 hintText.textContent = siblingMsg.replace('{protocol}', protoLabel);
                 hint.style.display = '';
             } else {
                 hint.style.display = 'none';
             }
         } catch (_e) {
-            hint.style.display = 'none';
+            if (key === siblingKey()) hint.style.display = 'none';
         }
     }
 
@@ -2910,7 +3053,29 @@ document.getElementById('generateSshKeyBtn')?.addEventListener('click', async fu
         document.querySelectorAll('input[name="type"]').forEach(function(r) {
             r.addEventListener('change', checkSiblingNode);
         });
+        // "Add paired protocol" opens with the IP already filled in.
+        if (ipInput.value.trim()) checkSiblingNode();
     }
+
+    // Setup runs over SSH, so without credentials (typed here or inherited from a
+    // node on the same IP) the click leads to the SSH fields instead.
+    document.getElementById('btnCreateAndSetup')?.addEventListener('click', async function(event) {
+        const typedSsh = document.getElementById('sshPassword')?.value.trim()
+            || document.getElementById('sshPrivateKey')?.value.trim();
+        if (typedSsh || (siblingState.key === siblingKey() && siblingState.hasSsh)) return;
+        event.preventDefault();
+        if (siblingState.key !== siblingKey()) {
+            clearTimeout(siblingCheckTimer);
+            await checkSiblingNode();
+            if (siblingState.key === siblingKey() && siblingState.hasSsh) {
+                this.form.requestSubmit(this);
+                return;
+            }
+        }
+        nfSetPane('access');
+        showNodeFormError(i18n.createAndSetupNeedsSsh);
+        document.getElementById('sshPassword')?.focus({ preventScroll: true });
+    });
 })();
 <% } %>
 
@@ -2975,6 +3140,7 @@ const sniI18n = {
 };
 
 let _sniReader = null; // active SSE reader (for cancellation)
+let _sniScanIp = '';   // IPv4 actually scanned, reported by the server (input may be a hostname)
 
 function openSniScanner() {
     const modal = document.getElementById('sniScanModal');
@@ -3033,7 +3199,7 @@ function _sniAddRow(result) {
         if (parseInt(row.dataset.ping, 10) > newPing) { insertBefore = row; break; }
     }
 
-    const scanSubnet = (document.getElementById('sniScanIp')?.value || '').split('.').slice(0,3).join('.');
+    const scanSubnet = _sniScanIp.split('.').slice(0,3).join('.');
     const ipSubnet   = (result.ip || '').split('.').slice(0,3).join('.');
     const isNeighbor = scanSubnet && ipSubnet && scanSubnet === ipSubnet;
     const ipBadge    = isNeighbor
@@ -3074,12 +3240,14 @@ async function startSniScan() {
     const threads = parseInt(document.getElementById('sniScanThreads')?.value || '50',  10);
     const timeout = parseInt(document.getElementById('sniScanTimeout')?.value || '5',   10);
 
-    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
+    // IPv4 or hostname; the server resolves and validates it.
+    if (!ip || ip.length > 253 || !/^[A-Za-z0-9.-]+$/.test(ip)) {
         _sniSetStatus(sniI18n.errInvalidIp);
         return;
     }
 
     // Reset UI
+    _sniScanIp = '';
     document.getElementById('sniScanTableBody').innerHTML = '';
     document.getElementById('sniScanResults').style.display = 'none';
     document.getElementById('sniScanEmpty').style.display   = 'none';
@@ -3124,7 +3292,9 @@ async function startSniScan() {
                 let evt;
                 try { evt = JSON.parse(line.slice(6)); } catch { continue; }
 
-                if (evt.type === 'verifying') {
+                if (evt.type === 'start') {
+                    _sniScanIp = String(evt.ip || '');
+                } else if (evt.type === 'verifying') {
                     _sniSetStatus(sniI18n.verifying);
                 } else if (evt.type === 'progress') {
                     _sniSetProgress(evt.done, evt.total);

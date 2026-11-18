@@ -166,6 +166,20 @@ function xhttpAdvancedFields() {
     };
 }
 
+// VLESS Encryption (src/utils/vlessEncryption.js). Keys are panel-generated:
+// the server key is stored encrypted with ENCRYPTION_KEY and must never be
+// returned by APIs; the public key is what subscriptions publish.
+function vlessEncryptionFields() {
+    return {
+        vlessEncryption: { type: Boolean, default: false },
+        vlessEncryptionAuth: { type: String, enum: ['x25519', 'mlkem768'], default: 'x25519' },
+        vlessEncryptionMode: { type: String, enum: ['native', 'xorpub', 'random'], default: 'native' },
+        vlessEncryptionTicket: { type: String, default: '600s', match: /^\d{1,5}(-\d{1,5})?s$/ },
+        vlessEncryptionPrivateKey: { type: String, default: '' },
+        vlessEncryptionPublicKey: { type: String, default: '', match: /^[A-Za-z0-9_-]*$/ },
+    };
+}
+
 // Per-inbound stream/security settings shared by the main inbound and extras.
 // Extras add `id`, `label`, `port` and reuse their own `inboundTag` instead of
 // the node-level fields.
@@ -220,6 +234,7 @@ const xrayExtraInboundSchema = new mongoose.Schema({
 
     // VLESS fallbacks[].dest — emitted only on tcp+tls; empty = no fallback.
     fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
+    ...vlessEncryptionFields(),
 }, { _id: false });
 
 // Caddy front owning the public port: fronted inbounds move to loopback with
@@ -232,6 +247,9 @@ const xrayFrontSchema = new mongoose.Schema({
     // Owned by Caddy, not by any inbound.
     publicPort: { type: Number, default: 443, min: 1, max: 65535 },
     siteMode: { type: String, enum: ['nginx', 'custom'], default: 'nginx' },
+    // Caddy global log level. ERROR silences the per-request warnings CDN
+    // cancellations produce, at the cost of hiding other warnings too.
+    logLevel: { type: String, enum: ['WARN', 'ERROR'], default: 'WARN' },
     // select:false — up to 256 KB no hot path needs.
     siteHtml: { type: Buffer, default: null, select: false },
     // 'main' for the main inbound, otherwise extraInbounds[].id.
@@ -321,12 +339,13 @@ const xrayConfigSchema = new mongoose.Schema({
 
     // VLESS fallbacks[].dest — emitted only on tcp+tls; empty = no fallback.
     fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
+    ...vlessEncryptionFields(),
 
     // TLS provisioning strategy (security==='tls'):
     //   panel       — inline panel's LE cert (PANEL_DOMAIN); no node files.
     //   acme        — acme.sh on node issues LE cert for node.domain; auto-renews.
     //   manual      — operator pastes node.domain + PEM; inlined into config.json.
-    //   self-signed — openssl on node; client needs allowInsecure (testing only).
+    //   self-signed — openssl on node; clients pin tlsCertSha256 (testing only).
     tlsSource: { type: String, enum: ['panel', 'acme', 'manual', 'self-signed'], default: 'panel' },
     // Empty acmeEmail = use panel-wide ACME_EMAIL env var.
     acmeEmail: { type: String, default: '' },
@@ -339,6 +358,17 @@ const xrayConfigSchema = new mongoose.Schema({
 
     // gRPC API port for user management (local, not exposed)
     apiPort: { type: Number, default: 61000 },
+
+    // Xray policy connIdle, seconds. 300 is the Xray default and is not written
+    // to the config; lower values free stale sessions sooner but also drop
+    // long-lived quiet connections (SSH, push channels).
+    connIdle: {
+        type: Number,
+        default: 300,
+        min: 10,
+        max: 86400,
+        validate: { validator: Number.isInteger, message: 'connIdle must be an integer' },
+    },
 
     // Inbound tag used in config and API calls
     inboundTag: { type: String, default: 'vless-in' },
@@ -382,6 +412,32 @@ const xrayConfigSchema = new mongoose.Schema({
         droppedEvents: { type: Number, default: 0 },
         lastReconcileAt: { type: Date, default: null },
     },
+
+    // Reality dest watchdog state (see realityGuardService). Written with
+    // targeted $set updates only, so a check never triggers a config sync.
+    realityGuard: {
+        mode: { type: String, enum: ['auto', 'notify', 'off'], default: 'auto' },
+        status: { type: String, enum: ['ok', 'failing', 'dead', 'no_candidate'], default: 'ok' },
+        failCount: { type: Number, default: 0 },
+        lastCheckAt: { type: Date, default: null },
+        lastError: { type: String, default: '', maxlength: 300 },
+        lastRotatedAt: { type: Date, default: null },
+        lastRotatedFrom: { type: String, default: '', maxlength: 300 },
+        lastRotatedTo: { type: String, default: '', maxlength: 300 },
+        warning: { type: String, default: '', maxlength: 300 },
+        nodeConfirmedAt: { type: Date, default: null },
+        // Operator-owned replacement candidates; the guard never edits this list.
+        reserveSnis: { type: [String], default: [] },
+        // Guard-owned: reserve domains that failed recently and are skipped for a while.
+        reserveFailed: {
+            type: [new mongoose.Schema({
+                domain: { type: String, maxlength: 253 },
+                at: { type: Date },
+                reason: { type: String, maxlength: 40 },
+            }, { _id: false })],
+            default: [],
+        },
+    },
 }, { _id: false });
 
 // Virtual node: a balancer entry that aggregates other nodes into a single
@@ -406,6 +462,9 @@ const virtualConfigSchema = new mongoose.Schema({
         interval: { type: String, default: '1m' },
         timeout: { type: String, default: '5s' },
         sampling: { type: Number, default: 3 },
+        // burstObservatory (leastLoad) only: GET makes the client download the
+        // whole probe response instead of the headers alone.
+        httpMethod: { type: String, enum: ['HEAD', 'GET'], default: 'HEAD', uppercase: true, trim: true },
     },
     // Clients that resolve the balancer with a latency test (sing-box urltest,
     // Mihomo url-test) rather than Xray's observatory. Xray ignores these and
@@ -456,32 +515,9 @@ const cdnConfigSchema = new mongoose.Schema({
     xhttpMode: { type: String, enum: ['', 'auto', 'packet-up', 'stream-up', 'stream-one'], default: '' },
 }, { _id: false });
 
-// Mieru node: standalone mita server config (https://github.com/enfein/mieru).
-// Users are taken from the global HyUser pool — each enabled user becomes one
-// entry in mita's `users` array (username + password). The fields below only
-// describe the listener and transport; per-user creds live on HyUser.
-const mieruConfigSchema = new mongoose.Schema({
-    // mita listens on a single port-binding. TCP is corp-firewall friendly,
-    // UDP is faster but more often blocked.
-    protocol: { type: String, enum: ['TCP', 'UDP'], default: 'TCP' },
-    // Padding budget for mita's inner frames — only effective when mux is on.
-    mtu: { type: Number, default: 1400 },
-    loggingLevel: { type: String, enum: ['DEBUG', 'INFO', 'WARN', 'ERROR'], default: 'INFO' },
-    // Server-side multiplexing pattern. Empty = client-driven. Setting it
-    // forces every session to use that pattern (raises latency-stealth).
-    multiplexing: {
-        type: String,
-        enum: ['', 'MULTIPLEXING_OFF', 'MULTIPLEXING_LOW', 'MULTIPLEXING_MIDDLE', 'MULTIPLEXING_HIGH', 'MULTIPLEXING_PADDING'],
-        default: '',
-    },
-    // When true, mux frames missing the username hint are rejected — saves CPU
-    // on probe traffic but blocks pre-3.x clients that don't emit the hint.
-    muxUserHintMandatory: { type: Boolean, default: false },
-}, { _id: false });
-
 const hyNodeSchema = new mongoose.Schema({
-    // 'hysteria' (default), 'xray', 'virtual' (balancer), 'cdn' (edge front), or 'mieru' (mita server).
-    type: { type: String, enum: ['hysteria', 'xray', 'virtual', 'cdn', 'mieru'], default: 'hysteria' },
+    // 'hysteria' (default), 'xray', 'virtual' (balancer), or 'cdn' (edge front).
+    type: { type: String, enum: ['hysteria', 'xray', 'virtual', 'cdn'], default: 'hysteria' },
 
     name: { type: String, required: true },
     flag: { type: String, default: '' },
@@ -495,6 +531,9 @@ const hyNodeSchema = new mongoose.Schema({
     port: { type: Number, default: 443 },
     portRange: { type: String, default: '20000-50000' },
     hopInterval: { type: String, default: '' },
+    // Subscription entries to publish: TLS (single port), Hopping (portRange),
+    // or both. Subscription-only; the node itself is not reconfigured.
+    subscriptionVariants: { type: String, enum: ['both', 'tls', 'hopping'], default: 'both' },
     portConfigs: { type: [portConfigSchema], default: [] },
     obfs: {
         type: { type: String, enum: ['', 'salamander', 'gecko'], default: '' },
@@ -520,9 +559,6 @@ const hyNodeSchema = new mongoose.Schema({
     // Virtual-specific configuration (only used when type === 'virtual')
     virtual: { type: virtualConfigSchema, default: () => ({}) },
 
-    // Mieru-specific configuration (only used when type === 'mieru')
-    mieru: { type: mieruConfigSchema, default: () => ({}) },
-
     // CDN-specific publication configuration (only used when type === 'cdn')
     cdn: { type: cdnConfigSchema, default: () => ({}) },
 
@@ -543,6 +579,9 @@ const hyNodeSchema = new mongoose.Schema({
         cert: { type: String, default: '/etc/hysteria/cert.pem' },
         key: { type: String, default: '/etc/hysteria/key.pem' },
     },
+    // Leaf SHA-256 (hex) of the certificate the node serves when clients cannot
+    // verify it by name. Read at setup. Clients pin it: Xray 26.2.6+ rejects allowInsecure.
+    tlsCertSha256: { type: String, default: '', match: /^([a-f0-9]{64})?$/ },
     
     outbounds: { type: [outboundSchema], default: [] },
     aclRules: { type: [String], default: [] },
@@ -661,6 +700,15 @@ hyNodeSchema.pre('validate', async function() {
     if (!this.ip) {
         throw new Error(`Node type ${this.type} requires ip`);
     }
+});
+
+// Retired nodes can still be referenced by old accounts. Keep their documents
+// for history, and exclude them from provisioning, statistics and subscriptions.
+hyNodeSchema.pre(['find', 'findOne', 'findOneAndUpdate', 'findOneAndDelete', 'countDocuments', 'updateOne', 'updateMany'], function () {
+    this.and([{ type: { $ne: 'mieru' } }]);
+});
+hyNodeSchema.pre('aggregate', function () {
+    this.pipeline().unshift({ $match: { type: { $ne: 'mieru' } } });
 });
 
 /**

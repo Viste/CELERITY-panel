@@ -3,6 +3,7 @@
  */
 
 const { Client } = require('ssh2');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
@@ -12,9 +13,7 @@ const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
 const { isServerlessNode } = require('../utils/nodeTypes');
 const { isLoopbackAddress, hasOwnTlsInbound } = require('../utils/xrayFront');
-const {
-    normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildServiceLogsCommand, buildListenCheckCommand,
-} = require('../utils/nodeOs');
+const { normalizeOsFamily, nodeOsFamily, buildServiceCommand } = require('../utils/nodeOs');
 
 /**
  * Check if a node is on the same VPS as the panel
@@ -390,6 +389,9 @@ function connectSSH(node) {
             port: node.ssh?.port || 22,
             username: node.ssh?.username || 'root',
             readyTimeout: 30000,
+            // Without keepalive a node that drops off mid-command leaves exec() pending forever.
+            keepaliveInterval: 15000,
+            keepaliveCountMax: 4,
         };
         
         if (node.ssh?.privateKey) {
@@ -430,10 +432,64 @@ function execSSH(conn, command) {
     });
 }
 
+const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+/**
+ * SHA-256 (hex) of the first certificate in a PEM bundle. That is the leaf
+ * `openssl x509 -outform der | sha256sum` prints, which is what clients pin.
+ */
+function leafCertSha256(pem) {
+    const match = String(pem || '').match(/-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----/);
+    if (!match) return '';
+    const der = Buffer.from(match[1].replace(/\s/g, ''), 'base64');
+    if (!der.length) return '';
+    return crypto.createHash('sha256').update(der).digest('hex');
+}
+
+/**
+ * Persist a certificate pin. No-op when the value is empty, the hash of an
+ * empty file, or already stored.
+ * @returns {Promise<boolean>} true when the database changed
+ */
+async function storeTlsCertSha256(node, hash) {
+    const normalized = String(hash || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(normalized) || normalized === EMPTY_SHA256) return false;
+    if (node.tlsCertSha256 === normalized) return false;
+    const HyNode = require('../models/hyNodeModel');
+    await HyNode.updateOne({ _id: node._id }, { $set: { tlsCertSha256: normalized } });
+    node.tlsCertSha256 = normalized;
+    return true;
+}
+
+/**
+ * Store the leaf SHA-256 of the certificate at `certPath` on the node, so
+ * subscriptions can pin it instead of emitting allowInsecure.
+ */
+async function saveSelfSignedCertHash(conn, node, certPath, log) {
+    const result = await execSSH(conn, `openssl x509 -in ${certPath} -outform der 2>/dev/null | sha256sum`);
+    const hash = String(result.output || '').trim().split(/\s+/)[0].toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hash) || hash === EMPTY_SHA256) {
+        log(`Warning: could not read the certificate hash of ${certPath}; clients cannot pin it`);
+        return;
+    }
+    await storeTlsCertSha256(node, hash);
+}
+
+/**
+ * Build the error raised when a service is not active after a restart.
+ * The restart scripts print status and journal output before the final
+ * `systemctl is-active` check, so the tail of the output explains the failure.
+ */
+function serviceStartError(service, result) {
+    const tail = String(result.output || '').trim().split('\n')
+        .map(l => l.trim()).filter(Boolean).slice(-5).join(' | ');
+    return new Error(`${service} is not active after restart (${result.error || 'unknown exit code'}). `
+        + `Last log lines: ${tail.slice(0, 800) || 'none'}`);
+}
+
 function resolveNodeServiceCandidates(node) {
     if (!node || isServerlessNode(node)) return [];
     if (node.type === 'xray') return ['xray'];
-    if (node.type === 'mieru') return ['mita'];
     return ['hysteria-server', 'hysteria'];
 }
 
@@ -456,8 +512,9 @@ function serviceExistsCommand(serviceName, osFamily) {
 /** Run `uname -s` once, persist the result on the node document and return it. */
 async function detectOsFamily(conn, node) {
     const result = await execSSH(conn, 'uname -s');
-    const osFamily = normalizeOsFamily(result.success ? result.output : '');
-    if (node && node.osFamily !== osFamily) {
+    if (!result.success || !/^(linux|freebsd)$/i.test(String(result.output).trim())) throw new Error('Unable to identify a supported node OS');
+    const osFamily = normalizeOsFamily(result.output);
+    if (node && nodeOsFamily(node) !== osFamily) {
         node.osFamily = osFamily;
         if (node._id) {
             const HyNode = require('../models/hyNodeModel');
@@ -495,7 +552,7 @@ function buildRuntimeStartScript(osFamily, service) {
         return `
 ${serviceExistsCommand(service, osFamily)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
 sysrc ${service}_enable=YES 2>&1
-service ${service} restart </dev/null >/dev/null 2>&1 2>&1
+service ${service} restart </dev/null >/dev/null 2>&1
 sleep 2
 if service ${service} status >/dev/null 2>&1; then STATE=active; else STATE=inactive; fi
 echo "STATE:$STATE"
@@ -536,15 +593,10 @@ exit 0`;
 function buildFreebsdXrayStartScript(verifyPorts) {
     return `
 echo "=== Starting Xray service (rc.d) ==="
-# The pkg rc script runs xray as user v2ray with -confdir: point it at the
-# directory and let that user bind :443 (FreeBSD reserves ports < 1024).
-sysrc xray_enable=YES
-sysrc xray_config=/usr/local/etc/xray
-sysctl net.inet.ip.portrange.reservedhigh=0 >/dev/null
-grep -q '^net.inet.ip.portrange.reservedhigh=' /etc/sysctl.conf 2>/dev/null || echo 'net.inet.ip.portrange.reservedhigh=0' >> /etc/sysctl.conf
-chmod 644 /usr/local/etc/xray/config.json 2>/dev/null || true
+# The package rc script runs Xray as v2ray and takes a configuration directory.
+sysrc xray_enable=YES && sysrc xray_config=/usr/local/etc/xray || exit 1
 # daemon(8) inherits our stdio; without this the SSH exec never sees EOF
-service xray restart </dev/null >/tmp/xray-restart.out 2>&1; cat /tmp/xray-restart.out
+service xray restart </dev/null >/dev/null 2>&1
 sleep 2
 echo "Service status:"
 service xray status || true
@@ -553,7 +605,7 @@ if ! service xray status >/dev/null 2>&1; then
     exit 1
 fi
 for p in ${verifyPorts.join(' ')}; do
-    if ! sockstat -46l -P tcp -p "$p" 2>/dev/null | awk 'NR > 1' | grep -q .; then
+    if ! sockstat -46l -p "$p" | awk -v p="$p" '$2=="xray" && $6 ~ (":" p "$") {ok=1} END{exit !ok}'; then
         echo "ERROR: xray is running but nothing listens on :$p"
         exit 1
     fi
@@ -565,23 +617,22 @@ echo "Done: xray running${verifyPorts.length ? `, listening on ${verifyPorts.joi
 /** Returns '' when CC_AGENT_FREEBSD_URL is unset or not a plain http(s) URL. */
 function buildFreebsdAgentDownloadScript(url) {
     const safeUrl = String(url || '').trim();
-    if (!/^https?:\/\/[^\s'"\\]+$/.test(safeUrl)) return '';
+    if (!/^https:\/\/[^\s'"\\\\]+$/.test(safeUrl)) return '';
     return `
-rm -f /usr/local/bin/cc-agent
+set -eu
+[ "$(uname -m)" = amd64 ] || { echo "ERROR: the bundled FreeBSD agent requires amd64"; exit 1; }
 URL='${safeUrl}'
-echo "Downloading $URL ..."
+tmp=$(mktemp /usr/local/bin/.cc-agent.XXXXXX)
+trap 'rm -f "$tmp"' EXIT
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 120 "$URL" -o /usr/local/bin/cc-agent
+    curl --proto '=https' --proto-redir '=https' -fsSL --max-time 120 "$URL" -o "$tmp"
 else
-    fetch -q -o /usr/local/bin/cc-agent "$URL"
+    fetch -q -o "$tmp" "$URL"
 fi
-if [ ! -s /usr/local/bin/cc-agent ]; then
-    echo "ERROR: Download failed or file is empty"
-    exit 1
-fi
-chmod +x /usr/local/bin/cc-agent
+[ -s "$tmp" ]
+chmod 755 "$tmp"
+mv -f "$tmp" /usr/local/bin/cc-agent
 echo "OK: cc-agent binary ready"
-ls -la /usr/local/bin/cc-agent
 `;
 }
 
@@ -682,14 +733,27 @@ async function startNodeRuntime(node) {
     return runRuntimeServiceCommand(node, 'start', service => buildRuntimeStartScript(osFamily, service));
 }
 
-function uploadFile(conn, content, remotePath) {
+// Without an explicit mode the result depends on the remote sftp-server umask,
+// which leaves 0666 files on some hosts. The open() mode only applies to new
+// files, so chmod afterwards fixes files left world-writable earlier.
+function uploadFile(conn, content, remotePath, mode = 0o644) {
     return new Promise((resolve, reject) => {
         conn.sftp((err, sftp) => {
             if (err) return reject(err);
-            
-            const writeStream = sftp.createWriteStream(remotePath);
-            writeStream.on('close', () => resolve());
-            writeStream.on('error', (err) => reject(err));
+
+            let settled = false;
+            const finish = (error) => {
+                if (settled) return;
+                settled = true;
+                sftp.end();
+                if (error) reject(error);
+                else resolve();
+            };
+            const writeStream = sftp.createWriteStream(remotePath, { mode });
+            writeStream.on('close', () => {
+                if (!settled) sftp.chmod(remotePath, mode, finish);
+            });
+            writeStream.on('error', finish);
             writeStream.write(content);
             writeStream.end();
         });
@@ -795,8 +859,8 @@ async function setupNode(node, options = {}) {
             
             if (panelCerts) {
                 // Upload certificates to node
-                await uploadFile(conn, panelCerts.cert, '/etc/hysteria/cert.pem');
-                await uploadFile(conn, panelCerts.key, '/etc/hysteria/key.pem');
+                await uploadFile(conn, panelCerts.cert, '/etc/hysteria/cert.pem', 0o644);
+                await uploadFile(conn, panelCerts.key, '/etc/hysteria/key.pem', 0o600);
                 
                 // Set correct permissions
                 await execSSH(conn, `
@@ -811,10 +875,18 @@ ls -la /etc/hysteria/*.pem
                 
                 log('Panel certificates copied successfully');
                 useTlsFiles = true;
+                // The file is the panel certificate, but a node without a domain
+                // is advertised by IP. Clients pin the leaf instead of failing
+                // name checks. A renewed cert is pinned again when sync uploads it.
+                const pinned = await storeTlsCertSha256(node, leafCertSha256(panelCerts.cert));
+                if (!pinned && !node.tlsCertSha256) {
+                    await saveSelfSignedCertHash(conn, node, '/etc/hysteria/cert.pem', log);
+                }
             } else {
                 log('Warning: Could not read panel certificates, falling back to self-signed');
                 const certResult = await execSSH(conn, SELF_SIGNED_CERT_SCRIPT);
                 logs.push(certResult.output);
+                await saveSelfSignedCertHash(conn, node, '/etc/hysteria/cert.pem', log);
                 useTlsFiles = true;
             }
             
@@ -827,6 +899,7 @@ ls -la /etc/hysteria/*.pem
             if (!certResult.success) {
                 throw new Error(`Certificate generation failed: ${certResult.error}`);
             }
+            await saveSelfSignedCertHash(conn, node, '/etc/hysteria/cert.pem', log);
             log('Certificate ready (self-signed)');
             useTlsFiles = true;
             
@@ -842,7 +915,11 @@ ls -la /etc/hysteria/*.pem
 echo "=== Setting up for ACME ==="
 
 mkdir -p /etc/hysteria/acme
-chmod 777 /etc/hysteria/acme
+# ACME private keys live here: owner-only, handed to the service user when present.
+if id hysteria >/dev/null 2>&1; then
+    chown hysteria:hysteria /etc/hysteria/acme
+fi
+chmod 700 /etc/hysteria/acme
 chmod 755 /etc/hysteria
 echo "Done: ACME directory created with correct permissions"
 
@@ -879,7 +956,7 @@ echo "Note: Make sure DNS for ${node.domain} points to this server's IP!"
         
         log('Uploading config...');
         const hysteriaConfig = configGenerator.generateNodeConfig(node, authUrl, { authInsecure, useTlsFiles });
-        await uploadFile(conn, hysteriaConfig, '/etc/hysteria/config.yaml');
+        await uploadFile(conn, hysteriaConfig, '/etc/hysteria/config.yaml', 0o644);
         log('Config uploaded to /etc/hysteria/config.yaml');
         logs.push('--- Config content ---');
         logs.push(hysteriaConfig);
@@ -943,14 +1020,14 @@ systemctl status hysteria-server --no-pager -l || true
 echo ""
 echo "Journal logs (last 20 lines):"
 journalctl -u hysteria-server -n 20 --no-pager || true
+systemctl is-active --quiet hysteria-server
             `);
             logs.push(restartResult.output);
-            
+
             if (!restartResult.success) {
-                log(`Service restart warning: ${restartResult.error}`);
-            } else {
-                log('Service restarted');
+                throw serviceStartError('hysteria-server', restartResult);
             }
+            log('Service restarted');
         }
         
         log('Setup completed successfully!');
@@ -1003,6 +1080,100 @@ async function getNodeLogs(node, lines = 50) {
 }
 
 // ==================== XRAY SETUP ====================
+
+/**
+ * Shell snippet that pins ownership and modes of an Xray config directory.
+ *
+ * The systemd unit runs Xray as User=nobody, while the upstream installer
+ * creates the config directory as 750 root:xray, which nobody cannot enter.
+ * Secrets (config, key, rollback copy) end up 640 root:<nobody group>, so only
+ * root and the service can read them. The primary group of nobody differs by
+ * distro (nogroup on Debian/Ubuntu, nobody on RHEL), hence `id -gn`.
+ *
+ * Exits non-zero when nobody still cannot read config.json, e.g. because a
+ * parent directory such as /usr/local/etc is locked down.
+ *
+ * @param {string} [dir='/usr/local/etc/xray'] - Absolute directory path (trusted constant)
+ * @returns {string} bash snippet
+ */
+function buildXrayPermsScript(dir = '/usr/local/etc/xray', osFamily = 'linux') {
+    if (!/^\/[A-Za-z0-9._\/-]+$/.test(dir)) {
+        throw new Error(`buildXrayPermsScript: unsafe directory path: ${dir}`);
+    }
+    const freebsd = osFamily === 'freebsd';
+    return `
+XRAY_DIR='${dir}'
+XRAY_GROUP="${freebsd ? '$(id -gn v2ray)' : '$(id -gn nobody 2>/dev/null || echo nogroup)'}" || exit 20
+if [ -d "$XRAY_DIR" ]; then
+    chown root:"$XRAY_GROUP" "$XRAY_DIR" && chmod 750 "$XRAY_DIR" || exit 20
+    for f in config.json config.json.prev key.pem; do
+        if [ -f "$XRAY_DIR/$f" ]; then
+            chown root:"$XRAY_GROUP" "$XRAY_DIR/$f" && chmod 640 "$XRAY_DIR/$f" || exit 20
+        fi
+    done
+    if [ -f "$XRAY_DIR/cert.pem" ]; then
+        chown root:"$XRAY_GROUP" "$XRAY_DIR/cert.pem" && chmod 644 "$XRAY_DIR/cert.pem" || exit 20
+    fi
+    if [ -f "$XRAY_DIR/config.json" ] && command -v runuser >/dev/null 2>&1; then
+        if ! runuser -u ${freebsd ? 'v2ray' : 'nobody'} -- test -r "$XRAY_DIR/config.json"; then
+            echo "ERROR: service user cannot read $XRAY_DIR/config.json. Check permissions of every parent directory:"
+            ls -ld /usr/local /usr/local/etc "$XRAY_DIR" 2>&1
+            exit 21
+        fi
+    fi
+    echo "Done: permissions pinned on $XRAY_DIR (root:$XRAY_GROUP)"
+fi
+`;
+}
+
+/**
+ * Shell snippet that moves xray.service onto User=nobody when it runs as
+ * another account.
+ *
+ * Nodes that only ever ran the upstream installer (cascade bridges and relays)
+ * keep its unit with User=xray. Once the config directory belongs to the nobody
+ * group, that unit can no longer read the config on its next start (sync, core
+ * update, reboot), so it is replaced with the panel's unit. Enabled and running
+ * state are kept: a running process switches user on its next restart. Units
+ * running as root or nobody, and nodes without the unit, are left alone.
+ *
+ * `systemctl show` is parsed without --value, which systemd < 230 lacks. The
+ * unit travels as base64, so its text needs no shell quoting.
+ *
+ * @param {string} [unitDir='/etc/systemd/system'] - Absolute directory path (trusted constant)
+ * @returns {string} bash snippet, exits 22 when the unit cannot be switched
+ */
+function buildXrayUnitUserScript(unitDir = '/etc/systemd/system') {
+    if (!/^\/[A-Za-z0-9._\/-]+$/.test(unitDir)) {
+        throw new Error(`buildXrayUnitUserScript: unsafe directory path: ${unitDir}`);
+    }
+    const unit = Buffer.from(configGenerator.generateXraySystemdService()).toString('base64');
+    return `
+xray_unit_prop() { systemctl show -p "$1" xray 2>/dev/null | sed -n "s/^$1=//p"; }
+XRAY_UNIT_FILE='${unitDir}/xray.service'
+XRAY_UNIT_USER="$(xray_unit_prop User)"
+if [ "$(xray_unit_prop LoadState)" = "loaded" ] && [ -n "$XRAY_UNIT_USER" ] && [ "$XRAY_UNIT_USER" != "nobody" ]; then
+    echo '${unit}' | base64 -d > "$XRAY_UNIT_FILE.tmp" \\
+        && chmod 644 "$XRAY_UNIT_FILE.tmp" \\
+        && mv -f "$XRAY_UNIT_FILE.tmp" "$XRAY_UNIT_FILE" \\
+        && systemctl daemon-reload \\
+        || { rm -f "$XRAY_UNIT_FILE.tmp"; echo "ERROR: cannot replace xray.service (User=$XRAY_UNIT_USER)"; exit 22; }
+    XRAY_UNIT_GROUP="$(xray_unit_prop Group)"
+    if [ "$(xray_unit_prop User)" != "nobody" ] \\
+       || { [ -n "$XRAY_UNIT_GROUP" ] && [ "$XRAY_UNIT_GROUP" != "$(id -gn nobody 2>/dev/null || echo nogroup)" ]; }; then
+        echo "ERROR: xray.service still runs as $(xray_unit_prop User):$XRAY_UNIT_GROUP, a drop-in in /etc/systemd/system/xray.service.d overrides User= or Group="
+        exit 22
+    fi
+    echo "Done: xray.service switched from User=$XRAY_UNIT_USER to User=nobody"
+fi
+`;
+}
+
+const XRAY_PERMS_SNIPPET = buildXrayUnitUserScript() + buildXrayPermsScript();
+
+function xrayPermsSnippet(osFamily) {
+    return osFamily === 'freebsd' ? buildXrayPermsScript('/usr/local/etc/xray', osFamily) : XRAY_PERMS_SNIPPET;
+}
 
 /** Client-facing TCP ports the node's xray must bind (main + extra inbounds, non-loopback). */
 function collectExternalListenPorts(node) {
@@ -1072,25 +1243,24 @@ else
 fi
 
 mkdir -p /usr/local/etc/xray
+${XRAY_PERMS_SNIPPET}
 echo "Done: Directory /usr/local/etc/xray ready"
 `;
 
 // POSIX sh: FreeBSD root's login shell is /bin/sh and bash is not in base.
 const XRAY_INSTALL_SCRIPT_FREEBSD = `
-echo "=== [1/4] Installing Xray-core (FreeBSD pkg) ==="
+set -eu
+echo "=== Installing Xray-core (FreeBSD pkg) ==="
 echo "OS: $(uname -sr)"
 echo "Arch: $(uname -m)"
 
-XRAY_PIN="${process.env.XRAY_VERSION || ''}"
-if [ -n "$XRAY_PIN" ]; then
-    echo "Note: XRAY_VERSION=$XRAY_PIN is ignored on FreeBSD — the pkg repository version is installed."
-fi
+# Initial installation uses the pkg repository. Use the panel version action to change the core afterwards.
 
-if [ -x /usr/local/bin/xray ] && command -v curl >/dev/null 2>&1; then
+if [ -x /usr/local/bin/xray ] && command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
     echo "Done: xray-core and curl already installed"
 else
     echo "Installing xray-core and curl via pkg..."
-    ASSUME_ALWAYS_YES=yes pkg install -y xray-core curl 2>&1
+    ASSUME_ALWAYS_YES=yes pkg install -y xray-core curl unzip 2>&1
     if [ ! -x /usr/local/bin/xray ]; then
         echo "ERROR: /usr/local/bin/xray not found after pkg install"
         exit 1
@@ -1114,7 +1284,7 @@ if [ ! -s "$ASSET/geoip.dat" ] || [ ! -s "$ASSET/geosite.dat" ]; then
         echo "Done: geo data fetched from GitHub"
     fi
 fi
-[ -s "$ASSET/geoip.dat" ] || { echo "ERROR: geoip.dat missing"; exit 1; }
+[ -s "$ASSET/geoip.dat" ] && [ -s "$ASSET/geosite.dat" ] || { echo "ERROR: Xray geo data missing"; exit 1; }
 ln -sf "$ASSET/geoip.dat" /usr/local/bin/geoip.dat
 ln -sf "$ASSET/geosite.dat" /usr/local/bin/geosite.dat
 
@@ -1148,10 +1318,10 @@ function buildAcmeSetupScript({ domain, email, nodeIp, osFamily }) {
         apt-get update && apt-get install -y curl || yum install -y curl || apk add --no-cache curl
     fi`;
     const reloadXray = freebsd
-        ? `service xray restart >/dev/null 2>&1 || true`
+        ? `service xray restart </dev/null >/dev/null 2>&1 || true`
         : `systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true`;
 
-    return `#!/bin/bash
+    return `#!${freebsd ? '/bin/sh' : '/bin/bash'}
 set -e
 DOMAIN="${d}"
 EMAIL="${e}"
@@ -1202,20 +1372,20 @@ fi
 
 mkdir -p /usr/local/etc/xray
 
-# Xray runs as User=nobody; acme.sh writes as root → chown is required for the
-# unprivileged service to read the key. Re-applied via --reloadcmd on renewal.
-# 'nobody' primary group differs by distro (nogroup on Debian/Ubuntu).
-NOBODY_GROUP="\$(id -gn nobody 2>/dev/null || echo nobody)"
-RELOAD_CMD="chown 'nobody:\${NOBODY_GROUP}' '\${KEY_PATH}' '\${CERT_PATH}' 2>/dev/null || true; chmod 644 '\${CERT_PATH}' 2>/dev/null || true; chmod 600 '\${KEY_PATH}' 2>/dev/null || true; ${reloadXray}"
+# Xray runs as User=nobody; acme.sh writes as root, so the key is handed to
+# the primary group of nobody (root stays the owner). Re-applied via
+# --reloadcmd on renewal. The group differs by distro (nogroup on Debian/Ubuntu).
+XRAY_GROUP="${freebsd ? '$(id -gn v2ray)' : '$(id -gn nobody 2>/dev/null || echo nogroup)'}"
+RELOAD_CMD="chown 'root:\${XRAY_GROUP}' '\${KEY_PATH}' '\${CERT_PATH}' 2>/dev/null || true; chmod 644 '\${CERT_PATH}' 2>/dev/null || true; chmod 640 '\${KEY_PATH}' 2>/dev/null || true; ${reloadXray}"
 
 "\${ACME}" --install-cert -d "\${DOMAIN}" --ecc \\
     --key-file       "\${KEY_PATH}" \\
     --fullchain-file "\${CERT_PATH}" \\
     --reloadcmd "\${RELOAD_CMD}"
 
-chown "nobody:\${NOBODY_GROUP}" "\${KEY_PATH}" "\${CERT_PATH}" 2>/dev/null || true
+chown "root:\${XRAY_GROUP}" "\${KEY_PATH}" "\${CERT_PATH}" 2>/dev/null || true
 chmod 644 "\${CERT_PATH}" 2>/dev/null || true
-chmod 600 "\${KEY_PATH}"  2>/dev/null || true
+chmod 640 "\${KEY_PATH}"  2>/dev/null || true
 
 if crontab -l 2>/dev/null | grep -q '\\.acme\\.sh/acme\\.sh.*--cron'; then
     echo "Done: cert installed; acme.sh cron is active."
@@ -1303,7 +1473,7 @@ async function setupXrayNode(node, options = {}) {
             if (/csh$/.test(loginShell)) {
                 throw new Error(`Login shell on the node is ${loginShell}; set it to /bin/sh (chsh -s /bin/sh ${node.ssh?.username || 'root'}) and retry.`);
             }
-            if (exitOnly) {
+            if (exitOnly || node.cascadeRole === 'relay') {
                 throw new Error('Cascade bridge/exit nodes are not supported on FreeBSD (xray-bridge is a systemd unit).');
             }
             if ((node.xray || {}).front?.enabled) {
@@ -1314,7 +1484,7 @@ async function setupXrayNode(node, options = {}) {
         await runInitScript(conn, node, log, logs);
 
         if (!exitOnly) {
-            // A foreign listener on a client-facing port (mita, nginx, another
+            // A foreign listener on a client-facing port (nginx, another
             // panel's xray) would make `systemctl restart xray` succeed while
             // the inbound never binds. Fail here, with the owner in the message.
             const portsToCheck = collectExternalListenPorts(node);
@@ -1417,7 +1587,9 @@ exit 0`);
         }
         const configPath = '/usr/local/etc/xray/config.json';
 
-        await uploadFile(conn, configContent, configPath);
+        // The config holds the Reality private key and every user UUID, so it
+        // is not world-readable; XRAY_PERMS_SNIPPET below grants group access.
+        await uploadFile(conn, configContent, configPath, 0o640);
         log(`Config uploaded to ${configPath} (${users.length} users)`);
         logs.push('--- Config preview ---');
         logs.push(configContent.substring(0, 500) + (configContent.length > 500 ? '\n...' : ''));
@@ -1462,6 +1634,7 @@ fi
             if (!certResult.success) {
                 log(`Self-signed cert generation warning: ${certResult.error}`);
             }
+            await saveSelfSignedCertHash(conn, node, '/usr/local/etc/xray/cert.pem', log);
         } else if (xrayCfg.front?.enabled && xrayCfg.tlsSource === 'acme') {
             log('TLS source: acme — the reverse proxy front obtains and renews the certificate itself.');
         } else if (terminatesTls && xrayCfg.tlsSource === 'acme') {
@@ -1486,22 +1659,19 @@ fi
             log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
         }
 
+        log('Pinning ownership and modes of /usr/local/etc/xray...');
+        const permsResult = await execSSH(conn, xrayPermsSnippet(osFamily));
+        logs.push(permsResult.output);
+        if (!permsResult.success) {
+            const tail = (permsResult.output || '').trim().split('\n').slice(-4).join(' | ');
+            throw new Error(`Cannot make the Xray config readable by the service user: ${tail || permsResult.error}`);
+        }
+
         // Collect externally bound client-facing ports. Loopback listeners and
         // apiPort do not need host firewall rules.
-        const mainPort = node.port || 443;
         const apiPort = (node.xray || {}).apiPort || 61000;
         const xrayConfig = node.xray || {};
-        const externalPorts = [];
-        if (!isLoopbackAddress(xrayConfig.listen || '0.0.0.0')) {
-            externalPorts.push(mainPort);
-        }
-        for (const inbound of (xrayConfig.extraInbounds || [])) {
-            const port = parseInt(inbound.port, 10);
-            if (Number.isInteger(port) && port > 0 && port < 65536
-                && !isLoopbackAddress(inbound.listen || '0.0.0.0')) {
-                externalPorts.push(port);
-            }
-        }
+        const externalPorts = collectExternalListenPorts(node);
         // The front owns the public port, plus :80 for the ACME challenge.
         if (xrayConfig.front?.enabled) {
             externalPorts.push(xrayConfig.front.publicPort || 443, 80);
@@ -1520,9 +1690,7 @@ fi
 
         const firewalldRules = allPorts.map(p => `
     firewall-cmd --permanent --add-port=${p}/tcp >/dev/null 2>&1 || true`).join('');
-        const firewallResult = osFamily === 'freebsd'
-            ? { output: 'FreeBSD: firewall step skipped' }
-            : await execSSH(conn, `
+        const firewallResult = osFamily === 'freebsd' ? { output: 'FreeBSD: firewall managed by the host' } : await execSSH(conn, `
 echo "=== Opening firewall ports ==="
 if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then${firewalldRules}
     firewall-cmd --reload >/dev/null 2>&1 || true
@@ -1541,14 +1709,11 @@ echo "Done: Firewall configured"
         log(osFamily === 'freebsd' ? 'Firewall step skipped' : 'Firewall configured');
 
         if (restartService) {
-            if (osFamily === 'freebsd') {
-                log('Enabling rc.d service and starting Xray...');
-            } else {
+            if (osFamily === 'linux') {
                 log('Installing systemd service and starting Xray...');
-                const serviceContent = configGenerator.generateXraySystemdService();
-                await uploadFile(conn, serviceContent, '/etc/systemd/system/xray.service');
+                await uploadFile(conn, configGenerator.generateXraySystemdService(), '/etc/systemd/system/xray.service', 0o644);
             }
-            const verifyPorts = xrayConfig.front?.enabled ? [] : collectExternalListenPorts(node);
+            const verifyPorts = xrayConfig.front?.enabled ? [] : externalPorts;
             const restartResult = await execSSH(conn, osFamily === 'freebsd' ? buildFreebsdXrayStartScript(verifyPorts) : `
 echo "=== Starting Xray service ==="
 systemctl daemon-reload
@@ -1560,21 +1725,17 @@ systemctl status xray --no-pager -l || true
 echo ""
 echo "Journal (last 15 lines):"
 journalctl -u xray -n 15 --no-pager || true
-if ! systemctl is-active --quiet xray; then
-    echo "ERROR: xray.service is not active after restart"
-    exit 1
-fi
 for p in ${verifyPorts.join(' ')}; do
     if ! ss -Hltn "sport = :$p" 2>/dev/null | grep -q .; then
         echo "ERROR: xray is active but nothing listens on :$p"
         exit 1
     fi
 done
-echo "Done: xray active${verifyPorts.length ? `, listening on ${verifyPorts.join(', ')}` : ''}"
+systemctl is-active --quiet xray
             `);
             logs.push(restartResult.output);
             if (!restartResult.success) {
-                throw new Error(`Xray did not start cleanly: ${restartResult.error || 'see logs above'}`);
+                throw serviceStartError('xray', restartResult);
             }
             log('Xray service started');
         }
@@ -1766,7 +1927,7 @@ fi`;
             || (config.BASE_URL ? `${config.BASE_URL}/agents/cc-agent-freebsd-amd64` : '');
         freebsdDownloadScript = buildFreebsdAgentDownloadScript(freebsdAgentUrl);
         if (!freebsdDownloadScript) {
-            const msg = 'CC_AGENT_FREEBSD_URL is not set (or is not an http(s) URL) — point it at a freebsd/amd64 cc-agent binary built by cc-agent/build.sh';
+            const msg = 'CC_AGENT_FREEBSD_URL is not set (or is not an HTTPS URL) — point it at a freebsd/amd64 cc-agent binary built by cc-agent/build.sh';
             log(`ERROR: ${msg}`);
             return { success: false, agentVersion: '', output: msg };
         }
@@ -1800,7 +1961,7 @@ ls -la /usr/local/bin/cc-agent
     // Step 2: Write config
     log('Writing agent config...');
     await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
-    await uploadFile(conn, configJson, '/etc/cc-agent/config.json');
+    await uploadFile(conn, configJson, '/etc/cc-agent/config.json', 0o600);
     await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
     log('Config written');
 
@@ -1835,30 +1996,16 @@ StandardError=journal
 WantedBy=multi-user.target
 `;
     if (osFamily === 'freebsd') {
-        log('Installing rc.d service...');
-        await uploadFile(conn, buildCcAgentRcScript(), '/usr/local/etc/rc.d/cc_agent');
-        await execSSH(conn, 'chmod 755 /usr/local/etc/rc.d/cc_agent');
-        log('rc.d script installed');
+        await uploadFile(conn, buildCcAgentRcScript(), '/usr/local/etc/rc.d/cc_agent', 0o755);
     } else {
-        log('Installing systemd service...');
-        await uploadFile(conn, serviceUnit, '/etc/systemd/system/cc-agent.service');
-        log('Service unit installed');
+        await uploadFile(conn, serviceUnit, '/etc/systemd/system/cc-agent.service', 0o644);
     }
-
-    // Step 5: Firewall + start service
+    log('Service definition installed');
     log('Configuring firewall and starting service...');
     const startResult = await execSSH(conn, osFamily === 'freebsd' ? `
-${firewallRules}
-sysrc cc_agent_enable=YES
-service cc_agent restart </dev/null >/tmp/cc_agent-restart.out 2>&1; cat /tmp/cc_agent-restart.out
+sysrc cc_agent_enable=YES && service cc_agent restart </dev/null >/dev/null 2>&1 || exit 1
 sleep 2
-if service cc_agent status >/dev/null 2>&1; then
-    echo "OK: cc-agent running"
-    /usr/local/bin/cc-agent -version 2>/dev/null || true
-else
-    echo "ERROR: cc-agent failed to start"
-    grep -i cc-agent /var/log/messages 2>/dev/null | tail -n 10 || true
-fi
+service cc_agent status >/dev/null 2>&1 && echo "OK: cc-agent running"
 ` : `
 ${firewallRules}
 systemctl daemon-reload
@@ -1948,6 +2095,17 @@ async function setupXrayNodeWithAgent(node, options = {}) {
         };
         await HyNode.updateOne({ _id: preparedNode._id }, { $set: updates });
         log('Agent metadata saved to database');
+
+        // A fresh agent rewrites config.json from its empty store a few seconds
+        // after start, so it must receive the user list before setup reports success.
+        log('Syncing users to agent...');
+        let syncedCount;
+        try {
+            syncedCount = await require('./syncService').pushUsersToAgent(preparedNode);
+        } catch (syncErr) {
+            throw new Error(`Agent did not accept the user list: ${syncErr.message}`);
+        }
+        log(`Users synced via agent (${syncedCount})`);
 
         result.agentToken = agentToken;
 
@@ -2071,409 +2229,27 @@ async function reloadCcAgent(node, ssh) {
 
     await ssh.uploadContent(configJson, '/etc/cc-agent/config.json');
     await ssh.exec('chmod 600 /etc/cc-agent/config.json');
-    // Wait for systemd to confirm cc-agent is active again before returning,
+    // Wait for both the unit and HTTP listener before returning. Type=simple
+    // becomes active before the agent has bound its API port.
     // so the caller (syncService) can immediately POST /restart to it without
-    // racing the bring-up. The loop polls for up to ~5 s and exits 0 as soon
-    // as the unit is active again, exit 1 on timeout.
-    const waitResult = await ssh.exec(nodeOsFamily(node) === 'freebsd'
-        ? 'service cc_agent restart </dev/null >/dev/null 2>&1 && '
-        + 'for i in 1 2 3 4 5; do '
-        + '  service cc_agent status >/dev/null 2>&1 && exit 0; '
-        + '  sleep 1; '
-        + 'done; '
-        + 'exit 1'
-        : 'systemctl restart cc-agent && '
-        + 'for i in 1 2 3 4 5; do '
-        + '  systemctl is-active cc-agent >/dev/null 2>&1 && exit 0; '
+    // racing the bring-up. Poll for up to ~10 s, then report the timeout.
+    const freebsd = nodeOsFamily(node) === 'freebsd';
+    const restart = freebsd ? buildServiceCommand('freebsd', 'restart', 'cc_agent') : 'systemctl restart cc-agent';
+    const ready = freebsd
+        ? `service cc_agent status >/dev/null 2>&1 && sockstat -46l -P tcp -p ${Number(agentPort)} | awk '$2=="cc-agent"{ok=1} END{exit !ok}'`
+        : `systemctl is-active cc-agent >/dev/null 2>&1 && ss -ltnH 'sport = :${Number(agentPort)}' | grep -q .`;
+    const waitResult = await ssh.exec(
+        `${restart} && `
+        + 'for i in 1 2 3 4 5 6 7 8 9 10; do '
+        + `  ${ready} && exit 0; `
         + '  sleep 1; '
         + 'done; '
         + 'exit 1'
     );
     if (waitResult && typeof waitResult.code === 'number' && waitResult.code !== 0) {
-        logger.warn(`[Agent] Node ${node.name}: cc-agent did not become active within ~5s (will continue anyway)`);
+        logger.warn(`[Agent] Node ${node.name}: cc-agent did not become active and listen on ${agentPort} within ~10s (will continue anyway)`);
     }
     logger.info(`[Agent] Node ${node.name}: cc-agent config refreshed (${agentConfig.inbounds.length} inbound(s))`);
-}
-
-// ==================== MIERU (mita server) auto-install ====================
-
-// Pinned version of mita installed by the panel. Bumping here is enough — the
-// install script detects already-present binaries and skips when found, so
-// existing nodes are not disturbed by a panel-side version bump.
-const MITA_VERSION = process.env.MITA_VERSION || '3.38.0';
-
-/**
- * Build the install-or-detect shell script for mita. The script:
- *  1. detects package manager (dnf vs apt) and CPU arch;
- *  2. if mita is already installed AND systemd unit exists, prints version
- *     and skips downloading — this is how we "adopt" hand-installed nodes;
- *  3. otherwise downloads the pinned RPM/DEB and installs it;
- *  4. opens the configured port/protocol via firewalld or ufw if either is
- *     present (silently noops if neither — assume security-group at the
- *     cloud layer);
- *  5. enables + starts mita.service.
- *
- * The script is idempotent — re-running on a fully set-up node is a no-op.
- */
-function buildMitaInstallScript(port, protocol) {
-    const proto = (protocol || 'TCP').toLowerCase() === 'udp' ? 'udp' : 'tcp';
-    const safePort = Number(port) || 443;
-    return `#!/bin/bash
-set -euo pipefail
-
-PORT=${safePort}
-PROTOCOL=${proto}
-MITA_VERSION=${MITA_VERSION}
-
-if command -v dnf >/dev/null 2>&1; then
-    PKG_MGR=dnf
-    PKG_EXT=rpm
-elif command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR=apt
-    PKG_EXT=deb
-else
-    echo "ERROR: neither dnf nor apt-get available"
-    exit 1
-fi
-
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)         DEB_ARCH=amd64; RPM_ARCH=x86_64 ;;
-    aarch64|arm64)  DEB_ARCH=arm64; RPM_ARCH=aarch64 ;;
-    *) echo "ERROR: unsupported arch $ARCH"; exit 1 ;;
-esac
-
-# --- adopt path: keep an existing mita only when it matches the pinned version ---
-INSTALLED_VER=""
-if command -v mita >/dev/null 2>&1 \\
-   && systemctl list-unit-files mita.service --no-legend 2>/dev/null | grep -q .; then
-    INSTALLED_VER=$(mita version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1 || echo unknown)
-fi
-if [ "$INSTALLED_VER" = "$MITA_VERSION" ]; then
-    echo "OK: mita $INSTALLED_VER already installed — skipping download"
-else
-    [ -n "$INSTALLED_VER" ] && echo "mita $INSTALLED_VER installed, pinned $MITA_VERSION — upgrading"
-
-    echo "Installing mita $MITA_VERSION ($PKG_MGR/$PKG_EXT, $ARCH)..."
-    cd /tmp
-    if [ "$PKG_EXT" = "rpm" ]; then
-        URL="https://github.com/enfein/mieru/releases/download/v$MITA_VERSION/mita-$MITA_VERSION-1.\${RPM_ARCH}.rpm"
-        curl -fsSL -o mita.rpm "$URL"
-        dnf install -y /tmp/mita.rpm
-        rm -f /tmp/mita.rpm
-    else
-        URL="https://github.com/enfein/mieru/releases/download/v$MITA_VERSION/mita_\${MITA_VERSION}_\${DEB_ARCH}.deb"
-        curl -fsSL -o mita.deb "$URL"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/mita.deb
-        rm -f /tmp/mita.deb
-    fi
-    echo "OK: mita installed"
-fi
-
-# --- firewall: best-effort, never fatal (security groups often live elsewhere) ---
-if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --add-port=$PORT/$PROTOCOL --permanent >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-    echo "OK: firewalld opened $PORT/$PROTOCOL"
-elif command -v ufw >/dev/null 2>&1; then
-    ufw allow $PORT/$PROTOCOL >/dev/null 2>&1 || true
-    echo "OK: ufw allowed $PORT/$PROTOCOL"
-else
-    echo "WARN: no firewalld/ufw — assuming $PORT/$PROTOCOL open via cloud SG"
-fi
-
-# --- service ---
-systemctl enable mita >/dev/null 2>&1 || true
-systemctl restart mita >/dev/null 2>&1 || systemctl start mita >/dev/null 2>&1
-sleep 1
-if systemctl is-active mita >/dev/null 2>&1; then
-    echo "OK: mita.service running"
-else
-    echo "ERROR: mita.service failed to start"
-    journalctl -u mita -n 30 --no-pager || true
-    exit 1
-fi
-`;
-}
-
-/**
- * rc.d script for mita on FreeBSD. upstream ships only a systemd unit; this mirrors it:
- * user mita, control socket directory recreated on every start, restart on failure.
- */
-function buildMitaRcScript() {
-    return `#!/bin/sh
-#
-# PROVIDE: mita
-# REQUIRE: LOGIN NETWORKING
-# KEYWORD: shutdown
-#
-# rc.conf knobs:
-#   mita_enable="YES"
-
-. /etc/rc.subr
-
-name="mita"
-rcvar="mita_enable"
-
-load_rc_config $name
-
-: \${mita_enable:="NO"}
-# syslog stamps the lines itself
-: \${mita_env:="MITA_LOG_NO_TIMESTAMP=true"}
-
-pidfile="/var/run/mita.pid"
-command="/usr/sbin/daemon"
-# -P keeps the supervisor pid, so "service mita stop" signals daemon(8), which forwards
-# SIGTERM to mita instead of restarting it (-R 5).
-command_args="-f -S -T mita -R 5 -P \${pidfile} -u mita /usr/local/bin/mita run"
-start_precmd="mita_prestart"
-
-mita_prestart()
-{
-    # /var/run is wiped at boot; the daemon keeps its control socket there.
-    install -d -o mita -g mita -m 775 /var/run/mita
-}
-
-run_rc_command "$1"
-`;
-}
-
-/**
- * FreeBSD counterpart of buildMitaInstallScript (POSIX sh, rc.d, pf). There is no upstream
- * FreeBSD package, so the binary comes from the panel image (see Dockerfile).
- * Returns '' when the url is not a plain http(s) URL.
- */
-function buildMitaInstallScriptFreebsd(port, protocol, url) {
-    const proto = (protocol || 'TCP').toLowerCase() === 'udp' ? 'udp' : 'tcp';
-    const safePort = Number(port) || 443;
-    const safeUrl = String(url || '').trim();
-    if (!/^https?:\/\/[^\s'"\\]+$/.test(safeUrl)) return '';
-    return `set -eu
-
-PORT=${safePort}
-PROTOCOL=${proto}
-MITA_VERSION=${MITA_VERSION}
-URL='${safeUrl}'
-
-mita_version() {
-    /usr/local/bin/mita version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1
-}
-
-INSTALLED_VER=""
-[ -x /usr/local/bin/mita ] && INSTALLED_VER=$(mita_version || true)
-if [ "$INSTALLED_VER" = "$MITA_VERSION" ]; then
-    echo "OK: mita $INSTALLED_VER already installed — skipping download"
-else
-    [ -n "$INSTALLED_VER" ] && echo "mita $INSTALLED_VER installed, pinned $MITA_VERSION — upgrading"
-    echo "Downloading $URL ..."
-    # Download next to the target and rename: writing over a running binary fails with ETXTBSY.
-    TMP=/usr/local/bin/mita.new
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 180 "$URL" -o "$TMP"
-    else
-        fetch -q -o "$TMP" "$URL"
-    fi
-    [ -s "$TMP" ] || { echo "ERROR: download failed or file is empty"; exit 1; }
-    chmod 0755 "$TMP"
-    mv -f "$TMP" /usr/local/bin/mita
-    NEW_VER=$(mita_version || true)
-    [ -n "$NEW_VER" ] || { echo "ERROR: the downloaded mita does not run on this host"; exit 1; }
-    [ "$NEW_VER" = "$MITA_VERSION" ] || echo "WARN: the panel serves mita $NEW_VER, pinned $MITA_VERSION"
-    echo "OK: mita $NEW_VER installed"
-fi
-
-# --- user and directories (what the rpm/deb postinst does on linux) ---
-pw groupshow mita >/dev/null 2>&1 || pw groupadd mita
-pw usershow mita >/dev/null 2>&1 || pw useradd mita -g mita -d /nonexistent -s /usr/sbin/nologin -c "mieru proxy server"
-install -d -o mita -g mita -m 755 /etc/mita /var/lib/mita
-install -d -o mita -g mita -m 775 /var/run/mita
-
-cat > /usr/local/etc/rc.d/mita <<'CELERITY_RC_EOF'
-${buildMitaRcScript()}CELERITY_RC_EOF
-chmod 0555 /usr/local/etc/rc.d/mita
-
-# --- firewall: best-effort, never fatal ---
-if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' && [ -f /etc/pf.conf ]; then
-    if pfctl -P -s rules 2>/dev/null | grep -Eq "^pass in .*proto $PROTOCOL .* port = $PORT( |\\$)"; then
-        echo "OK: pf already allows $PORT/$PROTOCOL"
-    else
-        cp -p /etc/pf.conf /etc/pf.conf.celerity-bak
-        printf 'pass in proto %s to port %s keep state # celerity-mieru\\n' "$PROTOCOL" "$PORT" >> /etc/pf.conf
-        if pfctl -nf /etc/pf.conf >/dev/null 2>&1 && pfctl -f /etc/pf.conf >/dev/null 2>&1; then
-            echo "OK: pf opened $PORT/$PROTOCOL"
-        else
-            cp -p /etc/pf.conf.celerity-bak /etc/pf.conf
-            echo "WARN: pf rejected the new rule, /etc/pf.conf restored — open $PORT/$PROTOCOL by hand"
-        fi
-    fi
-else
-    echo "WARN: pf is not enabled — assuming $PORT/$PROTOCOL is reachable"
-fi
-
-# --- service ---
-sysrc mita_enable=YES >/dev/null
-service mita restart </dev/null >/dev/null 2>&1 || service mita start </dev/null >/dev/null 2>&1 || true
-sleep 2
-if service mita status >/dev/null 2>&1; then
-    echo "OK: mita running"
-else
-    echo "ERROR: mita failed to start"
-    ${buildServiceLogsCommand('freebsd', 'mita', 30).replace(/; exit 0$/, ' || true')}
-    exit 1
-fi
-`;
-}
-
-/**
- * Set up a mieru node end-to-end:
- *  1. SSH into the node and run the install/adopt script;
- *  2. push the current users + listener config via NodeSSH.updateMieruConfig;
- *  3. verify mita is listening on the configured port.
- *
- * Returns the same shape as setupNode / setupXrayNode for parity with the
- * existing API caller in routes/nodes.js.
- */
-async function setupMieruNode(node, options = {}) {
-    const { installPackage = true, restartService = true } = options;
-
-    const logs = [];
-    const log = (msg) => {
-        const line = `[${new Date().toISOString()}] ${msg}`;
-        logs.push(line);
-        logger.info(`[MieruSetup] ${msg}`);
-    };
-
-    log(`Starting setup for mieru node ${node.name} (${node.ip})`);
-
-    if (!hasSshCredentials(node)) {
-        return { success: false, error: 'SSH credentials not configured', logs };
-    }
-
-    const protocol = (node.mieru && node.mieru.protocol === 'UDP') ? 'UDP' : 'TCP';
-    const port = node.port || 443;
-
-    let conn;
-    try {
-        log('Connecting via SSH...');
-        conn = await connectSSH(node);
-        log('SSH connected');
-
-        const osFamily = await detectOsFamily(conn, node);
-        log(`Detected OS family: ${osFamily}`);
-        let installScript = buildMitaInstallScript(port, protocol);
-        if (osFamily === 'freebsd') {
-            // Every script below runs as `$SHELL -c`; csh cannot parse POSIX sh.
-            const shellResult = await execSSH(conn, 'echo "$SHELL"');
-            const loginShell = String(shellResult.output || '').trim().split('\n')[0];
-            if (/csh$/.test(loginShell)) {
-                throw new Error(`Login shell on the node is ${loginShell}; set it to /bin/sh (chsh -s /bin/sh ${node.ssh?.username || 'root'}) and retry.`);
-            }
-            // The image ships the freebsd build under public/agents/ (see Dockerfile).
-            const mitaUrl = process.env.MITA_FREEBSD_URL
-                || (config.BASE_URL ? `${config.BASE_URL}/agents/mita-freebsd-amd64` : '');
-            installScript = buildMitaInstallScriptFreebsd(port, protocol, mitaUrl);
-            if (!installScript) {
-                throw new Error('MITA_FREEBSD_URL is not set (or is not an http(s) URL) — point it at a freebsd/amd64 mita binary');
-            }
-        }
-
-        await runInitScript(conn, node, log, logs);
-
-        if (installPackage) {
-            log(`Installing/adopting mita ${MITA_VERSION} (port ${port}/${protocol})...`);
-            const installResult = await execSSH(conn, installScript);
-            logs.push(installResult.output || '');
-            if (!installResult.success) {
-                log(`ERROR: mita install failed (exit code ${installResult.code})`);
-                throw new Error(`mita install failed: ${installResult.error || 'see logs'}`);
-            }
-            log('mita install/adopt completed');
-        }
-
-        // Push the actual user pool + listener config via the same path
-        // schedulePush uses, so this stays one source of truth.
-        log('Pushing mita config (users + portBindings)...');
-        const syncService = require('./syncService');
-        const success = await syncService.updateMieruNodeConfig(node);
-        if (!success) {
-            return { success: false, error: 'updateMieruNodeConfig failed (see node journal)', logs };
-        }
-
-        if (restartService) {
-            log('Verifying mita.service status...');
-            const status = await execSSH(conn, `${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null || echo inactive`);
-            const isActive = (status.output || '').trim() === 'active';
-            if (!isActive) {
-                log('WARN: mita is not active after setup');
-            } else {
-                log('OK: mita.service active');
-            }
-        }
-
-        return { success: true, logs, message: `mieru node ${node.name} ready` };
-    } catch (error) {
-        logger.error(`[MieruSetup] ${node.name}: ${error.message}`);
-        return { success: false, error: error.message, logs };
-    } finally {
-        if (conn) {
-            try { conn.end(); } catch { /* best-effort */ }
-        }
-    }
-}
-
-/**
- * Quick health probe for a mieru node — service active + port open.
- * Mirrors checkNodeStatus / checkXrayNodeStatus signatures.
- */
-async function checkMieruNodeStatus(node) {
-    if (!hasSshCredentials(node)) {
-        return { online: false, message: 'SSH credentials not configured' };
-    }
-    let conn;
-    try {
-        conn = await connectSSH(node);
-        const osFamily = nodeOsFamily(node);
-        const svc = await execSSH(conn, `${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null || echo inactive`);
-        const isActive = (svc.output || '').trim() === 'active';
-        const port = node.port || 443;
-        const protocol = (node.mieru && node.mieru.protocol === 'UDP') ? 'udp' : 'tcp';
-        const listen = await execSSH(conn, buildListenCheckCommand(osFamily, protocol, port));
-        const listening = (listen.output || '').includes(`:${port}`);
-        return {
-            online: isActive && listening,
-            serviceActive: isActive,
-            listening,
-            port,
-            message: isActive && listening ? 'mita running' : 'mita not ready',
-        };
-    } catch (error) {
-        return { online: false, message: error.message };
-    } finally {
-        if (conn) {
-            try { conn.end(); } catch { /* best-effort */ }
-        }
-    }
-}
-
-/**
- * Fetch the last N lines of mita journal output.
- */
-async function getMieruNodeLogs(node, lines = 50) {
-    if (!hasSshCredentials(node)) {
-        return { success: false, error: 'SSH credentials not configured', logs: '' };
-    }
-    let conn;
-    try {
-        conn = await connectSSH(node);
-        const result = await execSSH(conn, buildServiceLogsCommand(nodeOsFamily(node), 'mita', lines));
-        return { success: true, logs: result.output || '' };
-    } catch (error) {
-        return { success: false, error: error.message, logs: '' };
-    } finally {
-        if (conn) {
-            try { conn.end(); } catch { /* best-effort */ }
-        }
-    }
 }
 
 module.exports = {
@@ -2497,21 +2273,19 @@ module.exports = {
     getXrayNodeLogs,
     getPanelCertificates,
     isSameVpsAsPanel,
-    setupMieruNode,
-    checkMieruNodeStatus,
-    getMieruNodeLogs,
-    buildMitaInstallScript,
-    buildMitaInstallScriptFreebsd,
-    buildMitaRcScript,
+    leafCertSha256,
+    storeTlsCertSha256,
     isLoopbackAddress,
+    buildXrayPermsScript,
+    buildXrayUnitUserScript,
+    XRAY_PERMS_SNIPPET,
+    xrayPermsSnippet,
     normalizeOsFamily,
     nodeOsFamily,
-    detectOsFamily,
     buildServiceCommand,
     buildRuntimeStopScript,
     buildRuntimeStartScript,
     buildXrayLogsCommand,
-    buildFreebsdBusyPortsScript,
     buildFreebsdXrayStartScript,
     buildFreebsdAgentDownloadScript,
     buildCcAgentRcScript,

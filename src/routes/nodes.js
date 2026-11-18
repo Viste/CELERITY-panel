@@ -11,10 +11,11 @@ const ServerGroup = require('../models/serverGroupModel');
 const cryptoService = require('../services/cryptoService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
-const { invalidateNodesCache } = require('../utils/helpers');
+const { invalidateNodesCache, normalizeSubscriptionVariants } = require('../utils/helpers');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
 const { isServerlessNode, checkCascadeMembership } = require('../utils/nodeTypes');
+const { normalizeVirtualObservatory } = require('../utils/virtualObservatory');
 const nodeSetupLock = require('../utils/nodeSetupLock');
 const {
     mergeCdnConfig,
@@ -25,9 +26,13 @@ const {
 const { validateXrayXhttp } = require('../utils/xhttpOptions');
 const {
     FRONT_HIDDEN_SELECT,
+    frontUpdatePaths,
     applyFrontPatch,
     captureFrontRollbackState,
 } = require('../services/edgeFront/frontConfig');
+const vlessEncryption = require('../utils/vlessEncryption');
+
+const { redactNode } = vlessEncryption;
 
 function hasSshCredentials(node) {
     return !!(node?.ssh?.password || node?.ssh?.privateKey);
@@ -136,7 +141,7 @@ async function setNodeActive(req, res, active) {
 
             return res.json({
                 success: true,
-                node: disabledNode,
+                node: redactNode(disabledNode),
                 runtime,
                 ...(warning ? { warning } : {}),
             });
@@ -169,7 +174,7 @@ async function setNodeActive(req, res, active) {
             logger.warn(`[Nodes API] Enable node ${node.name} failed: ${errorMessage}`);
             return res.status(500).json({
                 error: errorMessage,
-                node: failedNode,
+                node: redactNode(failedNode),
                 runtime,
             });
         }
@@ -185,7 +190,7 @@ async function setNodeActive(req, res, active) {
 
         logger.info(`[Nodes API] Enabled node ${node.name}`);
 
-        res.json({ success: true, node: enabledNode, runtime });
+        res.json({ success: true, node: redactNode(enabledNode), runtime });
     } catch (error) {
         logger.error(`[Nodes API] ${active ? 'Enable' : 'Disable'} node error: ${error.message}`);
         res.status(500).json({ error: error.message });
@@ -208,7 +213,7 @@ router.get('/', requireScope('nodes:read'), async (req, res) => {
             .populate('groups', 'name color')
             .sort({ name: 1 });
         
-        res.json(nodes);
+        res.json(nodes.map(redactNode));
     } catch (error) {
         logger.error(`[Nodes API] List error: ${error.message}`);
         res.status(500).json({ error: error.message });
@@ -218,13 +223,16 @@ router.get('/', requireScope('nodes:read'), async (req, res) => {
 /**
  * GET /nodes/check-ip - Check which protocol nodes exist for a given IP address.
  * Used by the UI to show a sibling-node hint when adding a node.
- * Returns { nodes: [{ type, name, _id }] } — only safe fields, no credentials.
+ * Returns { nodes: [{ type, name, _id, hasSsh }] } — credentials reduced to a flag.
  */
 router.get('/check-ip', requireScope('nodes:read'), async (req, res) => {
     try {
         const ip = (req.query.ip || '').trim();
         if (!ip) return res.json({ nodes: [] });
-        const nodes = await HyNode.find({ ip }).select('type name _id').lean();
+        const found = await HyNode.find({ ip }).select('type name _id ssh.password ssh.privateKey').lean();
+        const nodes = found.map(({ _id, type, name, ssh }) => ({
+            _id, type, name, hasSsh: !!(ssh?.password || ssh?.privateKey),
+        }));
         res.json({ nodes });
     } catch (error) {
         logger.error(`[Nodes API] check-ip error: ${error.message}`);
@@ -251,7 +259,7 @@ router.get('/:id', requireScope('nodes:read'), async (req, res) => {
         });
         
         res.json({
-            ...node.toObject(),
+            ...redactNode(node),
             userCount,
         });
     } catch (error) {
@@ -276,9 +284,9 @@ router.post('/:id/disable', requireScope('nodes:write'), (req, res) => setNodeAc
 router.post('/', requireScope('nodes:write'), async (req, res) => {
     try {
         const {
-            name, ip, domain, sni, port, portRange, statsPort,
+            name, ip, domain, sni, port, portRange, subscriptionVariants, statsPort,
             groups, ssh, paths, settings, rankingCoefficient,
-            type, xray, virtual, cdn, mieru, cascadeRole, country, comment,
+            type, xray, virtual, cdn, cascadeRole, country, comment,
             hopInterval, acme, masquerade, bandwidth,
             ignoreClientBandwidth, speedTest, disableUDP,
             udpIdleTimeout, sniff, quic, resolver, acl,
@@ -289,14 +297,14 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             return res.status(400).json({ error: 'name is required' });
         }
 
-        if (type && !['hysteria', 'xray', 'virtual', 'cdn', 'mieru'].includes(type)) {
-            return res.status(400).json({ error: 'type must be hysteria, xray, virtual, cdn, or mieru' });
+        if (type && !['hysteria', 'xray', 'virtual', 'cdn'].includes(type)) {
+            return res.status(400).json({ error: 'type must be hysteria, xray, virtual, or cdn' });
         }
 
         const nodeType = type || 'hysteria';
 
         if (!isServerlessNode(nodeType) && !ip) {
-            return res.status(400).json({ error: `ip is required for ${nodeType} nodes` });
+            return res.status(400).json({ error: 'ip is required for hysteria and xray nodes' });
         }
         // The front takes over the public port, so the stored one can differ.
         const frontNode = { port: parseInt(port, 10) || 443, domain, ip };
@@ -307,12 +315,16 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             if (xhttpError) return res.status(400).json({ error: xhttpError });
             const frontError = applyFrontPatch(xray, frontNode, null);
             if (frontError) return res.status(400).json({ error: frontError });
+            vlessEncryption.takeRegenerateIds(xray);
+            const encryptionError = await vlessEncryption.applyVlessEncryptionToXray(xray, null);
+            if (encryptionError) return res.status(400).json({ error: encryptionError });
         }
 
         // Validate virtual-specific fields up-front (pre('validate') hook is
         // skipped on findOneAndUpdate but still runs on .save(); keeping the
         // explicit check here gives callers a clear 400 instead of a generic
         // ValidationError 500).
+        let virtualObservatory = null;
         if (nodeType === 'virtual') {
             const v = virtual || {};
             const selectMode = v.selectMode === 'group' ? 'group' : 'manual';
@@ -322,6 +334,8 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             if (selectMode === 'manual' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
                 return res.status(400).json({ error: 'Virtual node (manual): at least one source required' });
             }
+            virtualObservatory = normalizeVirtualObservatory(v.observatory);
+            if (virtualObservatory.error) return res.status(400).json({ error: virtualObservatory.error });
         }
         let normalizedCdn = null;
         if (nodeType === 'cdn') {
@@ -369,6 +383,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             sni: isServerlessNode(nodeType) ? '' : (sni || ''),
             port: frontNode.port,
             portRange: portRange || '20000-50000',
+            subscriptionVariants: normalizeSubscriptionVariants(subscriptionVariants),
             statsPort: statsPort || 9999,
             statsSecret,
             groups: groups || [],
@@ -388,18 +403,6 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             nodeData.xray = xray;
         }
 
-        if (nodeType === 'mieru' && mieru) {
-            // Schema defaults cover the rest (mtu/loggingLevel/multiplexing);
-            // accept only the few fields a caller is allowed to override.
-            nodeData.mieru = {
-                protocol: mieru.protocol === 'UDP' ? 'UDP' : 'TCP',
-                mtu: Number.isFinite(mieru.mtu) && mieru.mtu > 0 ? mieru.mtu : 1400,
-                loggingLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].includes(mieru.loggingLevel) ? mieru.loggingLevel : 'INFO',
-                multiplexing: mieru.multiplexing || '',
-                muxUserHintMandatory: !!mieru.muxUserHintMandatory,
-            };
-        }
-
         if (nodeType === 'virtual') {
             const v = virtual || {};
             nodeData.virtual = {
@@ -415,13 +418,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
                     : 50,
                 idleTimeout: (v.idleTimeout || '').trim(),
                 interruptExistConnections: v.interruptExistConnections !== false,
-                observatory: {
-                    destination: (v.observatory?.destination || '').trim() || 'http://www.gstatic.com/generate_204',
-                    connectivity: (v.observatory?.connectivity || '').trim(),
-                    interval: (v.observatory?.interval || '').trim() || '1m',
-                    timeout: (v.observatory?.timeout || '').trim() || '5s',
-                    sampling: parseInt(v.observatory?.sampling, 10) || 3,
-                },
+                observatory: virtualObservatory.value,
             };
         }
         if (nodeType === 'cdn') nodeData.cdn = normalizedCdn;
@@ -440,7 +437,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 
         logger.info(`[Nodes API] Created ${nodeType} node ${name} (${isServerlessNode(nodeType) ? 'serverless' : ip})`);
 
-        res.status(201).json(node);
+        res.status(201).json(redactNode(node));
     } catch (error) {
         logger.error(`[Nodes API] Create node error: ${error.message}`);
         res.status(500).json({ error: error.message });
@@ -453,9 +450,9 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
         const allowedUpdates = [
-            'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort',
+            'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'subscriptionVariants', 'statsPort',
             'groups', 'ssh', 'paths', 'settings', 'active', 'rankingCoefficient',
-            'type', 'xray', 'virtual', 'cdn', 'mieru', 'cascadeRole', 'country', 'comment',
+            'type', 'xray', 'virtual', 'cdn', 'cascadeRole', 'country', 'comment',
             'hopInterval', 'acme', 'masquerade', 'bandwidth',
             'ignoreClientBandwidth', 'speedTest', 'disableUDP',
             'udpIdleTimeout', 'sniff', 'quic', 'resolver', 'acl',
@@ -471,6 +468,8 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                     updates[key] = typeof req.body[key] === 'string'
                         ? req.body[key].trim().slice(0, 500)
                         : '';
+                } else if (key === 'subscriptionVariants') {
+                    updates[key] = normalizeSubscriptionVariants(req.body[key]);
                 } else {
                     updates[key] = req.body[key];
                 }
@@ -485,8 +484,8 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
         // so enforce type-specific invariants explicitly here. We need the existing
         // doc to know the resulting type when only one of {type,virtual} is sent.
-        // The front subdocument is written whole, so the decoy page has to be
-        // carried over instead of being dropped by the $set.
+        // The pending rollback baseline is hidden; the decoy page is not loaded
+        // because the front is written by dot-paths that never include it.
         const existing = await HyNode.findById(req.params.id)
             .select(FRONT_HIDDEN_SELECT)
             .lean();
@@ -506,6 +505,16 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // having them wiped by a whole-subdocument $set.
         const nextXray = xrayPatch ? { ...(existing.xray || {}), ...xrayPatch } : existing.xray;
         if (xrayPatch) {
+            const regenerateIds = vlessEncryption.takeRegenerateIds(xrayPatch);
+            delete nextXray.vlessEncryptionRegenerate;
+            const encryptionError = await vlessEncryption.applyVlessEncryptionToXray(
+                nextXray,
+                existing.xray,
+                regenerateIds
+            ) || vlessEncryption.versionError(nextXray, existing.xrayVersion, existing.name);
+            if (encryptionError) return res.status(400).json({ error: encryptionError });
+            // Main-inbound keys live on nextXray; extras were settled in place.
+            for (const key of vlessEncryption.FIELDS) xrayPatch[key] = nextXray[key];
             delete updates.xray;
             for (const [key, value] of Object.entries(xrayPatch)) {
                 // front is owned by the xray branch below: it merges the
@@ -530,6 +539,11 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             }
             if (v.selectMode !== 'group' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
                 return res.status(400).json({ error: 'Virtual node (manual): at least one source required' });
+            }
+            if (updates.virtual && typeof updates.virtual === 'object') {
+                const observatory = normalizeVirtualObservatory(updates.virtual.observatory);
+                if (observatory.error) return res.status(400).json({ error: observatory.error });
+                updates.virtual = { ...updates.virtual, observatory: observatory.value };
             }
             // Virtual nodes carry no IP — clear any leftover from a prior type.
             updates.ip = null;
@@ -577,9 +591,10 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                 // Persist the pending state and everything the layout rewrites,
                 // even when a partial patch changed only TLS/path/domain.
                 updates.port = frontNode.port;
-                for (const key of ['front', 'listen', 'security', 'extraInbounds']) {
+                for (const key of ['listen', 'security', 'extraInbounds']) {
                     if (nextXray[key] !== undefined) updates[`xray.${key}`] = nextXray[key];
                 }
+                Object.assign(updates, frontUpdatePaths(nextXray.front));
             }
         }
 
@@ -634,7 +649,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         
         logger.info(`[Nodes API] Updated node ${node.name}`);
         
-        res.json(node);
+        res.json(redactNode(node));
     } catch (error) {
         logger.error(`[Nodes API] Update error: ${error.message}`);
         res.status(500).json({ error: error.message });
@@ -853,7 +868,7 @@ router.post('/:id/groups', requireScope('nodes:write'), async (req, res) => {
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Added groups for node ${node.name}`);
-        res.json(node);
+        res.json(redactNode(node));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -884,7 +899,7 @@ router.delete('/:id/groups/:groupId', requireScope('nodes:write'), async (req, r
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Removed group ${req.params.groupId} from node ${node.name}`);
-        res.json(node);
+        res.json(redactNode(node));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -1033,8 +1048,6 @@ router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
         let result;
         if (node.type === 'xray') {
             result = await nodeSetup.setupXrayNode(node, { restartService });
-        } else if (node.type === 'mieru') {
-            result = await nodeSetup.setupMieruNode(node, { restartService });
         } else {
             result = await nodeSetup.setupNode(node, {
                 installHysteria,

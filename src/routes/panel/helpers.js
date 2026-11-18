@@ -35,6 +35,7 @@ const {
     normalizeFingerprintPool,
 } = require('../../utils/fingerprints');
 const { normalizeXrayFront, xrayNeedsTls } = require('../../utils/xrayFront');
+const vlessEncryption = require('../../utils/vlessEncryption');
 const { version: appVersion } = require('../../../package.json');
 
 // Compiled template cache (production only)
@@ -99,6 +100,7 @@ const XRAY_TRANSPORT_VALUES = ['tcp', 'ws', 'grpc', 'xhttp'];
 const XRAY_SECURITY_VALUES = ['reality', 'tls', 'none'];
 const XRAY_XHTTP_MODE_VALUES = ['auto', 'packet-up', 'stream-up', 'stream-one'];
 const XRAY_TLS_SOURCE_VALUES = ['panel', 'acme', 'manual', 'self-signed'];
+const XRAY_REALITY_GUARD_MODES = ['auto', 'notify', 'off'];
 const XRAY_XHTTP_METHOD_VALUES = XHTTP_METHOD_VALUES;
 const XRAY_XHTTP_DATA_PLACEMENT_VALUES = XHTTP_DATA_PLACEMENT_VALUES;
 const XRAY_XHTTP_PLACEMENT_VALUES = XHTTP_PLACEMENT_VALUES;
@@ -129,6 +131,33 @@ function _splitCsv(raw, { keepEmpty = false } = {}) {
 }
 
 const _sanitizeXhttpRange = sanitizeXhttpRange;
+
+// Keys are never read from the form: applyVlessEncryptionToXray() keeps or
+// generates them server-side.
+function parseVlessEncryptionFields(enabled, auth, mode, ticket) {
+    return {
+        vlessEncryption: !!enabled,
+        vlessEncryptionAuth: _pickEnum(auth, vlessEncryption.AUTH_VALUES, vlessEncryption.DEFAULT_AUTH),
+        vlessEncryptionMode: _pickEnum(mode, vlessEncryption.MODE_VALUES, vlessEncryption.DEFAULT_MODE),
+        vlessEncryptionTicket: String(ticket ?? '').trim().slice(0, 32),
+    };
+}
+
+/**
+ * Inbounds whose VLESS Encryption key the operator asked to regenerate:
+ * 'main' for the main inbound, otherwise extraInbounds[].id.
+ */
+function parseVlessEncryptionRegenerateIds(body) {
+    const ids = [];
+    if (body['xray.vlessEncryptionRegenerate'] === '1') ids.push('main');
+    const extra = body.xray_extra_vlessEncryptionRegenerate;
+    if (extra !== undefined) {
+        for (const id of (Array.isArray(extra) ? extra : [extra])) {
+            if (id) ids.push(String(id));
+        }
+    }
+    return ids;
+}
 
 /**
  * Parse the `xray.extraInbounds[]` array out of parallel form arrays
@@ -197,6 +226,10 @@ function parseExtraInbounds(body) {
     const xhttpSeqPlacements = arr('xray_extra_xhttpSeqPlacement');
     const xhttpSeqKeys = arr('xray_extra_xhttpSeqKey');
     const fallbackDests = arr('xray_extra_fallbackDest');
+    const vlessEncryptionIds = new Set(arr('xray_extra_vlessEncryption').map(v => String(v || '')));
+    const vlessEncryptionAuths = arr('xray_extra_vlessEncryptionAuth');
+    const vlessEncryptionModes = arr('xray_extra_vlessEncryptionMode');
+    const vlessEncryptionTickets = arr('xray_extra_vlessEncryptionTicket');
 
     const result = [];
     for (let i = 0; i < idArr.length; i++) {
@@ -267,6 +300,15 @@ function parseExtraInbounds(body) {
             xhttpSeqKey: String(xhttpSeqKeys[i] || '').trim().slice(0, 64),
             fallbackDest: String(fallbackDests[i] || '').trim().slice(0, 253),
         };
+        // Rows rendered without the encryption block keep their stored settings.
+        if (vlessEncryptionAuths[i] !== undefined) {
+            Object.assign(inbound, parseVlessEncryptionFields(
+                vlessEncryptionIds.has(id),
+                vlessEncryptionAuths[i],
+                vlessEncryptionModes[i],
+                vlessEncryptionTickets[i]
+            ));
+        }
         // Empty short-id list is invalid for Reality; restore the empty marker.
         if (inbound.realityShortIds.length === 0) inbound.realityShortIds = [''];
         result.push(inbound);
@@ -359,9 +401,23 @@ function parseXrayFormFields(body) {
     xray.xhttpSeqPlacement = _pickEnum(body['xray.xhttpSeqPlacement'], XRAY_XHTTP_PLACEMENT_VALUES, '');
     xray.xhttpSeqKey = String(body['xray.xhttpSeqKey'] || '').trim().slice(0, 64);
     if (body['xray.apiPort']) xray.apiPort = parseInt(body['xray.apiPort']) || 61000;
+    if (body['xray.connIdle'] !== undefined) {
+        const connIdle = Number(body['xray.connIdle']);
+        xray.connIdle = Number.isInteger(connIdle) && connIdle >= 10 && connIdle <= 86400
+            ? connIdle
+            : 300;
+    }
 
     if (body['xray.fallbackDest'] !== undefined) {
         xray.fallbackDest = String(body['xray.fallbackDest']).trim().slice(0, 253);
+    }
+    if (body['xray.vlessEncryptionAuth'] !== undefined) {
+        Object.assign(xray, parseVlessEncryptionFields(
+            body['xray.vlessEncryption'] === 'on',
+            body['xray.vlessEncryptionAuth'],
+            body['xray.vlessEncryptionMode'],
+            body['xray.vlessEncryptionTicket']
+        ));
     }
 
     // TLS source / manual cert+key (only meaningful when security==='tls').
@@ -390,10 +446,63 @@ function parseXrayFormFields(body) {
     // touch extras can just delete the field from the result.
     xray.extraInbounds = parseExtraInbounds(body);
 
+    if (body['xray.realityGuard.mode'] !== undefined) {
+        xray.realityGuard = { mode: normalizeRealityGuardMode(body['xray.realityGuard.mode']) };
+        if (body['xray.realityGuard.reserveSnis'] !== undefined) {
+            xray.realityGuard.reserveSnis = normalizeReserveSnis(body['xray.realityGuard.reserveSnis']);
+        }
+    }
+
     const front = parseXrayFront(body);
     if (front) xray.front = front;
 
     return xray;
+}
+
+function normalizeRealityGuardMode(value) {
+    return _pickEnum(value, XRAY_REALITY_GUARD_MODES, 'auto');
+}
+
+function normalizeReserveSnis(value) {
+    return require('../../services/realityGuardService').normalizeReserveSnis(value);
+}
+
+function _realityDestSignature(xray) {
+    const pick = inbound => (inbound && (inbound.security || 'reality') === 'reality')
+        ? `${inbound.realityDest || ''}|${(inbound.realitySni || []).join(',')}`
+        : '';
+    return [pick(xray), ...(xray?.extraInbounds || []).map(pick)].join(';');
+}
+
+/**
+ * Merge the posted watchdog settings (mode and reserve list) into the stored
+ * watchdog state. Runtime fields are preserved — unless the operator changed
+ * a Reality dest/SNI by hand, which makes them stale.
+ *
+ * @param {Object} existingXray - Stored xray block (plain object)
+ * @param {Object} nextXray     - Merged xray block about to be persisted
+ * @returns {Object} realityGuard to persist
+ */
+function mergeRealityGuard(existingXray, nextXray) {
+    const stored = existingXray?.realityGuard || {};
+    const posted = nextXray?.realityGuard || {};
+    const reserveSnis = posted.reserveSnis !== undefined
+        ? normalizeReserveSnis(posted.reserveSnis)
+        : normalizeReserveSnis(stored.reserveSnis);
+    const guard = {
+        ...stored,
+        mode: normalizeRealityGuardMode(posted.mode ?? stored.mode),
+        reserveSnis,
+        reserveFailed: (stored.reserveFailed || []).filter(f => reserveSnis.includes(f.domain)),
+    };
+    if (_realityDestSignature(existingXray) !== _realityDestSignature(nextXray)) {
+        guard.status = 'ok';
+        guard.failCount = 0;
+        guard.lastError = '';
+        guard.warning = '';
+        guard.nodeConfirmedAt = null;
+    }
+    return guard;
 }
 
 /**
@@ -407,6 +516,7 @@ function parseXrayFront(body) {
         enabled: body['xray.front.enabled'],
         publicPort: body['xray.front.publicPort'],
         siteMode: body['xray.front.siteMode'],
+        logLevel: body['xray.front.logLevel'],
         inboundIds: body['xray.front.inboundIds'],
     });
 }
@@ -642,6 +752,7 @@ function sanitizeXrayForRender(xray) {
         plain.front = { ...plain.front, siteHtmlBytes: bufferByteLength(plain.front.siteHtml) };
         delete plain.front.siteHtml;
     }
+    vlessEncryption.stripVlessEncryptionKeys(plain, { keepPublic: true });
     return plain;
 }
 
@@ -1082,6 +1193,34 @@ const requireAuth = (req, res, next) => {
     next();
 };
 
+/**
+ * Re-check the current admin's password (and TOTP when enabled) before a
+ * remote binary change. Sends the JSON error itself.
+ * @returns {Promise<boolean>} true when the caller may proceed
+ */
+async function reauthenticateXrayVersionChange(req, res) {
+    const Admin = require('../../models/adminModel');
+    const password = String(req.body?.currentPassword || '');
+    const token = String(req.body?.totpToken || '');
+    const admin = await Admin.verifyPassword(req.session.adminUsername, password);
+    if (!admin) {
+        res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentPassword') || 'Invalid current password' });
+        return false;
+    }
+    if (!admin.twoFactor?.enabled) return true;
+
+    const secret = totpService.decryptSecret(admin.twoFactor.secretEncrypted);
+    if (!secret) {
+        res.status(500).json({ error: res.locals.t?.('auth.totpConfigError') || 'TOTP configuration error' });
+        return false;
+    }
+    if (!(await totpService.verifyToken({ secret, token }))) {
+        res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentTotp') || 'Invalid current TOTP code' });
+        return false;
+    }
+    return true;
+}
+
 // ─── Render Engine ───────────────────────────────────────────────────────────
 
 const render = (res, template, data = {}) => {
@@ -1424,6 +1563,11 @@ function buildClonedNodePrefill(source) {
     delete xray.accessLogs;
     delete xray.manualCert;
     delete xray.manualKey;
+    // Runtime watchdog state belongs to the source node; only the settings are copied.
+    xray.realityGuard = {
+        mode: normalizeRealityGuardMode(source.xray?.realityGuard?.mode),
+        reserveSnis: normalizeReserveSnis(source.xray?.realityGuard?.reserveSnis),
+    };
     xray.realityPrivateKey = freshKeys.privateKey;
     xray.realityPublicKey = freshKeys.publicKey;
     if (Array.isArray(xray.extraInbounds)) {
@@ -1437,6 +1581,8 @@ function buildClonedNodePrefill(source) {
             return copy;
         });
     }
+    // The clone gets its own VLESS Encryption keys when it is saved.
+    vlessEncryption.stripVlessEncryptionKeys(xray);
 
     const name = String(source.name || 'node').trim() || 'node';
     return {
@@ -1496,7 +1642,11 @@ module.exports = {
     connectNodeSSH,
     parseXrayFormFields,
     parseExtraInbounds,
+    parseVlessEncryptionRegenerateIds,
     parseXrayFront,
+    mergeRealityGuard,
+    normalizeRealityGuardMode,
+    XRAY_REALITY_GUARD_MODES,
     validateXrayFormFields,
     validateXrayFrontFields,
     ensureExtraInboundRealityKeys,
@@ -1514,6 +1664,7 @@ module.exports = {
     validateHysteriaFormFields,
     checkIpWhitelist,
     requireAuth,
+    reauthenticateXrayVersionChange,
     requireOnboarding,
     invalidateOnboardingCache,
     render,

@@ -91,6 +91,8 @@
         // Mode switcher
         initModeSwitcher('modeSwitcher', 'linkModeInput', 'modeHint');
         initModeSwitcher('quickModeSwitcher', 'quickLinkMode');
+        applyProtocolUi('reverse');
+        applyProtocolUi('reverse', document.getElementById('quickTunnelProtocol'));
 
         // Security change -> show/hide REALITY section + refresh warnings
         var secSel = document.getElementById('selectSecurity');
@@ -100,22 +102,10 @@
             updateLinkFormWarnings();
         });
 
-        // Transport change -> disable REALITY for ws + refresh warnings
+        // Transport change -> disable REALITY for ws/kcp, toggle mKCP section + refresh warnings
         var transSel = document.getElementById('selectTransport');
         if (transSel) transSel.addEventListener('change', function () {
-            var secSelect = document.getElementById('selectSecurity');
-            if (!secSelect) return;
-            var realityOpt = secSelect.querySelector('option[value="reality"]');
-            if (!realityOpt) return;
-            if (this.value === 'ws') {
-                realityOpt.disabled = true;
-                if (secSelect.value === 'reality') {
-                    secSelect.value = 'none';
-                    secSelect.dispatchEvent(new Event('change'));
-                }
-            } else {
-                realityOpt.disabled = false;
-            }
+            applyTransportUi();
             updateLinkFormWarnings();
         });
 
@@ -910,7 +900,6 @@
         form.tunnelProtocol.value = link.tunnelProtocol || 'vless';
         form.tunnelTransport.value = link.tunnelTransport === 'splithttp' ? 'xhttp' : (link.tunnelTransport || 'tcp');
         form.tunnelSecurity.value = link.tunnelSecurity || 'none';
-        form.tunnelDomain.value = link.tunnelDomain || 'reverse.tunnel.internal';
         form.muxEnabled.checked = !!link.muxEnabled;
         form.muxConcurrency.value = link.muxConcurrency || 8;
         form.priority.value = link.priority || 100;
@@ -923,6 +912,12 @@
         form.realityShortIds.value = Array.isArray(link.realityShortIds) ? link.realityShortIds.join(', ') : (link.realityShortIds || '');
         form.realityFingerprint.value = link.realityFingerprint || 'chrome';
 
+        if (form.kcpMtu) form.kcpMtu.value = link.kcpMtu || 1350;
+        if (form.kcpTti) form.kcpTti.value = link.kcpTti || 20;
+        if (form.kcpUplinkCapacity) form.kcpUplinkCapacity.value = link.kcpUplinkCapacity || 100;
+        if (form.kcpDownlinkCapacity) form.kcpDownlinkCapacity.value = link.kcpDownlinkCapacity || 100;
+        if (form.kcpHeader) form.kcpHeader.value = link.kcpHeader || 'none';
+
         const geoEnabled = document.getElementById('geoRoutingEnabled');
         const geoFields = document.getElementById('geoRoutingFields');
         const geoDomains = document.getElementById('geoRoutingDomains');
@@ -934,8 +929,8 @@
 
         var realitySec = document.getElementById('realitySection');
         if (realitySec) realitySec.style.display = form.tunnelSecurity.value === 'reality' ? '' : 'none';
-        var domGroup = document.getElementById('tunnelDomainGroup');
-        if (domGroup) domGroup.style.display = form.mode.value === 'forward' ? 'none' : '';
+        applyTransportUi();
+        applyProtocolUi(form.mode.value);
         var hint = document.getElementById('modeHint');
         if (hint) {
             hint.textContent = form.mode.value === 'forward'
@@ -951,9 +946,40 @@
         updateLinkFormWarnings();
     }
 
+    function applyTransportUi() {
+        var transSelect = document.getElementById('selectTransport');
+        var transport = transSelect ? transSelect.value : 'tcp';
+        var kcpSec = document.getElementById('kcpSection');
+        if (kcpSec) kcpSec.style.display = transport === 'kcp' ? '' : 'none';
+
+        var secSelect = document.getElementById('selectSecurity');
+        var realityOpt = secSelect && secSelect.querySelector('option[value="reality"]');
+        if (!realityOpt) return;
+        var realityBlocked = transport === 'ws' || transport === 'kcp';
+        realityOpt.disabled = realityBlocked;
+        if (realityBlocked && secSelect.value === 'reality') {
+            secSelect.value = 'none';
+            secSelect.dispatchEvent(new Event('change'));
+        }
+    }
+
+    // VLESS Reverse Proxy has no VMess counterpart.
+    function applyProtocolUi(mode, select) {
+        if (!select) {
+            var form = document.getElementById('addLinkForm');
+            select = form && form.tunnelProtocol;
+        }
+        var vmess = select && select.querySelector('option[value="vmess"]');
+        if (!vmess) return;
+        vmess.disabled = mode !== 'forward';
+        if (vmess.disabled && select.value === 'vmess') select.value = 'vless';
+    }
+
     function closeModal() {
         document.getElementById('addLinkModal').classList.remove('active');
         document.getElementById('addLinkForm').reset();
+        applyTransportUi();
+        applyProtocolUi('reverse');
         linkModalMode = 'create';
         var title = document.getElementById('linkModalTitle');
         if (title) title.textContent = i18n.addLink || 'Add Link';
@@ -982,8 +1008,6 @@
         if (geoGeoip) geoGeoip.value = '';
         var geoFields = document.getElementById('geoRoutingFields');
         if (geoFields) geoFields.style.display = 'none';
-        var domGroup = document.getElementById('tunnelDomainGroup');
-        if (domGroup) domGroup.style.display = '';
     }
 
     async function onAddLinkSubmit(e) {
@@ -1007,11 +1031,6 @@
             priority:       parseInt(form.priority?.value) || 100,
         };
 
-        // Tunnel domain (reverse only)
-        if (form.tunnelDomain?.value) {
-            data.tunnelDomain = form.tunnelDomain.value;
-        }
-
         // REALITY fields
         if (data.tunnelSecurity === 'reality') {
             data.realityDest = form.realityDest?.value || '';
@@ -1020,6 +1039,14 @@
             data.realityPublicKey = form.realityPublicKey?.value || '';
             data.realityShortIds = form.realityShortIds?.value || '';
             data.realityFingerprint = form.realityFingerprint?.value || 'chrome';
+        }
+
+        if (data.tunnelTransport === 'kcp') {
+            data.kcpMtu = parseInt(form.kcpMtu?.value) || 1350;
+            data.kcpTti = parseInt(form.kcpTti?.value) || 20;
+            data.kcpUplinkCapacity = parseInt(form.kcpUplinkCapacity?.value) || 100;
+            data.kcpDownlinkCapacity = parseInt(form.kcpDownlinkCapacity?.value) || 100;
+            data.kcpHeader = form.kcpHeader?.value || 'none';
         }
 
         // Geo routing (always sent so unchecking persists)
@@ -1238,9 +1265,7 @@
                             : (i18n.modeReverseHint || 'Bridge initiates tunnel to Portal. Bridge can be behind NAT.');
                     }
                 }
-                // Show/hide tunnel domain field (reverse only)
-                var domGroup = document.getElementById('tunnelDomainGroup');
-                if (domGroup) domGroup.style.display = mode === 'forward' ? 'none' : '';
+                applyProtocolUi(mode, inputId === 'quickLinkMode' ? document.getElementById('quickTunnelProtocol') : null);
                 updateLinkFormWarnings();
             });
         });

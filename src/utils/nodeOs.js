@@ -41,7 +41,7 @@ PS=$(sysctl -n hw.pagesize); T=$(sysctl -n hw.physmem)
 F=$(( ( $(sysctl -n vm.stats.vm.v_free_count) + $(sysctl -n vm.stats.vm.v_inactive_count) ) * PS ))
 echo "Mem: $T $(( T - F )) $F"
 echo "===DISK==="
-df -k / | tail -1 | awk '{printf "%s %d %d %d %s %s\\n", $1, $2*1024, $3*1024, $4*1024, $5, $6}'
+df -k / | tail -1 | awk '{printf "%s %.0f %.0f %.0f %s %s\\n", $1, $2*1024, $3*1024, $4*1024, $5, $6}'
 echo "===UPTIME==="
 echo $(( $(date +%s) - $(sysctl -n kern.boottime | awk -F'[ =,]+' '{print $3}') ))
 `;
@@ -63,33 +63,9 @@ cat /proc/uptime | cut -d' ' -f1
 }
 function buildNetStatsCommand(osFamily) {
     if (osFamily === 'freebsd') {
-        return `IF=$(route -n get default | awk '/interface:/{print $2}'); netstat -ibn -I "$IF" | awk -v i="$IF" '/<Link/ {printf "%s: %d 0 0 0 0 0 0 0 %d\\n", i, $8, $11}'`;
+        return `IF=$(route -n get default | awk '/interface:/{print $2}'); netstat -ibn -I "$IF" | awk -v i="$IF" '/<Link/ {printf "%s: %.0f 0 0 0 0 0 0 0 %.0f\\n", i, $8, $11}'`;
     }
     return `cat /proc/net/dev | grep -E '(eth|ens|enp|eno)' | head -1`;
 }
 
-// journald on linux; on freebsd rc.d services run under daemon(8) -S -T <service>, so their
-// output lands in syslog under that tag.
-function buildServiceLogsCommand(osFamily, service, lines) {
-    const n = Number(lines) || 50;
-    if (osFamily === 'freebsd') {
-        // "host mita[1234]: ..." — the pid brackets are matched with dots to keep the pattern plain.
-        return `grep -E ' ${service}(.[0-9]+.)?: ' /var/log/messages 2>/dev/null | tail -n ${n}; exit 0`;
-    }
-    return `journalctl -u ${service} -n ${n} --no-pager 2>/dev/null || true`;
-}
-
-// Prints the listening socket line for the port, or nothing.
-function buildListenCheckCommand(osFamily, protocol, port) {
-    const proto = String(protocol || '').toLowerCase() === 'udp' ? 'udp' : 'tcp';
-    const p = Number(port) || 0;
-    if (osFamily === 'freebsd') {
-        return `sockstat -46l -P ${proto} -p ${p} 2>/dev/null | awk 'NR > 1' | head -1`;
-    }
-    return `ss ${proto === 'udp' ? '-uln' : '-tln'}p 2>/dev/null | grep -E ":${p}\\b" | head -1 || true`;
-}
-
-module.exports = {
-    normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildSystemStatsScript, buildNetStatsCommand,
-    buildServiceLogsCommand, buildListenCheckCommand,
-};
+module.exports = { normalizeOsFamily, nodeOsFamily, buildServiceCommand, buildSystemStatsScript, buildNetStatsCommand };

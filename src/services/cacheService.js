@@ -28,12 +28,12 @@ const DEFAULT_TTL = {
 
 // Key prefixes
 const PREFIX = {
-    SUB: 'sub:',             // sub:{token}:{format}
+    SUB: 'sub:v2:',          // sub:v2:{token}:{format}
     QR: 'qr:',               // qr:{baseUrl}
     USER: 'user:',           // user:{userId}
     DEVICES: 'devices:',     // devices:{userId} - Hash with device IPs
     ONLINE: 'online',        // online (stores all sessions) - legacy
-    NODES: 'nodes:active',   // nodes:active
+    NODES: 'nodes:active:v2',
     SETTINGS: 'settings',    // settings
     TRAFFIC_STATS: 'traffic:stats', // Total traffic stats
     GROUPS: 'groups:active', // Active groups

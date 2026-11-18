@@ -4,18 +4,13 @@ const mongoose = require('mongoose');
  * Per-user activity on a node: who was on which server and how much they moved there.
  *
  * xray nodes: one document per (user, node, hour) with the traffic deltas of each agent poll.
- * mieru nodes: one rolling document per (user, node) with hour = null, holding mita's own
- * 1/7/30-day windows (mita reports no deltas).
  */
-const windowSchema = { tx: { type: Number, default: 0 }, rx: { type: Number, default: 0 } };
-
 const userNodeStatSchema = new mongoose.Schema({
     userId: { type: String, required: true },
     node: { type: mongoose.Schema.Types.ObjectId, ref: 'HyNode', required: true },
     hour: { type: Date, default: null },
     tx: { type: Number, default: 0 },
     rx: { type: Number, default: 0 },
-    windows: { d1: windowSchema, d7: windowSchema, d30: windowSchema },
     lastSeen: { type: Date, default: null },
     // xray: bytes moved in the most recent poll, to tell real use from keep-alive probes
     lastDelta: { type: Number, default: null },
@@ -44,23 +39,6 @@ userNodeStatSchema.statics.recordXray = async function (nodeId, entries, now = n
             updateOne: {
                 filter: { userId, node: nodeId, hour },
                 update: { $inc: { tx, rx }, $set: { lastSeen: now, lastDelta: tx + rx } },
-                upsert: true,
-            },
-        });
-    }
-    if (ops.length > 0) await this.bulkWrite(ops, { ordered: false });
-    return ops.length;
-};
-
-/** rows: [{ userId, lastActive, windows }] — one `mita get users` reading, names already mapped. */
-userNodeStatSchema.statics.recordMieru = async function (nodeId, rows) {
-    const ops = [];
-    for (const row of rows) {
-        if (!row.userId || !row.lastActive) continue;
-        ops.push({
-            updateOne: {
-                filter: { userId: row.userId, node: nodeId, hour: null },
-                update: { $set: { windows: row.windows, lastSeen: row.lastActive } },
                 upsert: true,
             },
         });

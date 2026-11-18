@@ -81,6 +81,10 @@ async function invokeRoute(router, method, routePath, req) {
 async function withRouteStubs(usersById, usersByToken, run) {
     const originalLoad = Module._load;
     const warnings = [];
+    const settings = {
+        loadBalancing: { hideOffline: false },
+        subscription: {},
+    };
     const logger = {
         debug() {},
         info() {},
@@ -157,10 +161,7 @@ async function withRouteStubs(usersById, usersByToken, run) {
             if (request === '../utils/helpers') {
                 return {
                     getNodesByGroups: () => [],
-                    getSettings: async () => ({
-                        loadBalancing: { hideOffline: false },
-                        subscription: {},
-                    }),
+                    getSettings: async () => settings,
                     parseDurationSeconds: () => 0,
                     normalizeHopInterval: value => value,
                 };
@@ -194,7 +195,7 @@ async function withRouteStubs(usersById, usersByToken, run) {
     try {
         delete require.cache[require.resolve('../src/routes/auth')];
         delete require.cache[require.resolve('../src/routes/subscription')];
-        return await run({ warnings });
+        return await run({ warnings, settings, cache });
     } finally {
         Module._load = originalLoad;
         delete require.cache[require.resolve('../src/routes/auth')];
@@ -313,6 +314,27 @@ async function main() {
                 groups: [],
                 xray: { transport: 'xhttp', security: 'reality', fingerprint: 'firefox', realityPublicKey: 'pk', realitySni: ['www.example.com'], realityShortIds: ['ab'], xhttpPath: '/x' },
             },
+            {
+                _id: 'node-4',
+                name: 'Encrypted',
+                active: true,
+                type: 'xray',
+                status: 'online',
+                domain: 'enc.example.com',
+                port: 443,
+                groups: [],
+                xray: {
+                    transport: 'tcp',
+                    security: 'reality',
+                    realityPublicKey: 'pk',
+                    realitySni: ['www.example.com'],
+                    realityShortIds: ['ab'],
+                    vlessEncryption: true,
+                    vlessEncryptionAuth: 'x25519',
+                    vlessEncryptionMode: 'native',
+                    vlessEncryptionPublicKey: Buffer.alloc(32, 7).toString('base64url'),
+                },
+            },
         ],
     };
 
@@ -325,9 +347,10 @@ async function main() {
         ['safe-token', alice],
         ['bob-token', bob],
         ['probe-token', probe],
+        ['retired-only', { ...alice, nodes: [], groups: ['group-with-other-nodes'], populated: path => path === 'nodes' ? ['retired-id'] : undefined }],
     ]);
 
-    await withRouteStubs(usersById, usersByToken, async ({ warnings }) => {
+    await withRouteStubs(usersById, usersByToken, async ({ warnings, settings, cache }) => {
         const authRouter = require('../src/routes/auth');
 
         for (const payload of ['alice', 'alice:', ':password', '', null, 42]) {
@@ -399,6 +422,22 @@ async function main() {
         assert(proxy, 'the linked modern node must appear in the Clash subscription');
         assert.strictEqual(proxy['client-fingerprint'], 'chrome');
         assert.strictEqual(proxy['reality-opts']['support-x25519mlkem768'], true);
+        // Mongoose leaves the original IDs in populated() when the retired
+        // nodes are filtered out. Explicit assignments must still take priority.
+        cache.getActiveNodes = async () => [{ ...alice.nodes[0], groups: ['group-with-other-nodes'] }];
+        const retired = await invokeRoute(subscriptionRouter, 'get', '/files/:token', makeFilesReq('retired-only', 'raw'));
+        assert.strictEqual(retired.statusCode, 503, 'retired-only users must not gain group nodes');
+        assert(!byTag.has('Encrypted'), 'sing-box must not get a VLESS Encryption node by default');
+
+        settings.subscription.singboxVlessEncryption = true;
+        res = await invokeRoute(subscriptionRouter, 'get', '/files/:token', makeFilesReq('probe-token'));
+        assert.strictEqual(res.statusCode, 200);
+        const encrypted = JSON.parse(res.body).outbounds.find(o => o.tag === 'Encrypted');
+        assert.strictEqual(
+            encrypted?.encryption,
+            `mlkem768x25519plus.native.0rtt.${Buffer.alloc(32, 7).toString('base64url')}`,
+            'the opt-in publishes VLESS Encryption nodes to sing-box'
+        );
     });
 
     await withRateLimiterStubs(async () => {

@@ -237,6 +237,10 @@ router.post('/settings', async (req, res) => {
                 return Number.isNaN(n) ? 12 : Math.min(168, Math.max(1, n));
             });
 
+            if (req.body['_singboxEncryptionSettings'] !== undefined) {
+                updates['subscription.singboxVlessEncryption'] = req.body['subscription.singboxVlessEncryption'] === 'on';
+            }
+
             if (req.body['subscription.buttonsJson'] !== undefined) {
                 let parsedButtons = [];
                 try { parsedButtons = JSON.parse(req.body['subscription.buttonsJson'] || '[]'); } catch {}
@@ -328,7 +332,7 @@ router.post('/settings', async (req, res) => {
         let homepageModeChanged = null;
         let probeTrafficLimit = null;
         if (req.body['_homepageSettings'] !== undefined) {
-            const VALID_MODES = ['nginx', 'custom'];
+            const VALID_MODES = ['nginx', 'custom', 'off'];
             const mode = String(req.body['homepage.mode'] || 'nginx');
             const safeMode = VALID_MODES.includes(mode) ? mode : 'nginx';
             updates['homepage.mode'] = safeMode;
@@ -490,9 +494,9 @@ router.post('/settings', async (req, res) => {
         } catch (_e) { /* ignore */ }
         await reloadSettings();
 
-        // Drop subscription cache so load-balancing toggles take effect now,
-        // not after subscriptionTTL (up to 1 h).
-        if (systemTabSubmit) {
+        // Drop subscription cache so load-balancing and sing-box encryption
+        // toggles take effect now, not after subscriptionTTL (up to 1 h).
+        if (systemTabSubmit || req.body['_singboxEncryptionSettings'] !== undefined) {
             await cache.invalidateAllSubscriptions();
         }
 
@@ -846,11 +850,10 @@ router.post('/settings/homepage/upload', (req, res) => {
     });
 });
 
-// POST /settings/homepage/reset - drop custom HTML, revert to fake nginx
+// POST /settings/homepage/reset - drop custom HTML, revert to fake nginx (unless decoy is off)
 router.post('/settings/homepage/reset', async (req, res) => {
     try {
         await homepageService.clearCustom();
-        await Settings.update({ 'homepage.mode': 'nginx' });
         logger.info(`[Panel] Homepage reset to default by ${req.session.adminUsername}`);
         return res.redirect('/panel/settings?tab=security&message=' + encodeURIComponent(res.locals.t?.('settings.homepageResetDone') || 'Homepage reset to default'));
     } catch (error) {

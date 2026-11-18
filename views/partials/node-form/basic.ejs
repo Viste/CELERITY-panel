@@ -1,5 +1,5 @@
 <%# Pane: main — protocol, identification, groups, cascade role. %>
-<div class="nf-pane is-active" data-pane="main" data-types="hysteria xray virtual cdn mieru">
+<div class="nf-pane is-active" data-pane="main" data-types="hysteria xray virtual cdn">
     <div class="nf-pane__head">
         <h3><%= t('nodes.paneMain') %></h3>
         <p><%= t('nodes.paneMainHint') %></p>
@@ -43,14 +43,6 @@
                 <span class="proto-name"><%= t('nodes.cdnName') %></span>
                 <span class="proto-desc"><%= t('nodes.cdnDesc') %></span>
             </label>
-            <label class="proto-option <% if (node?.type === 'mieru') { %>active<% } %>" id="protoMieruLabel">
-                <input type="radio" name="type" value="mieru" id="protoMieru"
-                       <%= node?.type === 'mieru' ? 'checked' : '' %>
-                       onchange="switchProto('mieru')">
-                <span class="proto-icon"><i class="ti ti-shield-lock" style="font-size:24px;"></i></span>
-                <span class="proto-name">Mieru</span>
-                <span class="proto-desc">mita server · TCP/UDP · no TLS fingerprint</span>
-            </label>
         </div>
     </div>
 
@@ -64,7 +56,7 @@
             <input type="text" id="name" name="name" value="<%= node?.name || '' %>"
                    placeholder="<%= t('nodes.nodeNamePlaceholder') %>" required>
         </div>
-        <div class="form-group" id="ipFormGroup" data-types="hysteria xray mieru">
+        <div class="form-group" id="ipFormGroup" data-types="hysteria xray">
             <div class="nf-label-row">
                 <label for="ip"><%= t('nodes.ipAddress') %><span class="nf-req">*</span></label>
                 <%- include('field-help', { textKey: 'nodes.ipAddressHelp' }) %>

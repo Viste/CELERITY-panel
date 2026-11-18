@@ -28,11 +28,7 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
-const { parseMitaUsers, staleMitaUsers } = require('../utils/mitaUsers');
-const {
-    nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand,
-    buildServiceCommand, buildServiceLogsCommand, buildListenCheckCommand,
-} = require('../utils/nodeOs');
+const { nodeOsFamily, buildSystemStatsScript, buildNetStatsCommand } = require('../utils/nodeOs');
 
 // Hard cap to keep CPU usage bounded on weak hardware (1 vCPU).
 // Each SSH handshake involves DH key-exchange which is CPU-heavy on Node.js.
@@ -130,6 +126,9 @@ class NodeSSH {
                 port: this.node.ssh?.port || 22,
                 username: this.node.ssh?.username || 'root',
                 readyTimeout: getDirectReadyTimeoutMs(),
+                // Without keepalive a node that drops off mid-command leaves exec() pending forever.
+                keepaliveInterval: 15000,
+                keepaliveCountMax: 4,
             };
 
             if (this.node.ssh?.privateKey) {
@@ -142,20 +141,30 @@ class NodeSSH {
             }
 
             let settled = false;
+            const deadline = setTimeout(() => fail(new Error('SSH handshake timed out')), config.readyTimeout);
+            const fail = (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(deadline);
+                try { client.destroy(); } catch (_) { try { client.end(); } catch (_) {} }
+                reject(err);
+            };
             client
                 .on('ready', () => {
                     if (settled) return;
                     settled = true;
+                    clearTimeout(deadline);
                     logger.info(`[SSH] Connected (direct) to ${this.node.name} (${this.node.ip})`);
                     resolve(client);
                 })
-                .on('error', (err) => {
-                    if (settled) return;
-                    settled = true;
-                    try { client.end(); } catch (_) {}
-                    reject(err);
-                })
-                .connect(config);
+                .on('error', fail)
+                .on('end', () => fail(new Error('SSH connection ended before authentication')))
+                .on('close', () => fail(new Error('SSH connection closed before authentication')));
+            try {
+                client.connect(config);
+            } catch (err) {
+                fail(err);
+            }
         });
     }
 
@@ -406,107 +415,6 @@ class NodeSSH {
     }
 
     /**
-     * Apply a mita (mieru) server config — write JSON then `mita apply config`.
-     * Accepts a JS object; this method serialises and ownership-fixes for the
-     * dedicated `mita` system user that the RPM/DEB creates on install.
-     */
-    async updateMieruConfig(configObject) {
-        try {
-            const configPath = '/etc/mita/server-config.json';
-            const content = typeof configObject === 'string'
-                ? configObject
-                : JSON.stringify(configObject, null, 2);
-
-            await this.exec('mkdir -p /etc/mita');
-            await this.writeFile(configPath, content);
-            // mita reads as user `mita`; without these the daemon refuses to load.
-            await this.exec(`chown mita:mita ${configPath} && chmod 0600 ${configPath}`);
-
-            const apply = await this.exec(`mita apply config ${configPath} 2>&1`);
-            if (/(error|failed|invalid)/i.test(`${apply.stdout} ${apply.stderr}`)) {
-                logger.error(`[SSH] mita apply config error on ${this.node.name}: ${apply.stdout} ${apply.stderr}`);
-                return false;
-            }
-            await this.pruneMieruUsers(configObject);
-            return await this.restartMieru();
-        } catch (error) {
-            logger.error(`[SSH] mita config update error: ${error.message}`);
-            return false;
-        }
-    }
-
-    /**
-     * `mita apply config` merges users: without this a user deleted or disabled in the panel
-     * would keep access on the node forever.
-     */
-    async pruneMieruUsers(configObject) {
-        if (!configObject || typeof configObject !== 'object' || !Array.isArray(configObject.users)) return 0;
-        const current = await this.exec('mita describe config 2>/dev/null');
-        const stale = staleMitaUsers(current.stdout, configObject.users.map(u => u.name));
-        for (const name of stale) {
-            await this.exec(`mita delete user '${name}' 2>&1`);
-        }
-        if (stale.length > 0) {
-            logger.info(`[SSH] mita on ${this.node.name}: removed ${stale.length} user(s) the panel no longer lists: ${stale.join(', ')}`);
-        }
-        return stale.length;
-    }
-
-    /**
-     * Restart the mita service (systemd or rc.d) and verify it picks up the new config.
-     */
-    async restartMieru() {
-        try {
-            const osFamily = nodeOsFamily(this.node);
-            await this.exec(`${buildServiceCommand(osFamily, 'restart', 'mita')} 2>&1`);
-            await new Promise(resolve => setTimeout(resolve, 3000));
-
-            const statusResult = await this.exec(`${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null`);
-            const isActive = statusResult.stdout.trim() === 'active';
-
-            if (isActive) {
-                logger.info(`[SSH] mita restarted and running on ${this.node.name}`);
-                return true;
-            }
-            const logsResult = await this.exec(buildServiceLogsCommand(osFamily, 'mita', 15));
-            logger.error(`[SSH] mita failed to start on ${this.node.name}. Logs: ${logsResult.stdout}`);
-            return false;
-        } catch (error) {
-            logger.error(`[SSH] mita restart error: ${error.message}`);
-            return false;
-        }
-    }
-
-    /**
-     * Quick health probe for a mieru node — service active + port open.
-     */
-    async checkMieruStatus() {
-        try {
-            const port = this.node.port || 443;
-            const protocol = (this.node.mieru && this.node.mieru.protocol === 'UDP') ? 'udp' : 'tcp';
-            const osFamily = nodeOsFamily(this.node);
-
-            const svc = await this.exec(`${buildServiceCommand(osFamily, 'is-active', 'mita')} 2>/dev/null`);
-            const listen = await this.exec(buildListenCheckCommand(osFamily, protocol, port));
-            const serviceActive = svc.stdout.trim() === 'active';
-            // Per-user last activity and traffic windows, read in the session that is already open.
-            let users = [];
-            if (serviceActive) {
-                const table = await this.exec('mita get users 2>/dev/null').catch(() => null);
-                users = parseMitaUsers(table?.stdout);
-            }
-            return {
-                serviceActive,
-                listening: listen.stdout.includes(`:${port}`),
-                users,
-            };
-        } catch (error) {
-            logger.error(`[SSH] mita status check error: ${error.message}`);
-            return { serviceActive: false, listening: false };
-        }
-    }
-
-    /**
      * Upload file content to a remote path (alias for writeFile)
      */
     async uploadContent(content, remotePath) {
@@ -606,7 +514,7 @@ echo "Port hopping: ${startPort}-${endPort} -> ${mainPort}"
     async getNetworkSpeed() {
         try {
             const getNetStats = async () => {
-                const result = await this.exec(NodeSSH.buildNetStatsCommand(nodeOsFamily(this.node)));
+                const result = await this.exec(buildNetStatsCommand(nodeOsFamily(this.node)));
                 const line = result.stdout.trim();
                 
                 if (!line) return null;
@@ -770,7 +678,7 @@ fi
      */
     async getSystemStats() {
         try {
-            const result = await this.exec(NodeSSH.buildSystemStatsScript(nodeOsFamily(this.node)));
+            const result = await this.exec(buildSystemStatsScript(nodeOsFamily(this.node)));
             
             const output = result.stdout || '';
             const lines = output.split('\n');
@@ -860,8 +768,6 @@ fi
     }
 }
 
-NodeSSH.buildSystemStatsScript = buildSystemStatsScript;
-NodeSSH.buildNetStatsCommand = buildNetStatsCommand;
 NodeSSH._cpuSamples = new Map();
 
 // Direct-connection semaphore (issue #70 hardening).

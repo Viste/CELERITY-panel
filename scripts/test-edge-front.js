@@ -83,6 +83,7 @@ const {
 const {
     applyFrontPatch,
     captureFrontRollbackState,
+    frontUpdatePaths,
 } = require('../src/services/edgeFront/frontConfig');
 const { selectCaddyAsset } = require('../src/services/edgeFront/release');
 const {
@@ -159,7 +160,7 @@ function makeNode(overrides = {}) {
     // XHTTP appends segments below its base path, but a bare hit counts too.
     assert.deepStrictEqual(routes[0].paths, ['/api/sync', '/api/sync/*']);
     assert.strictEqual(routes[0].upstream, '127.0.0.1:8443');
-    assert.strictEqual(routes[0].h2c, true);
+    assert.strictEqual(routes[0].h2c, false, 'xhttp goes over HTTP/1.1');
 
     assert.strictEqual(routes[1].transport, 'ws');
     assert.strictEqual(routes[1].h2c, false);
@@ -201,11 +202,22 @@ function makeNode(overrides = {}) {
     );
     assert.ok(
         caddyfile.indexOf('respond @front0Smoke 204')
-            < caddyfile.indexOf('reverse_proxy h2c://127.0.0.1:8443'),
+            < caddyfile.indexOf('reverse_proxy 127.0.0.1:8443 {'),
         'route smoke marker answers before the XHTTP upstream'
     );
-    assert.ok(caddyfile.includes('reverse_proxy h2c://127.0.0.1:8443'), 'xhttp upstream is h2c');
+    assert.ok(!caddyfile.includes('h2c://'), 'neither xhttp nor ws use h2c');
+    assert.ok(
+        caddyfile.includes('\t\treverse_proxy 127.0.0.1:8443 {\n'
+            + '\t\t\tflush_interval -1\n'
+            + '\t\t\ttransport http {\n'
+            + '\t\t\t\tkeepalive 60s\n'
+            + '\t\t\t\tkeepalive_idle_conns_per_host 256\n'
+            + '\t\t\t}\n'
+            + '\t\t}'),
+        'xhttp upstream is pooled HTTP/1.1 without response buffering'
+    );
     assert.ok(caddyfile.includes('reverse_proxy 127.0.0.1:8444'), 'ws upstream is plain http');
+    assert.ok(!caddyfile.includes('\tlog {'), 'default log level leaves the global block unchanged');
     assert.ok(caddyfile.includes('file_server'), 'decoy site is served');
     assert.ok(caddyfile.indexOf('@front1') < caddyfile.indexOf('file_server'),
         'the catch-all comes after the inbound routes');
@@ -215,6 +227,21 @@ function makeNode(overrides = {}) {
     grpcNode.xray.grpcServiceName = 'tunnel';
     const grpcCaddyfile = buildCaddyfile(grpcNode);
     assert.ok(grpcCaddyfile.includes('header_up X-Real-IP {remote_host}'), 'grpc forwards X-Real-IP');
+    assert.ok(grpcCaddyfile.includes('reverse_proxy h2c://127.0.0.1:8443 {'), 'grpc stays on h2c');
+    assert.strictEqual(buildFrontRoutes(grpcNode.xray, grpcNode.port)[0].h2c, true);
+
+    const errorLogNode = makeNode();
+    errorLogNode.xray.front.logLevel = 'ERROR';
+    const errorLogCaddyfile = buildCaddyfile(errorLogNode);
+    assert.ok(errorLogCaddyfile.startsWith('{\n\tadmin off\n\tlog {\n\t\tlevel ERROR\n\t}\n\tservers {'),
+        'ERROR level goes into the global options block');
+    assert.notStrictEqual(buildDesiredState(errorLogNode).fingerprint, buildDesiredState(makeNode()).fingerprint,
+        'a log level change re-provisions the front');
+
+    assert.strictEqual(normalizeXrayFront({ logLevel: 'error' }).logLevel, 'ERROR');
+    assert.strictEqual(normalizeXrayFront({ logLevel: 'DEBUG\n}' }).logLevel, 'WARN',
+        'unknown levels fall back to WARN instead of reaching the Caddyfile');
+    assert.ok(!('logLevel' in normalizeXrayFront({})), 'omitted level keeps the stored one on patch');
 
     // A panel certificate cannot serve the node domain reliably.
     const panelNode = makeNode();
@@ -232,7 +259,9 @@ function makeNode(overrides = {}) {
     const upstreamHostNode = makeNode();
     upstreamHostNode.xray.xhttpHost = 'origin.internal';
     assert.ok(
-        buildCaddyfile(upstreamHostNode).includes('header_up Host origin.internal'),
+        buildCaddyfile(upstreamHostNode).includes('\t\treverse_proxy 127.0.0.1:8443 {\n'
+            + '\t\t\theader_up Host origin.internal\n'
+            + '\t\t\tflush_interval -1\n'),
         'a private inbound Host is rewritten only on the upstream hop'
     );
 
@@ -494,7 +523,54 @@ function makeNode(overrides = {}) {
 
     // A patch is still a patch: sent fields win over the stored ones.
     assert.strictEqual(node.xray.front.publicPort, 443);
+    assert.ok(!('siteHtml' in node.xray.front.rollbackSnapshot.xray.front),
+        'the rollback snapshot does not duplicate the decoy page');
+    assert.ok(!Object.keys(frontUpdatePaths(node.xray.front)).includes('xray.front.siteHtml'),
+        'REST/MCP never write the decoy page');
+}
 
+// ---- front patch without siteMode -------------------------------------------
+{
+    // A partial REST/MCP patch must not reset omitted fields to their defaults:
+    // an absent siteMode used to become 'nginx' and replace the uploaded page.
+    const node = makeNode();
+    const previousFront = {
+        ...node.xray.front,
+        enabled: true,
+        publicPort: 443,
+        siteMode: 'custom',
+        logLevel: 'ERROR',
+        siteHtml: Buffer.from('<html>decoy</html>'),
+        inboundIds: [MAIN_INBOUND_ID, 'extra-ws'],
+        appliedFingerprint: 'abc123',
+        status: 'active',
+    };
+    node.xray.front = { inboundIds: [MAIN_INBOUND_ID], siteHtml: null, status: 'active' };
+
+    assert.strictEqual(applyFrontPatch(node.xray, node, previousFront), null);
+    assert.strictEqual(node.xray.front.siteMode, 'custom');
+    assert.strictEqual(node.xray.front.enabled, true);
+    assert.strictEqual(node.xray.front.logLevel, 'ERROR');
+    assert.deepStrictEqual(node.xray.front.inboundIds, [MAIN_INBOUND_ID]);
+    assert.strictEqual(node.xray.front.siteHtml.toString(), '<html>decoy</html>',
+        'a caller cannot clear the decoy page through the patch');
+    assert.strictEqual(node.xray.front.status, 'pending',
+        'a caller cannot set the provisioning state');
+
+    const paths = frontUpdatePaths(node.xray.front);
+    assert.strictEqual(paths['xray.front.siteMode'], 'custom');
+    assert.strictEqual(paths['xray.front.enabled'], true);
+    assert.ok(!('xray.front.siteHtml' in paths));
+    assert.ok(!('xray.front' in paths), 'the front subdocument is never replaced whole');
+
+    // An explicit switch to nginx is honoured; the page stays stored.
+    node.xray.front = { siteMode: 'nginx' };
+    assert.strictEqual(applyFrontPatch(node.xray, node, previousFront), null);
+    assert.strictEqual(node.xray.front.siteMode, 'nginx');
+    assert.ok(!('xray.front.siteHtml' in frontUpdatePaths(node.xray.front)));
+}
+
+{
     const firstEnable = makeNode();
     firstEnable.port = 443;
     firstEnable.xray.listen = '0.0.0.0';

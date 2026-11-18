@@ -7,9 +7,11 @@
 
 const tls = require('tls');
 const dns = require('dns').promises;
+const { isValidHostname, isPrivateIp } = require('../utils/netAddress');
 
 // Hard cap: only scan /24 subnets (254 hosts) to keep it lightweight
 const MAX_PREFIX = 24;
+const RESOLVE_TIMEOUT_MS = 3000;
 
 // ── IP helpers ────────────────────────────────────────────────────────────────
 
@@ -26,6 +28,52 @@ function isValidIpv4(ip) {
     const parts = ip.split('.');
     if (parts.length !== 4) return false;
     return parts.every(p => /^\d{1,3}$/.test(p) && parseInt(p, 10) <= 255);
+}
+
+/**
+ * Turn a scan target (IPv4 or hostname, e.g. the node address field) into a
+ * public IPv4 to scan. Private and reserved ranges are refused so a hostname
+ * pointing inwards cannot make the panel sweep its own network.
+ * Never throws.
+ *
+ * @param {string} host
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs=3000] - DNS lookup cap
+ * @returns {Promise<{ip: string}|{error: string}>}
+ */
+async function resolveScanIp(host, { timeoutMs = RESOLVE_TIMEOUT_MS } = {}) {
+    const value = String(host || '').trim().toLowerCase();
+    if (!value) return { error: 'Address is empty' };
+
+    let ip;
+    if (isValidIpv4(value)) {
+        // Canonical form: net.isIP rejects leading zeros, which would let
+        // "010.0.0.1" slip past the private-range check.
+        ip = value.split('.').map(Number).join('.');
+    } else if (isValidHostname(value)) {
+        let timer;
+        try {
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+            });
+            ({ address: ip } = await Promise.race([dns.lookup(value, { family: 4 }), timeout]));
+        } catch (err) {
+            return {
+                error: err.message === 'timeout'
+                    ? `DNS lookup for ${value} timed out`
+                    : `Cannot resolve ${value} to an IPv4 address`,
+            };
+        } finally {
+            clearTimeout(timer);
+        }
+    } else {
+        return { error: 'Not a valid IPv4 address or hostname' };
+    }
+
+    if (!isValidIpv4(ip) || isPrivateIp(ip)) {
+        return { error: `${ip} is a private or reserved address and cannot be scanned` };
+    }
+    return { ip };
 }
 
 /** Derive the /24 CIDR from any IP in that subnet. */
@@ -77,11 +125,26 @@ function isDomainUsable(domain, issuer) {
  * @param {number} [timeoutMs=5000]
  * @returns {Promise<{ip, domain, issuer, ping}|null>}
  */
-function probeHost(ip, port = 443, timeoutMs = 5000) {
+function probeHost(ip, port = 443, timeoutMs = 5000, signal) {
     return new Promise(resolve => {
+        if (signal?.aborted) return resolve(null);
         const start = Date.now();
-
-        const socket = tls.connect({
+        let socket;
+        let settled = false;
+        const finish = result => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(deadline);
+            signal?.removeEventListener('abort', aborted);
+            socket?.destroy();
+            resolve(result);
+        };
+        const aborted = () => finish(null);
+        // Socket inactivity timers do not cover every connect/DNS/close path.
+        const deadline = setTimeout(aborted, timeoutMs);
+        signal?.addEventListener('abort', aborted, { once: true });
+        try {
+        socket = tls.connect({
             host: ip,
             port,
             rejectUnauthorized: false,
@@ -91,16 +154,18 @@ function probeHost(ip, port = 443, timeoutMs = 5000) {
             timeout: timeoutMs,
         });
 
-        socket.setTimeout(timeoutMs);
+        socket.setTimeout(timeoutMs, aborted);
+        socket.once('error', aborted);
+        socket.once('timeout', aborted);
+        socket.once('end', aborted);
+        socket.once('close', aborted);
 
         socket.on('secureConnect', () => {
             const ping   = Date.now() - start;
             const proto  = socket.getProtocol();
             const alpn   = socket.alpnProtocol;
             const cert   = socket.getPeerCertificate();
-            socket.destroy();
-
-            if (proto !== 'TLSv1.3' || alpn !== 'h2') return resolve(null);
+            if (proto !== 'TLSv1.3' || alpn !== 'h2') return finish(null);
 
             let domain = null;
 
@@ -121,13 +186,14 @@ function probeHost(ip, port = 443, timeoutMs = 5000) {
 
             const issuer = cert?.issuer?.O || cert?.issuer?.CN || 'unknown';
 
-            if (!isDomainUsable(domain, issuer)) return resolve(null);
+            if (!isDomainUsable(domain, issuer)) return finish(null);
 
-            resolve({ ip, domain, issuer, ping });
+            finish({ ip, domain, issuer, ping });
         });
-
-        socket.on('error',   () => { socket.destroy(); resolve(null); });
-        socket.on('timeout', () => { socket.destroy(); resolve(null); });
+        if (signal?.aborted) aborted();
+        } catch (_) {
+            finish(null);
+        }
     });
 }
 
@@ -159,13 +225,31 @@ async function runPool(tasks, concurrency, signal) {
  * @param {number} timeoutMs
  * @returns {Promise<object|null>}
  */
-async function verifyDomain(candidate, port, timeoutMs) {
+async function verifyDomain(candidate, port, timeoutMs, signal) {
     // The /24 prefix of the originally scanned IP
     const subnetPrefix = candidate.ip.split('.').slice(0, 3).join('.');
 
     let resolvedIp;
     try {
-        const { address } = await dns.lookup(candidate.domain, { family: 4 });
+        const resolved = await new Promise(resolve => {
+            if (signal?.aborted) return resolve(null);
+            let settled = false;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(deadline);
+                signal?.removeEventListener('abort', aborted);
+                resolve(value);
+            };
+            const aborted = () => finish(null);
+            const deadline = setTimeout(aborted, timeoutMs);
+            signal?.addEventListener('abort', aborted, { once: true });
+            Promise.resolve().then(() => dns.lookup(candidate.domain, { family: 4 }))
+                .then(finish, aborted);
+            if (signal?.aborted) aborted();
+        });
+        if (!resolved) return null;
+        const { address } = resolved;
         resolvedIp = address;
     } catch {
         return null;
@@ -183,7 +267,7 @@ async function verifyDomain(candidate, port, timeoutMs) {
     }
 
     // DNS points to a different host within the same /24 — probe it too
-    const realResult = await probeHost(resolvedIp, port, timeoutMs);
+    const realResult = await probeHost(resolvedIp, port, timeoutMs, signal);
     if (!realResult || realResult.domain !== candidate.domain) return null;
 
     return { ...realResult, dnsMatch: true };
@@ -216,16 +300,16 @@ async function scanRange({ ip, port = 443, threads = 50, timeout = 5, onResult, 
     const tasks = hosts.map(host => async () => {
         if (signal?.aborted) return;
 
-        const candidate = await probeHost(host, port, timeout * 1000);
+        const candidate = await probeHost(host, port, timeout * 1000, signal);
         done++;
         if (onProgress) onProgress(done, total);
 
-        if (!candidate) return;
+        if (!candidate || signal?.aborted) return;
 
         // Verify domain resolves and is reachable at its real DNS address
         if (onVerifying) onVerifying();
-        const verified = await verifyDomain(candidate, port, timeout * 1000);
-        if (!verified) return;
+        const verified = await verifyDomain(candidate, port, timeout * 1000, signal);
+        if (!verified || signal?.aborted) return;
 
         results.push(verified);
         if (onResult) onResult(verified);
@@ -236,4 +320,4 @@ async function scanRange({ ip, port = 443, threads = 50, timeout = 5, onResult, 
     return results;
 }
 
-module.exports = { scanRange, probeHost, expandCidr, ipToCidr24, isValidIpv4 };
+module.exports = { scanRange, probeHost, expandCidr, ipToCidr24, isValidIpv4, resolveScanIp };

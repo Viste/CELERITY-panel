@@ -96,6 +96,10 @@ const settingsSchema = new mongoose.Schema({
         // Remnawave/Marzban emit `total=0` for unlimited users; some clients
         // render a missing `total` as "0 of 0" instead of unlimited.
         userinfoTotalZeroWhenUnlimited: { type: Boolean, default: true },
+        // Publish VLESS Encryption inbounds in sing-box JSON. Only forks that
+        // know the `encryption` key accept them; upstream sing-box (SFA, SFI,
+        // Hiddify) rejects the whole config.
+        singboxVlessEncryption: { type: Boolean, default: false },
         buttons: {
             type: [{
                 _id: false,
@@ -240,7 +244,7 @@ const settingsSchema = new mongoose.Schema({
     },
 
     homepage: {
-        mode: { type: String, enum: ['nginx', 'custom'], default: 'nginx' },
+        mode: { type: String, enum: ['nginx', 'custom', 'off'], default: 'nginx' },
         customHtml: { type: Buffer, default: null },
     },
 
